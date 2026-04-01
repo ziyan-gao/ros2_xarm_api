@@ -1,0 +1,7 @@
+.codex
+__pycache__/
+*.pyc
+
+ws/build/
+ws/install/
+ws/log/

@@ -1,0 +1,7 @@
+{
+  "name": "ROS2 CV",
+  "dockerComposeFile": "../compose.yaml",
+  "service": "ros2_cv",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root"
+}

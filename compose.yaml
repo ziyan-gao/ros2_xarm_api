@@ -1,0 +1,21 @@
+services:
+  ros2_cv:
+    build: .
+    container_name: ros2_cv
+    stdin_open: true
+    tty: true
+    network_mode: host
+    ipc: "host"
+
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=0
+      - ROS_LOCALHOST_ONLY=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./:/workspace
+
+    working_dir: /workspace
