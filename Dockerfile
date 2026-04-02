@@ -20,7 +20,8 @@ RUN git clone https://github.com/xArm-Developer/xArm-Python-SDK.git /opt/xArm-Py
     cd /opt/xArm-Python-SDK && \
     python3 -m pip install --break-system-packages .
 
-# 进入容器自动 source ROS 2
-RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
+# 进入容器自动 source ROS 2 和工作区环境
+RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc && \
+    echo 'if [ -f /workspace/ws/install/setup.bash ]; then source /workspace/ws/install/setup.bash; fi' >> /root/.bashrc
 
 CMD ["bash"]

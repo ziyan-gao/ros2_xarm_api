@@ -3,5 +3,14 @@
   "dockerComposeFile": "../compose.yaml",
   "service": "ros2_cv",
   "workspaceFolder": "/workspace",
-  "remoteUser": "root"
+  "overrideCommand": true,
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  }
 }

@@ -1,61 +1,32 @@
-#!/usr/bin/env python3
-# Software License Agreement (BSD License)
-#
-# Copyright (c) 2019, UFACTORY, Inc.
-# All rights reserved.
-#
-# Author: Vinman <vinman.wen@ufactory.cc> <vinman.cub@gmail.com>
-
-"""
-Description: Move line(linear motion)
-"""
-
-import os
 import sys
 import time
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
-
+import math
+import socket
+import struct
 from xarm.wrapper import XArmAPI
 
 ip = '192.168.1.232'
 
-
-arm = XArmAPI(ip)
+arm = XArmAPI(ip, enable_report=True)
 arm.motion_enable(enable=True)
-arm.set_mode(0)
-arm.set_state(state=0)
+arm.set_ft_sensor_enable(0)
 
-arm.move_gohome(wait=True)
+arm.clean_error()
+arm.clean_warn()
+arm.set_ft_sensor_enable(1)
+time.sleep(0.5)
+arm.set_ft_sensor_zero()
 
-arm.set_position(x=300, y=0, z=150, roll=-180, pitch=0, yaw=0, speed=100, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=200, z=250, roll=-180, pitch=0, yaw=0, speed=200, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=500, y=200, z=150, roll=-180, pitch=0, yaw=0, speed=300, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=500, y=-200, z=250, roll=-180, pitch=0, yaw=0, speed=400, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=-200, z=150, roll=-180, pitch=0, yaw=0, speed=500, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=0, z=250, roll=-180, pitch=0, yaw=0, speed=600, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
+while arm.connected and arm.error_code == 0:
+    # ft_raw_force and ft_ext_force will update by reporting socket
+    print('raw_force: {}'.format(arm.ft_raw_force))
+    print('exe_force: {}'.format(arm.ft_ext_force))
 
+    # # get_ft_sensor_data() will get the last ext_force
+    # code, ext_force = arm.get_ft_sensor_data()
+    # if code == 0:
+    #     print('exe_force: {}'.format(ext_force))
+    time.sleep(0.2)
 
-arm.move_gohome(wait=True)
-
-arm.set_position(x=300, y=0, z=150, roll=-3.1415926, pitch=0, yaw=0, speed=100, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=200, z=250, roll=-3.1415926, pitch=0, yaw=0, speed=200, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=500, y=200, z=150, roll=-3.1415926, pitch=0, yaw=0, speed=300, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=500, y=-200, z=250, roll=-3.1415926, pitch=0, yaw=0, speed=400, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=-200, z=150, roll=-3.1415926, pitch=0, yaw=0, speed=500, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-arm.set_position(x=300, y=0, z=250, roll=-3.1415926, pitch=0, yaw=0, speed=600, is_radian=True, wait=True)
-print(arm.get_position(), arm.get_position(is_radian=True))
-
-arm.move_gohome(wait=True)
+arm.set_ft_sensor_enable(0)
 arm.disconnect()

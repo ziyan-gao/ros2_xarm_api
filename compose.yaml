@@ -19,3 +19,12 @@ services:
       - ./:/workspace
 
     working_dir: /workspace
+    command: >
+      bash -lc "
+        source /opt/ros/jazzy/setup.bash &&
+        cd /workspace/ws &&
+        if [ ! -f /workspace/ws/install/setup.bash ]; then
+          colcon build;
+        fi &&
+        source /workspace/ws/install/setup.bash
+      "
