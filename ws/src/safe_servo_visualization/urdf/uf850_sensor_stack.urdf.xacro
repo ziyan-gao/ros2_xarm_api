@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="uf850_sensor_stack">
+  <xacro:include filename="$(find xarm_description)/urdf/xarm_device_macro.xacro"/>
+
+  <xacro:xarm_device
+    robot_type="uf850"
+    dof="6"
+    add_gripper="false"
+    add_vacuum_gripper="false"
+    add_bio_gripper="false"
+    add_realsense_d435i="false"
+    load_gazebo_plugin="false"/>
+
+  <!-- Helpers required by the standalone official vacuum-gripper macro. -->
+  <xacro:property name="mesh_suffix" value="stl"/>
+  <xacro:property name="mesh_path" value="package://xarm_description/meshes"/>
+  <xacro:include filename="$(find xarm_description)/urdf/common/common.link.xacro"/>
+
+  <!-- Approximate physical tool stack supplied by the user.  Link frames are
+       located at each component's robot-side mounting face. -->
+  <joint name="ft_sensor_mount" type="fixed">
+    <parent link="link_eef"/>
+    <child link="ft_sensor_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="ft_sensor_link">
+    <visual>
+      <origin xyz="0 0 0.0325" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.045" length="0.065"/></geometry>
+      <material name="ft_sensor_gray"><color rgba="0.28 0.30 0.33 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0325" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.045" length="0.065"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="camera_stand_mount" type="fixed">
+    <parent link="ft_sensor_link"/>
+    <child link="camera_stand_link"/>
+    <origin xyz="0 0 0.065" rpy="0 0 0"/>
+  </joint>
+  <link name="camera_stand_link">
+    <visual>
+      <origin xyz="0 0 0.0015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.045" length="0.003"/></geometry>
+      <material name="camera_stand_blue"><color rgba="0.12 0.32 0.62 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0015" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.045" length="0.003"/></geometry>
+    </collision>
+  </link>
+
+  <xacro:include filename="$(find xarm_description)/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro"/>
+  <xacro:xarm_vacuum_gripper_urdf
+    attach_to="camera_stand_link"
+    attach_xyz="0 0 0.003"
+    attach_rpy="0 0 0"/>
+</robot>

@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'safe_servo_node = safe_servo_package.safe_servo_node:main'
+            'safe_servo_controller = safe_servo_package.safe_servo_controller:main',
+            'safe_servo_node = safe_servo_package.safe_servo_controller:main',
         ],
     },
 )

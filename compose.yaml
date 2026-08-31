@@ -6,25 +6,40 @@ services:
     tty: true
     network_mode: host
     ipc: "host"
+    # Allow RealSense USB hot-plug without granting the container access to
+    # every host device.
+    device_cgroup_rules:
+      - "c 189:* rmw"
+
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
+      - /dev/video4:/dev/video4
+      - /dev/video5:/dev/video5
+      - /dev/media0:/dev/media0
+      - /dev/media1:/dev/media1
 
     environment:
       - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.docker.xauth
       - QT_X11_NO_MITSHM=1
       - ROS_DOMAIN_ID=0
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - ROBOT_IP=${ROBOT_IP:-192.168.1.232}
+      - XARM_REPORT_TYPE=${XARM_REPORT_TYPE:-rich}
+      - SAFE_SERVO_DRY_RUN=${SAFE_SERVO_DRY_RUN:-false}
+      - MOVEIT_VELOCITY_SCALING=${MOVEIT_VELOCITY_SCALING:-0.10}
+      - MOVEIT_ACCELERATION_SCALING=${MOVEIT_ACCELERATION_SCALING:-0.10}
+      - RVIZ_CONFIG=/workspace/ws/src/rviz_config/rviz_scene.rviz
 
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}:/tmp/.docker.xauth:ro
+      - /dev/bus/usb:/dev/bus/usb
       - ./:/workspace
 
     working_dir: /workspace
-    command: >
-      bash -lc "
-        source /opt/ros/jazzy/setup.bash &&
-        cd /workspace/ws &&
-        if [ ! -f /workspace/ws/install/setup.bash ]; then
-          colcon build;
-        fi &&
-        source /workspace/ws/install/setup.bash
-      "
+    command: ["bash", "/workspace/start_all.sh"]

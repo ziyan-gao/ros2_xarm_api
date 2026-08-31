@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>safe_servo_rviz_panel</name>
+  <version>0.1.0</version>
+  <description>RViz controls for the safe servo controller.</description>
+  <maintainer email="robot@example.com">robot</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rviz_common</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+    <rviz plugin="${prefix}/plugin_description.xml"/>
+  </export>
+</package>

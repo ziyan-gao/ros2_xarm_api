@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'ft_sensor_publisher = ft_sensor_publish.ft_sensor_publisher:main'
+            'ft_sensor_publisher = ft_sensor_publish.ft_sensor_publisher:main',
+            'ft_sensor_initializer = ft_sensor_publish.ft_sensor_initializer:main',
         ],
     },
 )

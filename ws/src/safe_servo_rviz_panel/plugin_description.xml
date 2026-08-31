@@ -1,0 +1,7 @@
+<library path="safe_servo_rviz_panel">
+  <class name="safe_servo_rviz_panel/SafeServoPanel"
+         type="safe_servo_rviz_panel::SafeServoPanel"
+         base_class_type="rviz_common::Panel">
+    <description>Velocity and Cartesian workspace controls for safe_servo.</description>
+  </class>
+</library>
