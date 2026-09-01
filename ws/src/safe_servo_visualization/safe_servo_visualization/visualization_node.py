@@ -1,8 +1,8 @@
 import math
 
+from geometry_msgs.msg import Point, TransformStamped, WrenchStamped
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, TransformStamped, WrenchStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
@@ -124,7 +124,9 @@ class VisualizationNode(Node):
         text.pose.position.z, text.pose.orientation.w = 0.10, 1.0
         text.scale.z = 0.035
         text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-        text.text = f'{magnitude:.1f} N'
+        text.text = (
+            f'|F|={magnitude:.1f} N  '
+            f'Fz={force[2]:.1f} N (tool bias normal)')
         self.marker_pub.publish(text)
 
 

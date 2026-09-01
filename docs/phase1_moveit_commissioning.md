@@ -11,6 +11,8 @@ Before enabling motion:
 - Clear the robot workspace and keep the emergency stop accessible.
 - Confirm the selected UF850 model and vacuum-gripper model match the robot.
 - Start with no payload and 10% velocity/acceleration scaling.
+- Set both scaling fields in RViz before planning; the upstream launch does not
+  expose command-line defaults for them.
 - Inspect every trajectory in RViz before pressing **Execute**.
 - Use a small joint displacement from the current position for the first test.
 
@@ -93,13 +95,38 @@ Repeat using a manually selected joint target that remains comfortably inside al
 
 Phase 1 is complete only when all items are recorded as passing:
 
-- [ ] Image builds with `xarm_planner`, `xarm_moveit_config`, and `xarm_controller`.
-- [ ] UF850 model, DOF, namespaces, and vacuum tool are correct.
-- [ ] Real joint states match the RViz posture.
-- [ ] Trajectory controller is active.
-- [ ] A small joint-space plan is collision-free in RViz.
-- [ ] The plan executes at reduced scaling and reports success.
+- [x] Image builds with `xarm_planner`, `xarm_moveit_config`, and `xarm_controller`.
+- [x] UF850 model, DOF, namespaces, and vacuum tool are correct.
+- [x] Real joint states match the RViz posture.
+- [x] Trajectory controller is active.
+- [x] A small joint-space plan is collision-free in RViz.
+- [x] The plan executes at reduced scaling and reports success.
 - [ ] Cancellation or emergency stop halts the test safely.
-- [ ] No competing xArm driver or safe-servo process is running.
+- [x] No competing xArm driver or safe-servo process is running.
+
+The image pins xArm ROS 2 commit `57be2f40d4d198d1e552973b15fc26de6ebeed20` so dependency and launch behavior do not change between builds.
+
+The upstream `xarm_moveit_config` manifest depends on `xarm_gazebo` even for a
+real-hardware build. The image applies
+`patches/xarm_moveit_config_no_gazebo.patch`, which removes that manifest-only
+dependency. This keeps Phase 1 independent of simulator libraries without
+changing MoveIt, controller, robot-description, or planner code.
 
 Record the tested robot IP, xArm ROS 2 commit, firmware version, joint target, scaling values, and result below before starting Phase 2.
+
+## Commissioning record
+
+- Date: 2026-08-31
+- Robot: UFACTORY 850, 6 DOF
+- Robot IP: `192.168.1.232`
+- xArm ROS 2 commit: `57be2f40d4d198d1e552973b15fc26de6ebeed20`
+- Controller: `uf850_traj_controller` (`active`)
+- Joint-state feedback: approximately 10 Hz
+- Trajectory action: `/uf850_traj_controller/follow_joint_trajectory`
+- Velocity scaling: 0.10
+- Acceleration scaling: 0.10
+- Planning result: successful
+- Execution result: successful
+- Firmware version: not yet recorded
+- Test joint target: not yet recorded
+- Cancellation/emergency-stop test: pending

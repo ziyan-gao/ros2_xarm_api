@@ -1,0 +1,61 @@
+format_version: 1
+robot:
+  type: uf850
+  dof: 6
+waypoints:
+  observation:
+    saved_at: '2026-08-31T03:36:57.801632+00:00'
+    joint_names:
+    - joint1
+    - joint2
+    - joint3
+    - joint4
+    - joint5
+    - joint6
+    positions_rad:
+    - -1.478381633758545
+    - -0.3286112844944
+    - -1.2974965572357178
+    - -0.008716845884919167
+    - -0.9704232215881348
+    - 0.09022299945354462
+    tcp_pose:
+      frame_id: link_base
+      child_frame_id: link_eef
+      position_m:
+        x: 0.05120064788593376
+        y: -0.5594539093998832
+        z: 0.525563650692876
+      orientation_xyzw:
+        x: 0.7096154291280589
+        y: -0.7045795948038751
+        z: -0.002892660975231644
+        w: 0.0022737286315983197
+  intermediate:
+    saved_at: '2026-08-31T03:38:40.472620+00:00'
+    joint_names:
+    - joint1
+    - joint2
+    - joint3
+    - joint4
+    - joint5
+    - joint6
+    positions_rad:
+    - -2.5120489597320557
+    - -0.21859610080718994
+    - -1.169060230255127
+    - -0.00617810757830739
+    - -0.9452359080314636
+    - -0.9447883367538452
+    tcp_pose:
+      frame_id: link_base
+      child_frame_id: link_eef
+      position_m:
+        x: -0.4196663935161234
+        y: -0.30513493621147647
+        z: 0.5291384615742336
+      orientation_xyzw:
+        x: 0.7096218172790647
+        y: -0.7045734378471298
+        z: -0.002891882675941546
+        w: 0.0021872668842906175

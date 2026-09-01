@@ -14,20 +14,21 @@ The intended cycle is:
 1. Move to the item observation configuration.
 2. Detect the item's pose and dimensions.
 3. Move above the item, descend, and pick it up.
-4. Transfer it through a safe intermediate configuration and place it.
-5. Retreat through the intermediate configuration and return to observation.
+4. Use MoveIt to transfer it to the pallet-relative pre-place pose and place it.
+5. Retreat vertically and use MoveIt to return to observation.
 
 ## Design principles
 
 ### Separate transit and contact control
 
-Use MoveIt for collision-checked movement through free space. Use safe servo only for short vertical approaches and retreats near an item or placement surface. Long transfers must not be performed by Cartesian servoing.
+Use MoveIt for collision-checked movement through free space. Use safe servo only for short vertical approaches near an item or placement surface. After contact, use the existing UFACTORY driver's slow straight-line Cartesian service for the short vertical retreat. Long transfers must not be performed by Cartesian servoing.
 
 Only one command source may control the robot at a time. Switching between MoveIt trajectory execution and SDK servo mode must be explicit, and the previous motion must be stopped and confirmed complete first.
 
 ### Save taught configurations as joint positions
 
-Save the observation and intermediate waypoints primarily as six joint positions. Also save the corresponding TCP pose for validation and display.
+Save the observation and optional intermediate waypoints primarily as six joint
+positions. Define pre-place as a configurable pose relative to `pallet_frame`.
 
 A Cartesian TCP pose can have multiple inverse-kinematics solutions. Saving joint positions preserves the intended elbow and wrist configuration and reduces the risk of returning through an undesirable self-collision-prone posture.
 
@@ -59,7 +60,7 @@ Before execution, validate:
 
 - Detection age and confidence.
 - TF availability and timestamp consistency.
-- Item dimensions and workspace bounds.
+- Item dimensions; MoveIt validates kinematic reachability and collision limits.
 - Inverse-kinematics feasibility.
 - Collision-free planning to `pre_grasp_pose`.
 - Acceptable joint configuration and path length.
@@ -83,15 +84,16 @@ No lateral movement is allowed until the tool has returned to the pre-grasp clea
 
 ### 4. Transfer and placement
 
-Generate `pre_place_pose` above the target pose with configurable vertical clearance. Execute one continuous collision-checked trajectory:
+Teach `pre_place` above the target surface with sufficient vertical clearance.
+Use MoveIt to plan and execute a collision-checked trajectory:
 
 ```text
-pre-grasp -> intermediate joint configuration -> pre-place
+pre-grasp -> pre-place
 ```
 
-The intermediate waypoint should be an operator-taught joint configuration. It is intended to enforce a safe arm posture, not merely a TCP location.
-
-The preferred implementation is a MoveIt Pilz sequence with a nonzero blend radius at the intermediate waypoint and zero blend at `pre_place`. An acceptable alternative is a single combined, validated, and time-parameterized joint trajectory. Executing two independent plans is not considered continuous motion because the controller normally stops at the boundary.
+MoveIt checks the attached item together with the robot and world obstacles.
+The optional intermediate waypoint remains available for manual commissioning,
+but is not required by the automatic place pipeline.
 
 At `pre_place_pose`:
 
@@ -99,16 +101,17 @@ At `pre_place_pose`:
 2. Descend vertically to `place_pose`.
 3. Disable the vacuum gripper.
 4. Confirm release when feedback is available.
-5. Remove the attached item from the tool and update the planning scene.
-6. Servo vertically back to `pre_place_pose`.
+5. Remove the attached item from the tool and add its released box geometry to
+   the world as a placed-item collision obstacle.
+6. Use the direct driver to retreat vertically back to `pre_place_pose`.
 7. Switch back to trajectory control.
 
 ### 5. Retreat and return
 
-Plan and execute a continuous collision-checked trajectory:
+Plan and execute a collision-checked MoveIt trajectory:
 
 ```text
-pre-place -> intermediate joint configuration -> observation joint configuration
+pre-place -> observation joint configuration
 ```
 
 Plan the return independently after releasing the item because the planning scene and payload state have changed.
@@ -179,6 +182,8 @@ Completion criterion: a saved joint target can be planned, visually checked, and
 
 ### Phase 2: Taught waypoint storage
 
+Implementation and commissioning details: [Phase 2 waypoint storage](phase2_waypoint_storage.md).
+
 - Add panel controls to save observation and intermediate joint configurations.
 - Persist configurations in a versioned YAML file.
 - Add load, overwrite, validation, and display functions.
@@ -187,6 +192,8 @@ Completion criterion: a saved joint target can be planned, visually checked, and
 Completion criterion: restarting the system preserves both configurations and MoveIt can return to them consistently.
 
 ### Phase 3: Motion orchestration foundation
+
+Implementation and commissioning details: [Phase 3 motion coordinator](phase3_motion_coordinator.md).
 
 - Add a pick-and-place coordinator node with the explicit state machine.
 - Implement controller ownership and mode transitions.
@@ -197,15 +204,31 @@ Completion criterion: the coordinator can execute and cancel observation/interme
 
 ### Phase 4: Pre-grasp generation and pickup
 
+MoveIt Servo foundation and commissioning boundary:
+[Phase 4A MoveIt Servo foundation](phase4_moveit_servo_foundation.md).
+
+The Phase 4B supervised pickup implementation and commissioning procedure are
+documented in the same guide.
+
+The initial pre-grasp implementation plans only. It consumes one fresh refined
+depth box, creates a downward-facing TCP target above its measured top face,
+and previews the collision-checked plan before any execution is enabled.
+
 - Consume the refined item pose and dimensions.
 - Generate and validate grasp and pre-grasp poses.
 - Plan to pre-grasp with MoveIt.
-- Integrate safe-servo descent, vacuum activation, grasp verification, and vertical retreat.
+- Integrate safe-servo descent, vacuum activation and grasp verification, followed by a direct-driver vertical retreat.
 - Abort safely on stale perception, planning failure, force fault, or vacuum failure.
 
 Completion criterion: one stationary test item can be picked repeatedly at low speed without lateral servo motion.
 
 ### Phase 5: Planning-scene item attachment
+
+Static table and localized pallet collision geometry is introduced before
+Phase 5 item attachment. See
+[planning-scene obstacles](planning_scene_obstacles.md).
+The attachment behavior and test procedure are documented in
+[Phase 5 planning-scene attachment](phase5_planning_scene_attachment.md).
 
 - Add the environment collision objects.
 - Create item collision geometry from detected dimensions.
@@ -214,18 +237,19 @@ Completion criterion: one stationary test item can be picked repeatedly at low s
 
 Completion criterion: deliberately obstructed or self-colliding transfer requests are rejected before robot motion.
 
-### Phase 6: Continuous transfer and return
+### Phase 6: Removed — standard MoveIt transfer
 
-- Configure Pilz sequence planning or validated combined trajectories.
-- Blend through the intermediate joint configuration.
-- Stop precisely at pre-place.
-- Implement the independently planned blended return path.
-
-Completion criterion: the robot traverses the intermediate configuration without stopping while maintaining collision clearance and stopping at both terminal poses.
+The separate continuous/blended-transfer phase is no longer required. Standard
+MoveIt collision-checked plans move the attached item to pre-place and return
+the released robot to observation. An intermediate waypoint is optional rather
+than part of the place pipeline.
 
 ### Phase 7: Placement and complete cycle
 
-- Generate pre-place and place poses.
+Implementation and commissioning details:
+[place function](phase7_place_function.md).
+
+- Configure a pallet-relative pre-place pose and require a locked pallet frame.
 - Integrate safe-servo descent, release verification, and retreat.
 - Complete planning-scene updates.
 - Enable repeated cycles only after all single-cycle fault cases pass.

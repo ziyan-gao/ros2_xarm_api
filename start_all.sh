@@ -49,6 +49,10 @@ ros2 run safe_servo_package safe_servo_controller --ros-args \
   -p robot_ip:="${ROBOT_IP}" &
 child_pids+=("$!")
 
+echo "Starting taught-waypoint storage"
+ros2 run safe_servo_visualization waypoint_store &
+child_pids+=("$!")
+
 echo "Starting ArUco box marker detector"
 ros2 run box_marker_detection box_marker_detector &
 child_pids+=("$!")

@@ -14,7 +14,7 @@ Panels:
         - /DepthCloud1
         - /DepthCloud1/Auto Size1
       Splitter Ratio: 0.6355932354927063
-    Tree Height: 1470
+    Tree Height: 746
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -32,7 +32,7 @@ Panels:
     Experimental: false
     Name: Time
     SyncMode: 0
-    SyncSource: DepthCloud
+    SyncSource: ""
   - Class: safe_servo_rviz_panel/SafeServoPanel
     Name: SafeServoPanel
 Visualization Manager:
@@ -157,6 +157,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /safe_servo/force_marker
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Pre-grasp Target
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /motion_coordinator/pregrasp_pose
+      Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
       Filter (blacklist): ""
@@ -164,6 +177,28 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        aruco_marker_1:
+          Value: true
+        aruco_marker_14:
+          Value: true
+        aruco_marker_17:
+          Value: true
+        aruco_marker_2:
+          Value: true
+        aruco_marker_38:
+          Value: true
+        aruco_marker_5:
+          Value: true
+        aruco_marker_6:
+          Value: true
+        box_1:
+          Value: true
+        box_2:
+          Value: true
+        box_5:
+          Value: true
+        box_6:
+          Value: true
         camera_color_frame:
           Value: false
         camera_color_optical_frame:
@@ -196,6 +231,10 @@ Visualization Manager:
           Value: false
         link_tcp:
           Value: true
+        pallet_frame:
+          Value: true
+        pallet_preview:
+          Value: true
         world:
           Value: false
         xarm_vacuum_gripper_link:
@@ -208,6 +247,28 @@ Visualization Manager:
       Tree:
         world:
           link_base:
+            aruco_marker_1:
+              {}
+            aruco_marker_14:
+              {}
+            aruco_marker_17:
+              {}
+            aruco_marker_2:
+              {}
+            aruco_marker_38:
+              {}
+            aruco_marker_5:
+              {}
+            aruco_marker_6:
+              {}
+            box_1:
+              {}
+            box_2:
+              {}
+            box_5:
+              {}
+            box_6:
+              {}
             link1:
               link2:
                 link3:
@@ -227,13 +288,18 @@ Visualization Manager:
                               xarm_vacuum_gripper_link:
                                 link_tcp:
                                   {}
+            pallet_frame:
+              {}
+            pallet_preview:
+              {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Detected Boxes
       Namespaces:
-        {}
+        detected_box_labels: true
+        detected_boxes: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -245,7 +311,8 @@ Visualization Manager:
       Enabled: true
       Name: Depth Refined Boxes
       Namespaces:
-        {}
+        depth_refined_box_labels: true
+        depth_refined_boxes: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -287,7 +354,7 @@ Visualization Manager:
       Decay Time: 0
       Depth Map Topic: /camera/camera/depth/image_rect_raw
       Depth Map Transport Hint: raw
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -306,7 +373,213 @@ Visualization Manager:
       Topic Filter: true
       Use Fixed Frame: true
       Use rainbow: true
+      Value: false
+    - Acceleration_Scaling_Factor: 0.1
+      Class: moveit_rviz_plugin/MotionPlanning
+      Enabled: true
+      Move Group Namespace: ""
+      MoveIt_Allow_Approximate_IK: false
+      MoveIt_Allow_External_Program: false
+      MoveIt_Allow_Replanning: false
+      MoveIt_Allow_Sensor_Positioning: false
+      MoveIt_Planning_Attempts: 10
+      MoveIt_Planning_Time: 5
+      MoveIt_Use_Cartesian_Path: false
+      MoveIt_Use_Constraint_Aware_IK: false
+      MoveIt_Workspace:
+        Center:
+          X: 0
+          Y: 0
+          Z: 0
+        Size:
+          X: 2
+          Y: 2
+          Z: 2
+      Name: MotionPlanning
+      Planned Path:
+        Color Enabled: true
+        Interrupt Display: false
+        Links:
+          All Links Enabled: true
+          Expand Joint Details: false
+          Expand Link Details: false
+          Expand Tree: false
+          Link Tree Style: Links in Alphabetic Order
+          camera_stand_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          ft_sensor_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link1:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link2:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link3:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link4:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link5:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link6:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link_eef:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          link_tcp:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          world:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          xarm_vacuum_gripper_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+        Loop Animation: true
+        Robot Alpha: 0.75
+        Robot Color: 0; 255; 255
+        Show Robot Collision: false
+        Show Robot Visual: true
+        Show Trail: true
+        State Display Time: 0.05 s
+        Trail Step Size: 8
+        Trajectory Topic: /display_planned_path
+        Use Sim Time: false
+      Planning Metrics:
+        Payload: 1
+        Show Joint Torques: false
+        Show Manipulability: false
+        Show Manipulability Index: false
+        Show Weight Limit: false
+        TextHeight: 0.07999999821186066
+      Planning Request:
+        Colliding Link Color: 255; 0; 0
+        Goal State Alpha: 1
+        Goal State Color: 250; 128; 0
+        Interactive Marker Size: 0
+        Joint Violation Color: 255; 0; 255
+        Planning Group: uf850
+        Query Goal State: true
+        Query Start State: false
+        Show Workspace: false
+        Start State Alpha: 1
+        Start State Color: 0; 255; 0
+      Planning Scene Topic: /monitored_planning_scene
+      Robot Description: robot_description
+      Scene Geometry:
+        Scene Alpha: 0.8999999761581421
+        Scene Color: 50; 230; 50
+        Scene Display Time: 0.009999999776482582
+        Show Scene Geometry: true
+        Voxel Coloring: Z-Axis
+        Voxel Rendering: Occupied Voxels
+      Scene Robot:
+        Attached Body Color: 150; 50; 150
+        Links:
+          All Links Enabled: true
+          Expand Joint Details: false
+          Expand Link Details: false
+          Expand Tree: false
+          Link Tree Style: Links in Alphabetic Order
+          camera_stand_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          ft_sensor_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link1:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link2:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link3:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link4:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link5:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link6:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link_eef:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          link_tcp:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          world:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          xarm_vacuum_gripper_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+        Robot Alpha: 1
+        Show Robot Collision: false
+        Show Robot Visual: true
       Value: true
+      Velocity_Scaling_Factor: 0.1
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -353,7 +626,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.1612688302993774
+      Distance: 7.112150192260742
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -368,10 +641,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.08039780706167221
+      Pitch: 0.31039825081825256
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 0.8435943722724915
+      Yaw: 3.891784906387329
     Saved: ~
 Window Geometry:
   Displays:
@@ -381,7 +654,11 @@ Window Geometry:
   Hide Right Dock: false
   Marker Detection:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000400000000000003a800000622fc0200000008fb0000001200530065006c0065006300740069006f006e00000001e10000009b000000ab00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c0061007900730100000069000006220000017800fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c0000026100000001000004cc00000622fc0200000006fb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb00000020004d00610072006b0065007200200044006500740065006300740069006f006e0100000069000002490000002100fffffffb0000001c00530061006600650053006500720076006f00500061006e0065006c01000002be000003cd000003cd00fffffffb0000000a0049006d00610067006501000004420000027d0000000000000000fb0000000a00560069006500770073000000059c000001230000012300fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e1000001970000000300000ccd00000051fc0100000002fb0000000800540069006d0065010000000000000ccd0000046000fffffffb0000000800540069006d00650100000000000004500000000000000000000004410000062200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  MotionPlanning:
+    collapsed: false
+  MotionPlanning - Trajectory Slider:
+    collapsed: false
+  QMainWindow State: 000000ff00000000fd0000000400000000000003a800000622fc020000000bfb0000001200530065006c0065006300740069006f006e00000001e10000009b000000ab00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007302000001ed000001df00000185000000a3fb000000120056006900650077007300200054006f006f02000001df000002110000018500000122fb000000200054006f006f006c002000500072006f0070006500720074006900650073003203000002880000011d000002210000017afb000000100044006900730070006c00610079007301000000690000034e0000017800fffffffb0000002000730065006c0065006300740069006f006e00200062007500660066006500720200000138000000aa0000023a00000294fb00000014005700690064006500530074006500720065006f02000000e6000000d2000003ee0000030bfb0000000c004b0069006e0065006300740200000186000001060000030c00000261fb000000280020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000007000fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000003c3000002c80000028e00ffffff00000001000004cc00000622fc0200000006fb0000001c00530061006600650053006500720076006f00500061006e0065006c0100000069000003cd000000ab00fffffffb0000001e0054006f006f006c002000500072006f00700065007200740069006500730100000041000000780000000000000000fb00000020004d00610072006b0065007200200044006500740065006300740069006f006e0100000442000002490000002100fffffffb0000000a0049006d00610067006501000004420000027d0000000000000000fb0000000a00560069006500770073000000059c000001230000012300fffffffb0000001200530065006c0065006300740069006f006e010000025a000000b200000000000000000000000200000490000000a9fc0100000001fb0000000a00560069006500770073030000004e00000080000002e1000001970000000300000ccd00000051fc0100000002fb0000000800540069006d0065010000000000000ccd0000046000fffffffb0000000800540069006d00650100000000000004500000000000000000000004410000062200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   SafeServoPanel:
     collapsed: false
   Selection:
@@ -393,5 +670,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 3277
-  X: 563
-  Y: 149
+  X: 513
+  Y: 54

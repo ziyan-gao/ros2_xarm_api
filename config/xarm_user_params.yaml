@@ -1,0 +1,9 @@
+# Overrides for the unified MoveIt/ros2_control stack.
+# Enables vacuum gripper services on the existing ufactory_driver connection.
+ufactory_driver:
+  ros__parameters:
+    services:
+      set_position: true
+      set_vacuum_gripper: true
+      get_vacuum_gripper: true
+      set_ft_sensor_zero: true

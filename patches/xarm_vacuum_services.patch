@@ -1,0 +1,13 @@
+diff --git a/xarm_api/config/xarm_user_params.yaml b/xarm_api/config/xarm_user_params.yaml
+new file mode 100644
+index 0000000..c3a8f1e
+--- /dev/null
++++ b/xarm_api/config/xarm_user_params.yaml
+@@ -0,0 +1,7 @@
++ufactory_driver:
++  ros__parameters:
++    services:
++      set_position: true
++      set_vacuum_gripper: true
++      get_vacuum_gripper: true
++      set_ft_sensor_zero: true

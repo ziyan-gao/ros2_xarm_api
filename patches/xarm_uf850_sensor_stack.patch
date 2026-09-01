@@ -1,0 +1,109 @@
+diff --git a/xarm_description/urdf/other/uf850_sensor_stack.urdf.xacro b/xarm_description/urdf/other/uf850_sensor_stack.urdf.xacro
+new file mode 100644
+index 0000000..f850001
+--- /dev/null
++++ b/xarm_description/urdf/other/uf850_sensor_stack.urdf.xacro
+@@ -0,0 +1,40 @@
++<?xml version="1.0"?>
++<robot xmlns:xacro="http://ros.org/wiki/xacro" name="uf850_sensor_stack">
++  <!-- Physical stack between the UF850 flange and the official vacuum tool. -->
++  <xacro:macro name="uf850_sensor_stack" params="prefix:='' attach_to:=''">
++    <joint name="${prefix}ft_sensor_mount" type="fixed">
++      <parent link="${attach_to}"/>
++      <child link="${prefix}ft_sensor_link"/>
++      <origin xyz="0 0 0" rpy="0 0 0"/>
++    </joint>
++    <link name="${prefix}ft_sensor_link">
++      <visual>
++        <origin xyz="0 0 0.0325" rpy="0 0 0"/>
++        <geometry><cylinder radius="0.045" length="0.065"/></geometry>
++        <material name="${prefix}ft_sensor_gray"><color rgba="0.28 0.30 0.33 1"/></material>
++      </visual>
++      <collision>
++        <!-- Leave a 1 mm collision-only gap at the fixed-link boundary. -->
++        <origin xyz="0 0 0.032" rpy="0 0 0"/>
++        <geometry><cylinder radius="0.045" length="0.064"/></geometry>
++      </collision>
++    </link>
++
++    <joint name="${prefix}camera_stand_mount" type="fixed">
++      <parent link="${prefix}ft_sensor_link"/>
++      <child link="${prefix}camera_stand_link"/>
++      <origin xyz="0 0 0.065" rpy="0 0 0"/>
++    </joint>
++    <link name="${prefix}camera_stand_link">
++      <visual>
++        <origin xyz="0 0 0.0015" rpy="0 0 0"/>
++        <geometry><cylinder radius="0.045" length="0.003"/></geometry>
++        <material name="${prefix}camera_stand_blue"><color rgba="0.12 0.32 0.62 1"/></material>
++      </visual>
++      <collision>
++        <origin xyz="0 0 0.0015" rpy="0 0 0"/>
++        <geometry><cylinder radius="0.045" length="0.003"/></geometry>
++      </collision>
++    </link>
++  </xacro:macro>
++</robot>
+diff --git a/xarm_description/urdf/xarm_device_macro.xacro b/xarm_description/urdf/xarm_device_macro.xacro
+index 13c5c3d..4e7c885 100644
+--- a/xarm_description/urdf/xarm_device_macro.xacro
++++ b/xarm_description/urdf/xarm_device_macro.xacro
+@@ -277,7 +277,15 @@
+       </xacro:if>
+       <xacro:unless value="${robot_type == 'lite'}">
+         <!-- Load XArm Vacuum Gripper Model URDF -->
+         <xacro:include filename="$(find xarm_description)/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro" />
+-        <xacro:xarm_vacuum_gripper_urdf prefix="${prefix}" attach_to="${prefix}link_eef" />
++        <xacro:if value="${robot_type == 'uf850'}">
++          <!-- UF850 stack: 65 mm FT sensor + 3 mm camera stand + vacuum tool. -->
++          <xacro:include filename="$(find xarm_description)/urdf/other/uf850_sensor_stack.urdf.xacro" />
++          <xacro:uf850_sensor_stack prefix="${prefix}" attach_to="${prefix}link_eef" />
++          <xacro:xarm_vacuum_gripper_urdf prefix="${prefix}" attach_to="${prefix}camera_stand_link" attach_xyz="0 0 0.003" tcp_xyz="0 0 0.104" />
++        </xacro:if>
++        <xacro:unless value="${robot_type == 'uf850'}">
++          <xacro:xarm_vacuum_gripper_urdf prefix="${prefix}" attach_to="${prefix}link_eef" />
++        </xacro:unless>
+       </xacro:unless>
+     </xacro:if>
+diff --git a/xarm_moveit_config/srdf/_uf850_macro.srdf.xacro b/xarm_moveit_config/srdf/_uf850_macro.srdf.xacro
+index 35f283c..b58a850 100644
+--- a/xarm_moveit_config/srdf/_uf850_macro.srdf.xacro
++++ b/xarm_moveit_config/srdf/_uf850_macro.srdf.xacro
+@@ -211,4 +211,15 @@
+     <disable_collisions link1="${prefix}link5" link2="${prefix}link6" reason="Adjacent" />
+     <disable_collisions link1="${prefix}link6" link2="${prefix}link_eef" reason="Adjacent" />
++
++    <!-- The UF850 sensor/camera/vacuum assembly is one rigid body.  Ignore
++         proximity only among its fixed components so Servo does not scale a
++         valid command to zero; collisions with the arm and scene stay active. -->
++    <disable_collisions link1="${prefix}link_eef" link2="${prefix}ft_sensor_link" reason="Adjacent" />
++    <disable_collisions link1="${prefix}link_eef" link2="${prefix}camera_stand_link" reason="RigidToolStack" />
++    <disable_collisions link1="${prefix}ft_sensor_link" link2="${prefix}camera_stand_link" reason="Adjacent" />
++    <disable_collisions link1="${prefix}camera_stand_link" link2="${prefix}xarm_vacuum_gripper_link" reason="Adjacent" />
++    <disable_collisions link1="${prefix}ft_sensor_link" link2="${prefix}xarm_vacuum_gripper_link" reason="RigidToolStack" />
++    <disable_collisions link1="${prefix}link6" link2="${prefix}ft_sensor_link" reason="RigidToolStack" />
++    <disable_collisions link1="${prefix}link6" link2="${prefix}camera_stand_link" reason="RigidToolStack" />
+   </xacro:macro>
+ </robot>
+diff --git a/xarm_description/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro b/xarm_description/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro
+index 7899d21..c27837a 100644
+--- a/xarm_description/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro
++++ b/xarm_description/urdf/vacuum_gripper/xarm_vacuum_gripper.urdf.xacro
+@@ -1,7 +1,7 @@
+ <?xml version="1.0"?>
+ <robot xmlns:xacro="http://ros.org/wiki/xacro" name="xarm_vacuum_gripper">
+ 
+-  <xacro:macro name="xarm_vacuum_gripper_urdf" params="prefix:='' attach_to:='' attach_xyz:='0 0 0' attach_rpy:='0 0 0' ">
++  <xacro:macro name="xarm_vacuum_gripper_urdf" params="prefix:='' attach_to:='' attach_xyz:='0 0 0' attach_rpy:='0 0 0' tcp_xyz:='0 0 0.126' ">
+ 
+     <xacro:unless value="${attach_to == ''}">
+       <joint name="${prefix}vacuum_gripper_fix" type="fixed">
+@@ -33,7 +33,7 @@
+     <link name="${prefix}link_tcp" />
+ 
+     <joint name="${prefix}joint_tcp" type="fixed">
+-      <origin xyz="0 0 0.126" rpy="0 0 0" />
++      <origin xyz="${tcp_xyz}" rpy="0 0 0" />
+       <parent link="${prefix}xarm_vacuum_gripper_link" />
+       <child link="${prefix}link_tcp" />
+     </joint>

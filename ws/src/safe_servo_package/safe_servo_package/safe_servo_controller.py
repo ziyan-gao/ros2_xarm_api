@@ -3,8 +3,8 @@ import math
 import time
 from typing import List, Optional
 
-import rclpy
 from geometry_msgs.msg import PoseStamped, WrenchStamped
+import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool, Trigger
@@ -66,7 +66,8 @@ class SafeServoController(Node):
             'dry_run_start_pose', [250.0, 0.0, 65.0, 180.0, 0.0, 0.0]
         )
 
-        p = lambda name: self.get_parameter(name).value
+        def p(name):
+            return self.get_parameter(name).value
         self.robot_ip = str(p('robot_ip'))
         self.dry_run = bool(p('dry_run'))
         self.pause_robot_on_fault = bool(p('pause_robot_on_fault'))
@@ -512,7 +513,8 @@ class SafeServoController(Node):
         self.last_control_time = now
         if not self.enabled or self.fault_reason or self.target_pose is None:
             return
-        if self.last_command_time is None or now - self.last_command_time > self.command_timeout_sec:
+        if (self.last_command_time is None or
+                now - self.last_command_time > self.command_timeout_sec):
             self.latch_fault('command watchdog timeout')
             return
         if self.last_force_time is None or now - self.last_force_time > self.force_timeout_sec:

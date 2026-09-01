@@ -1,0 +1,13 @@
+diff --git a/xarm_planner/src/xarm_planner.cpp b/xarm_planner/src/xarm_planner.cpp
+index 3a10990..69c1271 100644
+--- a/xarm_planner/src/xarm_planner.cpp
++++ b/xarm_planner/src/xarm_planner.cpp
+@@ -10,7 +10,7 @@ namespace xarm_planner
+ {
+ const double jump_threshold = 0.0;
+ const double eef_step = 0.005;
+-const double max_velocity_scaling_factor = 0.3;  // [move_group_interface] default is 0.1
++const double max_velocity_scaling_factor = 0.1;  // commissioning safety limit
+ const double max_acceleration_scaling_factor = 0.1;  // [move_group_interface] default is 0.1
+ 
+ XArmPlanner::XArmPlanner(const rclcpp::Node::SharedPtr& node, const std::string& group_name)

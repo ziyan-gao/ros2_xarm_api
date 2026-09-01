@@ -1,0 +1,12 @@
+diff --git a/xarm_moveit_config/package.xml b/xarm_moveit_config/package.xml
+index 53c0d83..02c7d6e 100644
+--- a/xarm_moveit_config/package.xml
++++ b/xarm_moveit_config/package.xml
+@@ -12,7 +12,6 @@
+   <depend>backward_ros</depend>
+   <depend>xarm_description</depend>
+   <depend>xarm_controller</depend>
+-  <depend>xarm_gazebo</depend>
+ 
+   <exec_depend>rviz2</exec_depend>
+   <exec_depend>xacro</exec_depend>

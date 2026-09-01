@@ -1,3 +1,6 @@
+from glob import glob
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'safe_servo_package'
@@ -10,6 +13,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +31,7 @@ setup(
         'console_scripts': [
             'safe_servo_controller = safe_servo_package.safe_servo_controller:main',
             'safe_servo_node = safe_servo_package.safe_servo_controller:main',
+            'moveit_servo_bridge = safe_servo_package.moveit_servo_bridge:main',
         ],
     },
 )

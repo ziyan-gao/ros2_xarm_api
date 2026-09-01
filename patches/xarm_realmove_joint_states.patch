@@ -1,0 +1,38 @@
+diff --git a/xarm_moveit_config/launch/_robot_moveit_realmove.launch.py b/xarm_moveit_config/launch/_robot_moveit_realmove.launch.py
+index b0c7a01..c1a7e02 100644
+--- a/xarm_moveit_config/launch/_robot_moveit_realmove.launch.py
++++ b/xarm_moveit_config/launch/_robot_moveit_realmove.launch.py
+@@ -144,16 +144,15 @@ def launch_setup(context, *args, **kwargs):
+         }.items(),
+     )
+ 
+-    # joint state publisher node
+-    joint_state_publisher_node = Node(
+-        package='joint_state_publisher',
+-        executable='joint_state_publisher',
+-        name='joint_state_publisher',
++    # The ros2_control hardware plugin owns current joint state.  Its embedded
++    # xarm_driver intentionally does not publish <hw_ns>/joint_states, so use
++    # the standard broadcaster instead of aggregating that nonexistent topic.
++    joint_state_broadcaster_node = Node(
++        package='controller_manager',
++        executable='spawner',
+         output='screen',
+-        parameters=[{'source_list': ['{}{}/joint_states'.format(prefix.perform(context), hw_ns.perform(context))]}],
+-        remappings=[
+-            ('follow_joint_trajectory', '{}{}_traj_controller/follow_joint_trajectory'.format(prefix.perform(context), xarm_type)),
+-        ],
++        arguments=['joint_state_broadcaster', '--controller-manager',
++                   '{}/controller_manager'.format(ros_namespace)],
+     )
+ 
+     # ros2 control launch
+@@ -178,7 +176,7 @@ def launch_setup(context, *args, **kwargs):
+     return [
+         robot_description_launch,
+         robot_moveit_common_launch,
+-        joint_state_publisher_node,
++        joint_state_broadcaster_node,
+         ros2_control_launch,
+         control_node,
+         # robot_driver_launch,

@@ -30,8 +30,9 @@
       <material name="ft_sensor_gray"><color rgba="0.28 0.30 0.33 1"/></material>
     </visual>
     <collision>
-      <origin xyz="0 0 0.0325" rpy="0 0 0"/>
-      <geometry><cylinder radius="0.045" length="0.065"/></geometry>
+      <!-- Avoid a false FCL contact at the rigid sensor/stand boundary. -->
+      <origin xyz="0 0 0.032" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.045" length="0.064"/></geometry>
     </collision>
   </link>
 
