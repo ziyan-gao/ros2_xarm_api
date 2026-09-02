@@ -6,7 +6,7 @@ pallet_geometry:
   surface_thickness_m: 0.005
   origin: corner_of_top_face
 localization:
-  marker_id: 10
+  marker_id: 1
   required_samples: 27
   position_tolerance_m: 0.005
   angle_tolerance_deg: 2.0
@@ -28,8 +28,8 @@ pre_place_pose:
   frame_id: pallet_frame
   position_m:
   - 0.1
-  - 0.196
+  - 0.35
   - 0.2
-  rotate_item_90_deg: false
+  rotate_item_90_deg: true
   keep_tcp_roll_pitch: false
-  add_placed_item_obstacle: false
+  add_placed_item_obstacle: true

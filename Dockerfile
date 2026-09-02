@@ -37,6 +37,8 @@ COPY patches/xarm_uf850_joint4_pi_limit.patch /tmp/xarm_uf850_joint4_pi_limit.pa
 COPY patches/xarm_uf850_sensor_stack.patch /tmp/xarm_uf850_sensor_stack.patch
 COPY patches/xarm_vacuum_services.patch /tmp/xarm_vacuum_services.patch
 COPY patches/xarm_realmove_joint_states.patch /tmp/xarm_realmove_joint_states.patch
+COPY patches/xarm_control_write_watchdog.patch /tmp/xarm_control_write_watchdog.patch
+COPY patches/xarm_nonblocking_report_states.patch /tmp/xarm_nonblocking_report_states.patch
 
 # Official UFACTORY ROS 2 driver and collision-aware planning stack. Gazebo is
 # excluded from this real-robot image by the manifest-only patch copied above.
@@ -54,6 +56,8 @@ RUN mkdir -p /opt/xarm_ws/src && \
     git apply /tmp/xarm_uf850_sensor_stack.patch && \
     git apply /tmp/xarm_vacuum_services.patch && \
     git apply /tmp/xarm_realmove_joint_states.patch && \
+    git apply /tmp/xarm_control_write_watchdog.patch && \
+    git apply /tmp/xarm_nonblocking_report_states.patch && \
     source /opt/ros/jazzy/setup.bash && \
     rosdep update && \
     rosdep install --from-paths \

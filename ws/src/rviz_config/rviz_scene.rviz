@@ -161,7 +161,7 @@ Visualization Manager:
       Enabled: true
       Name: Pre-grasp Target
       Namespaces:
-        {}
+        pregrasp_target: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -177,23 +177,19 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        aruco_marker_1:
-          Value: true
         aruco_marker_14:
-          Value: true
-        aruco_marker_17:
           Value: true
         aruco_marker_2:
           Value: true
-        aruco_marker_38:
+        aruco_marker_4:
           Value: true
         aruco_marker_5:
           Value: true
         aruco_marker_6:
           Value: true
-        box_1:
-          Value: true
         box_2:
+          Value: true
+        box_4:
           Value: true
         box_5:
           Value: true
@@ -233,8 +229,6 @@ Visualization Manager:
           Value: true
         pallet_frame:
           Value: true
-        pallet_preview:
-          Value: true
         world:
           Value: false
         xarm_vacuum_gripper_link:
@@ -247,23 +241,19 @@ Visualization Manager:
       Tree:
         world:
           link_base:
-            aruco_marker_1:
-              {}
             aruco_marker_14:
-              {}
-            aruco_marker_17:
               {}
             aruco_marker_2:
               {}
-            aruco_marker_38:
+            aruco_marker_4:
               {}
             aruco_marker_5:
               {}
             aruco_marker_6:
               {}
-            box_1:
-              {}
             box_2:
+              {}
+            box_4:
               {}
             box_5:
               {}
@@ -289,8 +279,6 @@ Visualization Manager:
                                 link_tcp:
                                   {}
             pallet_frame:
-              {}
-            pallet_preview:
               {}
       Update Interval: 0
       Value: true
@@ -641,10 +629,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.31039825081825256
+      Pitch: 0.09039826691150665
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 3.891784906387329
+      Yaw: 3.251784324645996
     Saved: ~
 Window Geometry:
   Displays:

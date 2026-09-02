@@ -69,7 +69,9 @@ class PickupSupervisor(Node):
         self.declare_parameter('vacuum_hardware_version', 1)
         self.declare_parameter('vacuum_on_status', 1)
         self.declare_parameter('require_vacuum_sensor', False)
-        self.declare_parameter('vacuum_settle_sec', 0.5)
+        # Hold the contacted pose after suction is enabled so the cup has time
+        # to seal before the direct vertical retreat starts.
+        self.declare_parameter('vacuum_settle_sec', 1.0)
         self.declare_parameter('vacuum_verify_attempts', 10)
         self.declare_parameter('vacuum_verify_interval_sec', 0.5)
         self.declare_parameter('force_contact_threshold_n', 15.0)
@@ -414,9 +416,14 @@ class PickupSupervisor(Node):
         self.contact_detected = False
         self.expected_enable_generation = None
         self.get_logger().info(
-            'cleared stale touch_contact; zeroing external force before pickup')
-        self._zero_ft_sensor_then(
-            lambda: self._begin_descent(snapshot, z, floor_z))
+            'cleared stale touch_contact; arming pickup descent with a new '
+            'software Fz baseline')
+        # Hardware FT zero temporarily puts this UF850 into state 5.  That
+        # causes RobotHW to deactivate both controllers from inside its update
+        # loop and creates one-second feedback gaps.  The guarded Servo records
+        # a fresh force baseline on every enable, so a second hardware zero is
+        # unnecessary after the startup initializer.
+        self._begin_descent(snapshot, z, floor_z)
 
     def start_place_callback(self, _request, response):
         if self.state in self.ACTIVE:

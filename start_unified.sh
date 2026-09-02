@@ -14,17 +14,33 @@ source install/setup.bash
 set -u
 
 : "${ROBOT_IP:=192.168.1.232}"
-: "${XARM_REPORT_TYPE:=rich}"
+: "${XARM_REPORT_TYPE:=dev}"
 : "${RVIZ_CONFIG:=/workspace/ws/src/rviz_config/rviz_scene.rviz}"
 : "${MOVEIT_SERVO_DRY_RUN:=false}"
 : "${SERVO_DESCENT_SPEED_M_S:=0.03}"
 : "${SERVO_DESCENT_KP_Z:=3.0}"
 : "${PLACE_FORCE_THRESHOLD_N:=4.0}"
 
+if [[ "${XARM_REPORT_TYPE}" != "dev" ]]; then
+  echo "FATAL: XARM_REPORT_TYPE must be 'dev' for non-blocking 100 Hz joint feedback." >&2
+  exit 4
+fi
+
 if [[ ! -r "${RVIZ_CONFIG}" ]]; then
   echo "RViz configuration is not readable: ${RVIZ_CONFIG}" >&2
   exit 2
 fi
+
+# A non-real-time controller_manager previously missed tens of Servo-J write
+# cycles and then caught up abruptly.  Refuse to connect to the real robot if
+# the container cannot create a FIFO thread; compose.yaml grants this narrowly
+# through SYS_NICE and RLIMIT_RTPRIO.
+if ! chrt --fifo 1 true >/dev/null 2>&1; then
+  echo "FATAL: FIFO real-time scheduling is unavailable; refusing to start robot control." >&2
+  echo "Start this stack through compose.yaml with SYS_NICE and rtprio enabled." >&2
+  exit 3
+fi
+echo "Real-time scheduling preflight passed."
 
 child_pids=()
 

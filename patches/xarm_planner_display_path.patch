@@ -1,5 +1,5 @@
 diff --git a/xarm_planner/include/xarm_planner/xarm_planner.h b/xarm_planner/include/xarm_planner/xarm_planner.h
-index 85d86f3..ce3afbf 100644
+index a0b77ee..665f806 100644
 --- a/xarm_planner/include/xarm_planner/xarm_planner.h
 +++ b/xarm_planner/include/xarm_planner/xarm_planner.h
 @@ -42,9 +42,11 @@ namespace xarm_planner
@@ -15,10 +15,10 @@ index 85d86f3..ce3afbf 100644
          moveit_msgs::msg::RobotTrajectory trajectory_;
          bool is_trajectory_;
 diff --git a/xarm_planner/src/xarm_planner.cpp b/xarm_planner/src/xarm_planner.cpp
-index 69c1271..32ec044 100644
+index d35f9fd..451cb11 100644
 --- a/xarm_planner/src/xarm_planner.cpp
 +++ b/xarm_planner/src/xarm_planner.cpp
-@@ -31,6 +31,9 @@ void XArmPlanner::init(const std::string& group_name)
+@@ -36,6 +36,9 @@ void XArmPlanner::init(const std::string& group_name)
      std::copy(move_group_->getJointModelGroupNames().begin(), move_group_->getJointModelGroupNames().end(), std::ostream_iterator<std::string>(std::cout, ", "));
      move_group_->setMaxVelocityScalingFactor(max_velocity_scaling_factor);
      move_group_->setMaxAccelerationScalingFactor(max_acceleration_scaling_factor);
@@ -28,7 +28,7 @@ index 69c1271..32ec044 100644
  }
  
  bool XArmPlanner::planJointTarget(const std::vector<double>& joint_target)
-@@ -46,6 +50,8 @@ bool XArmPlanner::planJointTarget(const std::vector<double>& joint_target)
+@@ -46,6 +49,8 @@ bool XArmPlanner::planJointTarget(const std::vector<double>& joint_target)
      success = (move_group_->plan(xarm_plan_) == moveit::core::MoveItErrorCode::SUCCESS);
      if (!success)
          RCLCPP_ERROR(node_->get_logger(), "planJointTarget: plan failed");
@@ -37,7 +37,7 @@ index 69c1271..32ec044 100644
      is_trajectory_ = false;
      return success;
  }
-@@ -58,6 +64,8 @@ bool XArmPlanner::planPoseTarget(const geometry_msgs::msg::Pose& pose_target)
+@@ -58,6 +63,8 @@ bool XArmPlanner::planPoseTarget(const geometry_msgs::msg::Pose& pose_target)
      success = (move_group_->plan(xarm_plan_) == moveit::core::MoveItErrorCode::SUCCESS);
      if (!success)
          RCLCPP_ERROR(node_->get_logger(), "planPoseTarget: plan failed");
@@ -46,7 +46,7 @@ index 69c1271..32ec044 100644
      is_trajectory_ = false;
      return success;
  }
-@@ -70,10 +78,21 @@ bool XArmPlanner::planPoseTargets(const std::vector<geometry_msgs::msg::Pose>& po
+@@ -70,8 +77,19 @@ bool XArmPlanner::planPoseTargets(const std::vector<geometry_msgs::msg::Pose>& po
      success = (move_group_->plan(xarm_plan_) == moveit::core::MoveItErrorCode::SUCCESS);
      if (!success)
          RCLCPP_ERROR(node_->get_logger(), "planPoseTargets: plan failed");
@@ -66,5 +66,3 @@ index 69c1271..32ec044 100644
 +}
 +
  bool XArmPlanner::planCartesianPath(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector)
- {
-     // moveit_msgs::msg::RobotTrajectory trajectory;

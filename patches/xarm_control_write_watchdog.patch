@@ -1,0 +1,56 @@
+diff --git a/xarm_controller/config/uf850_controllers.yaml b/xarm_controller/config/uf850_controllers.yaml
+index c2beb4e..55e7e84 100644
+--- a/xarm_controller/config/uf850_controllers.yaml
++++ b/xarm_controller/config/uf850_controllers.yaml
+@@ -1,6 +1,6 @@
+ controller_manager:
+   ros__parameters:
+-    update_rate: 150  # Hz
++    update_rate: 100  # Hz; UFACTORY Servo-J reference cadence is 10 ms
+
+     joint_state_broadcaster:
+       type: joint_state_broadcaster/JointStateBroadcaster
+diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+index b570b6e..b04ec22 100644
+--- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
++++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+@@ -7,6 +7,8 @@
+  ============================================================================*/
+
+ #include "xarm_controller/hardware/uf_robot_system_hardware.h"
++#include <chrono>
++#include <cstdint>
+
+ #define SERVICE_CALL_FAILED 999
+ #define SERVICE_IS_PERSISTENT_BUT_INVALID 998
+@@ -383,9 +385,29 @@ namespace uf_robot_hardware
+             curr_write_time_ = node_->get_clock()->now();
+             if (curr_write_time_.seconds() - prev_write_time_.seconds() > 1 || _check_cmds_is_change(prev_cmds_float_, cmds_float_)) {
+                 // RCLCPP_INFO(LOGGER, "[%s] positon: %s", robot_ip_.c_str(), pos_str.c_str());
++                const auto write_started_at = std::chrono::steady_clock::now();
+                 cmd_ret = xarm_driver_.arm->set_servo_angle_j(cmds_float_, 0, 0, 0);
++                const auto write_latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now() - write_started_at).count();
+                 if (cmd_ret != 0) {
+-                    RCLCPP_WARN(LOGGER, "[%s] set_servo_angle_j, ret= %d", robot_ip_.c_str(), cmd_ret);
++                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
++                    RCLCPP_ERROR(LOGGER,
++                        "[%s] set_servo_angle_j failed (ret=%d); robot STOP requested (ret=%d), aborting controllers",
++                        robot_ip_.c_str(), cmd_ret, stop_ret);
++                    write_code_ = cmd_ret;
++                    return hardware_interface::return_type::ERROR;
+                 }
++                // A late synchronous SDK write means the trajectory clock is now ahead of
++                // the last command sent to the robot.  Returning OK would let the next
++                // cycle jump directly to that future setpoint, producing the observed
++                // abrupt acceleration.  Stop and latch a hardware error instead.
++                if (write_latency_ms > 30) {
++                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
++                    RCLCPP_ERROR(LOGGER,
++                        "[%s] Servo-J write latency %ld ms exceeded 30 ms; robot STOP requested (ret=%d), aborting controllers to prevent trajectory catch-up",
++                        robot_ip_.c_str(), static_cast<long>(write_latency_ms), stop_ret);
++                    write_code_ = SERVICE_CALL_FAILED;
++                    return hardware_interface::return_type::ERROR;
++                }
+                 if (cmd_ret == 0) {
+                     prev_write_time_ = curr_write_time_;

@@ -6,6 +6,18 @@ services:
     tty: true
     network_mode: host
     ipc: "host"
+    # ros2_control requests FIFO scheduling for its control loop.  Without
+    # SYS_NICE/rtprio the request is rejected and network/GUI load can delay a
+    # Servo-J write long enough for the trajectory controller to jump ahead.
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      memlock:
+        soft: -1
+        hard: -1
     # Allow RealSense USB hot-plug without granting the container access to
     # every host device.
     device_cgroup_rules:
@@ -29,7 +41,7 @@ services:
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - ROBOT_IP=${ROBOT_IP:-192.168.1.232}
-      - XARM_REPORT_TYPE=${XARM_REPORT_TYPE:-rich}
+      - XARM_REPORT_TYPE=${XARM_REPORT_TYPE:-dev}
       - START_MODE=${START_MODE:-unified}
       - SAFE_SERVO_DRY_RUN=${SAFE_SERVO_DRY_RUN:-false}
       - MOVEIT_SERVO_DRY_RUN=${MOVEIT_SERVO_DRY_RUN:-false}
