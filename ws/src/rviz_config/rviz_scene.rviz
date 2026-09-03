@@ -161,7 +161,7 @@ Visualization Manager:
       Enabled: true
       Name: Pre-grasp Target
       Namespaces:
-        pregrasp_target: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -177,23 +177,23 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        aruco_marker_1:
+          Value: true
         aruco_marker_14:
           Value: true
-        aruco_marker_2:
+        aruco_marker_17:
           Value: true
-        aruco_marker_4:
-          Value: true
-        aruco_marker_5:
+        aruco_marker_34:
           Value: true
         aruco_marker_6:
           Value: true
-        box_2:
+        aruco_marker_9:
           Value: true
-        box_4:
-          Value: true
-        box_5:
+        box_1:
           Value: true
         box_6:
+          Value: true
+        box_9:
           Value: true
         camera_color_frame:
           Value: false
@@ -229,6 +229,8 @@ Visualization Manager:
           Value: true
         pallet_frame:
           Value: true
+        pallet_preview:
+          Value: true
         world:
           Value: false
         xarm_vacuum_gripper_link:
@@ -241,23 +243,23 @@ Visualization Manager:
       Tree:
         world:
           link_base:
+            aruco_marker_1:
+              {}
             aruco_marker_14:
               {}
-            aruco_marker_2:
+            aruco_marker_17:
               {}
-            aruco_marker_4:
-              {}
-            aruco_marker_5:
+            aruco_marker_34:
               {}
             aruco_marker_6:
               {}
-            box_2:
+            aruco_marker_9:
               {}
-            box_4:
-              {}
-            box_5:
+            box_1:
               {}
             box_6:
+              {}
+            box_9:
               {}
             link1:
               link2:
@@ -279,6 +281,8 @@ Visualization Manager:
                                 link_tcp:
                                   {}
             pallet_frame:
+              {}
+            pallet_preview:
               {}
       Update Interval: 0
       Value: true
@@ -614,7 +618,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 7.112150192260742
+      Distance: 2.8162364959716797
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -629,10 +633,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.09039826691150665
+      Pitch: 0.47539833188056946
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 3.251784324645996
+      Yaw: 6.056784152984619
     Saved: ~
 Window Geometry:
   Displays:

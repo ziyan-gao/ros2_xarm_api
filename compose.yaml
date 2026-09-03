@@ -45,7 +45,7 @@ services:
       - START_MODE=${START_MODE:-unified}
       - SAFE_SERVO_DRY_RUN=${SAFE_SERVO_DRY_RUN:-false}
       - MOVEIT_SERVO_DRY_RUN=${MOVEIT_SERVO_DRY_RUN:-false}
-      - SERVO_DESCENT_SPEED_M_S=${SERVO_DESCENT_SPEED_M_S:-0.03}
+      - SERVO_DESCENT_SPEED_M_S=${SERVO_DESCENT_SPEED_M_S:-0.05}
       - SERVO_DESCENT_KP_Z=${SERVO_DESCENT_KP_Z:-3.0}
       - PLACE_FORCE_THRESHOLD_N=${PLACE_FORCE_THRESHOLD_N:-4.0}
       - RVIZ_CONFIG=/workspace/ws/src/rviz_config/rviz_scene.rviz

@@ -32,6 +32,7 @@ class PickupPipeline(Node):
         self.declare_parameter('detection_timeout_sec', 20.0)
         self.declare_parameter('detection_stable_frames', 3)
         self.declare_parameter('motion_timeout_sec', 120.0)
+        self.declare_parameter('pregrasp_settle_sec', 0.75)
 
         def p(name):
             return self.get_parameter(name).value
@@ -40,6 +41,7 @@ class PickupPipeline(Node):
         self.detection_timeout = float(p('detection_timeout_sec'))
         self.detection_stable_frames = max(1, int(p('detection_stable_frames')))
         self.motion_timeout = float(p('motion_timeout_sec'))
+        self.pregrasp_settle = max(0.0, float(p('pregrasp_settle_sec')))
 
         self.state = self.IDLE
         self.fault = ''
@@ -52,6 +54,7 @@ class PickupPipeline(Node):
         self.pending_motion = None
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
+        self.pregrasp_succeeded_at = None
 
         self.status_pub = self.create_publisher(String, '/pickup_pipeline/status', 10)
         self.create_subscription(
@@ -113,6 +116,7 @@ class PickupPipeline(Node):
         self.fault = reason
         self.state = self.FAULT
         self.pending_motion = None
+        self.pregrasp_succeeded_at = None
         self.get_logger().error(reason)
         self.publish_status()
 
@@ -161,6 +165,7 @@ class PickupPipeline(Node):
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.expected_pickup_operation_id = None
+        self.pregrasp_succeeded_at = None
         self.phase_started = time.monotonic()
         self.state = self.MOVE_OBSERVATION
         future = self.plan_observation_client.call_async(Trigger.Request())
@@ -232,6 +237,7 @@ class PickupPipeline(Node):
         self.stable_detection_count = 0
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
+        self.pregrasp_succeeded_at = None
         response.success = True
         response.message = 'pickup pipeline reset to IDLE'
         self.publish_status()
@@ -328,6 +334,16 @@ class PickupPipeline(Node):
         if (operation_matches and motion_state == 'SUCCEEDED' and
                 target.startswith('pregrasp_box_')):
             self.pending_motion = None
+            if self.pregrasp_succeeded_at is None:
+                self.pregrasp_succeeded_at = time.monotonic()
+                self.get_logger().info(
+                    f'pre-grasp motion succeeded; waiting '
+                    f'{self.pregrasp_settle:.2f} s for TCP telemetry to settle')
+                self.publish_status()
+                return
+            if (time.monotonic() - self.pregrasp_succeeded_at <
+                    self.pregrasp_settle):
+                return
             if not self.start_pickup_client.service_is_ready():
                 self._set_fault('pickup supervisor is unavailable')
                 return
@@ -393,6 +409,9 @@ class PickupPipeline(Node):
             'motion_target': self.motion_status.get('target'),
             'pickup_state': self.pickup_status.get('state'),
             'stable_detection_count': self.stable_detection_count,
+            'pregrasp_settling': (
+                self.state == self.MOVE_PREGRASP and
+                self.pregrasp_succeeded_at is not None),
             'detected_box': box_summary,
         }, separators=(',', ':'))
         self.status_pub.publish(message)

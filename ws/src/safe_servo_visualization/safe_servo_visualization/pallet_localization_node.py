@@ -59,12 +59,16 @@ class PalletLocalization(Node):
     def __init__(self):
         super().__init__('pallet_localization')
         self.base_frame = 'link_base'
+        self.declare_parameter('pre_place_clearance_m', 0.04)
+        self.pre_place_clearance = max(
+            0.0, float(self.get_parameter('pre_place_clearance_m').value))
         self.marker_id = 49
         self.required_samples = 30
         self.position_tolerance = 0.005
         self.angle_tolerance = math.radians(2.0)
         self.pallet_x, self.pallet_y = 1.2, 1.0
         self.offset_rpy = np.zeros(3)
+        self.marker_offset_xyz = np.zeros(3)
         self.config_path = Path('/workspace/config/pallet_place_config.yaml')
         self.configured_position = np.zeros(3)
         self.configured_q = np.array([0.0, 0.0, 0.0, 1.0])
@@ -114,14 +118,27 @@ class PalletLocalization(Node):
     def config_callback(self, msg):
         if len(msg.data) < 13:
             return
-        if not self.collecting and not self.locked:
-            self.marker_id = int(round(msg.data[0]))
+        if not self.locked:
+            marker_id = int(round(msg.data[0]))
+            detection_config_changed = (
+                marker_id != self.marker_id or
+                max(5, int(round(msg.data[1]))) != self.required_samples or
+                max(0.0005, msg.data[2] / 1000.0) != self.position_tolerance or
+                math.radians(max(0.1, msg.data[3])) != self.angle_tolerance)
+            self.marker_id = marker_id
             self.required_samples = max(5, int(round(msg.data[1])))
             self.position_tolerance = max(0.0005, msg.data[2] / 1000.0)
             self.angle_tolerance = math.radians(max(0.1, msg.data[3]))
             self.pallet_x = max(0.01, msg.data[4] / 1000.0)
             self.pallet_y = max(0.01, msg.data[5] / 1000.0)
             self.offset_rpy = np.radians(np.asarray(msg.data[6:9], dtype=float))
+            if self.collecting and detection_config_changed:
+                self.samples = []
+                self.last_stamp = None
+                self.preview = None
+        if len(msg.data) >= 18:
+            self.marker_offset_xyz = np.asarray(
+                msg.data[15:18], dtype=float) / 1000.0
         self.pre_place_xyz = np.asarray(msg.data[9:12], dtype=float) / 1000.0
         self.rotate_item_90 = bool(msg.data[12] > 0.5)
         if len(msg.data) >= 14:
@@ -154,6 +171,9 @@ class PalletLocalization(Node):
                     localization['angle_tolerance_deg']))
                 self.offset_rpy = np.radians(np.asarray(
                     localization['marker_offset_rpy_deg'], dtype=float))
+                self.marker_offset_xyz = np.asarray(
+                    localization.get('marker_offset_xyz_m', [0.0, 0.0, 0.0]),
+                    dtype=float)
             pallet = document.get('pallet_pose')
             pre_place = document['pre_place_pose']
             if isinstance(pallet, dict):
@@ -195,6 +215,8 @@ class PalletLocalization(Node):
                 'angle_tolerance_deg': math.degrees(self.angle_tolerance),
                 'marker_offset_rpy_deg': [
                     float(value) for value in np.degrees(self.offset_rpy)],
+                'marker_offset_xyz_m': [
+                    float(value) for value in self.marker_offset_xyz],
             },
             'pallet_pose': ({
                 'position_m': [float(value) for value in self.configured_position],
@@ -230,6 +252,7 @@ class PalletLocalization(Node):
             1.0 if self.rotate_item_90 else 0.0,
             1.0 if self.keep_tcp_roll_pitch else 0.0,
             1.0 if self.add_placed_item_obstacle else 0.0,
+            *[float(value) for value in self.marker_offset_xyz * 1000.0],
         ]
         self.config_state_pub.publish(msg)
 
@@ -317,8 +340,10 @@ class PalletLocalization(Node):
                 f'UNSTABLE: {position_spread*1000:.1f} mm, '
                 f'{math.degrees(angle_spread):.1f} deg; retry')
             return
-        rotation = quat_matrix(mean_q) @ rpy_matrix(*self.offset_rpy)
-        self.preview = (mean_position, matrix_quat(rotation))
+        marker_rotation = quat_matrix(mean_q)
+        rotation = marker_rotation @ rpy_matrix(*self.offset_rpy)
+        pallet_position = mean_position + marker_rotation @ self.marker_offset_xyz
+        self.preview = (pallet_position, matrix_quat(rotation))
         self.publish_preview('pallet_preview')
         self.publish_status(
             f'READY TO LOCK: spread {position_spread*1000:.1f} mm, '
@@ -402,25 +427,14 @@ class PalletLocalization(Node):
     def publish_pre_place_pose(self):
         position, q = self.preview
         rotation = quat_matrix(q)
-        target_position = position + rotation @ self.pre_place_xyz
+        corner_with_clearance = self.pre_place_xyz + np.array(
+            [0.0, 0.0, self.pre_place_clearance])
+        target_position = position + rotation @ corner_with_clearance
+        # This pose describes the desired object frame, not link_tcp. The
+        # motion coordinator uses the captured TCP-to-object grasp transform
+        # to derive the corresponding TCP target.
         target_rotation = rotation @ rpy_matrix(
-            math.pi, 0.0, math.pi / 2.0 if self.rotate_item_90 else 0.0)
-        if self.keep_tcp_roll_pitch:
-            try:
-                tcp_tf = self.tf_buffer.lookup_transform(
-                    self.base_frame, 'link_tcp', rclpy.time.Time(),
-                    timeout=Duration(seconds=0.02))
-            except Exception:
-                # Do not publish a target with silently changed roll/pitch.
-                # The coordinator will reject planning when the pose becomes
-                # stale, which is safer than using the pallet-normal fallback.
-                return
-            tcp_q = tcp_tf.transform.rotation
-            tcp_rpy = self._matrix_rpy(quat_matrix(
-                (tcp_q.x, tcp_q.y, tcp_q.z, tcp_q.w)))
-            target_yaw = self._matrix_rpy(target_rotation)[2]
-            target_rotation = rpy_matrix(
-                tcp_rpy[0], tcp_rpy[1], target_yaw)
+            0.0, 0.0, math.pi / 2.0 if self.rotate_item_90 else 0.0)
         target_q = matrix_quat(target_rotation)
         msg = PoseStamped()
         msg.header.frame_id = self.base_frame

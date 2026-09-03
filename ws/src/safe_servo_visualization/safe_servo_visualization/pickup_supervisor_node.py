@@ -76,7 +76,8 @@ class PickupSupervisor(Node):
         self.declare_parameter('vacuum_verify_interval_sec', 0.5)
         self.declare_parameter('force_contact_threshold_n', 15.0)
         self.declare_parameter('place_force_contact_threshold_n', 4.0)
-        self.declare_parameter('servo_speed_scale', 0.6666666667)
+        # Keep pickup at 20 mm/s with the 50 mm/s bridge cap.
+        self.declare_parameter('servo_speed_scale', 0.4)
         self.declare_parameter('place_servo_speed_scale', 1.0)
         self.declare_parameter('workspace_x_min_mm', 160.0)
         self.declare_parameter('workspace_x_max_mm', 390.0)
@@ -359,6 +360,7 @@ class PickupSupervisor(Node):
             force,
             1.0 if touch_mode else 0.0,
             1.0 if bypass_force else 0.0,
+            1.0 if is_place else 0.0,
         ]
         self.config_pub.publish(message)
 

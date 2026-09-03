@@ -107,6 +107,8 @@ class MoveItServoBridge(Node):
         self.touch_mode = False
         self.touch_descent = False
         self.touch_contact = False
+        self.contact_on_fz_sign_change = False
+        self.fz_sign_deadband = 0.25
         self.bypass_force_arm_check = False
         self.enable_force_baseline = None
         self.enable_generation = 0
@@ -188,7 +190,7 @@ class MoveItServoBridge(Node):
             self.bypass_force_arm_check = False
             self.publish_status()
             return
-        if len(msg.data) not in (7, 8, 9, 10) or not all(
+        if len(msg.data) not in (7, 8, 9, 10, 11) or not all(
                 math.isfinite(value) for value in msg.data):
             return
         speed_scale = float(msg.data[0])
@@ -197,6 +199,7 @@ class MoveItServoBridge(Node):
         force_limit = float(msg.data[7]) if len(msg.data) >= 8 else self.force_limit
         touch_mode = bool(round(msg.data[8])) if len(msg.data) >= 9 else False
         bypass_force = bool(round(msg.data[9])) if len(msg.data) >= 10 else False
+        sign_change = bool(round(msg.data[10])) if len(msg.data) >= 11 else False
         if (0.01 <= speed_scale <= 1.0 and z_min < z_max and
                 force_limit > 0.0):
             # Keep the supervisor's scale relative to the configured bridge
@@ -207,16 +210,19 @@ class MoveItServoBridge(Node):
             self.force_limit = force_limit
             self.touch_mode = touch_mode
             self.bypass_force_arm_check = bypass_force
+            self.contact_on_fz_sign_change = sign_change
             self.get_logger().info(
                 f'guarded Servo config applied: speed={self.max_speed:.3f} m/s, '
                 f'force_delta_fz={self.force_limit:.1f} N, '
-                f'touch_mode={self.touch_mode}')
+                f'touch_mode={self.touch_mode}, fz_sign_change={sign_change}')
             self.publish_status()
 
     def _contact_delta_n(self):
         return self.force_limit
 
     def _force_safety_cap_n(self):
+        if self.contact_on_fz_sign_change:
+            return max(12.0, 3.0 * self.force_limit)
         return max(50.0, 3.0 * self.force_limit)
 
     def _update_wrench_delta(self, force, torque):
@@ -250,7 +256,16 @@ class MoveItServoBridge(Node):
             safety_cap = self._force_safety_cap_n()
             delta = self.force_delta_z or 0.0
             if self.touch_descent:
-                if delta >= contact_delta:
+                baseline_z = self.enable_wrench_baseline[2]
+                sign_reversed = (
+                    self.contact_on_fz_sign_change and
+                    abs(baseline_z) >= self.fz_sign_deadband and
+                    abs(force[2]) >= self.fz_sign_deadband and
+                    baseline_z * force[2] < 0.0)
+                # Contact does not always cross raw zero because payload and
+                # sensor bias set the starting sign. Stop on either a clear
+                # sign reversal or the baseline-relative Fz threshold.
+                if sign_reversed or delta >= contact_delta:
                     self._latch_touch_contact()
                 elif self.force_norm >= safety_cap or self.torque_norm >= self.torque_limit:
                     self.latch_fault(
@@ -873,6 +888,7 @@ class MoveItServoBridge(Node):
             'touch_mode': self.touch_mode,
             'touch_descent': self.touch_descent,
             'touch_contact': self.touch_contact,
+            'contact_on_fz_sign_change': self.contact_on_fz_sign_change,
             'bypass_force_arm_check': self.bypass_force_arm_check,
             'enable_force_baseline_n': self.enable_force_baseline,
             'enable_generation': self.enable_generation,

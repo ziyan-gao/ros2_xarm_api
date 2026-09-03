@@ -217,6 +217,8 @@ and previews the collision-checked plan before any execution is enabled.
 - Consume the refined item pose and dimensions.
 - Generate and validate grasp and pre-grasp poses.
 - Plan to pre-grasp with MoveIt.
+- After execution succeeds, allow 0.75 seconds for TCP telemetry to settle,
+  then require the existing Cartesian pre-grasp validation before descent.
 - Integrate safe-servo descent, vacuum activation and grasp verification, followed by a direct-driver vertical retreat.
 - Abort safely on stale perception, planning failure, force fault, or vacuum failure.
 
@@ -229,6 +231,15 @@ Phase 5 item attachment. See
 [planning-scene obstacles](planning_scene_obstacles.md).
 The attachment behavior and test procedure are documented in
 [Phase 5 planning-scene attachment](phase5_planning_scene_attachment.md).
+The place target specifies the carried object's minimum-X/minimum-Y/bottom
+corner in `pallet_frame`. The captured TCP-to-object grasp transform converts
+that target into the required TCP pose, with 40 mm of automatic vertical
+pre-place clearance before guarded descent.
+Marker-to-pallet XYZ calibration corrects any displacement between the ArUco
+origin and the physical pallet top; the current calibrated Z offset is
+`+21.3 mm`. Placement contact triggers on either a debounced raw-Fz sign
+reversal or 4 N of baseline-relative Z-force change. Independent 12 N force
+and torque safety caps remain active.
 
 - Add the environment collision objects.
 - Create item collision geometry from detected dimensions.

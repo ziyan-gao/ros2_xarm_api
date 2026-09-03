@@ -17,7 +17,7 @@ set -u
 : "${XARM_REPORT_TYPE:=dev}"
 : "${RVIZ_CONFIG:=/workspace/ws/src/rviz_config/rviz_scene.rviz}"
 : "${MOVEIT_SERVO_DRY_RUN:=false}"
-: "${SERVO_DESCENT_SPEED_M_S:=0.03}"
+: "${SERVO_DESCENT_SPEED_M_S:=0.05}"
 : "${SERVO_DESCENT_KP_Z:=3.0}"
 : "${PLACE_FORCE_THRESHOLD_N:=4.0}"
 

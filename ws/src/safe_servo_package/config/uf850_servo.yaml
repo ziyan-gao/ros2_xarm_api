@@ -27,8 +27,13 @@ monitored_planning_scene_topic: /monitored_planning_scene
 check_octomap_collisions: false
 check_collisions: true
 collision_check_rate: 20.0
-self_collision_proximity_threshold: 0.03
-scene_collision_proximity_threshold: 0.04
+# This vertical-only guarded Servo operates in a tightly constrained path.
+# MoveIt requires the self threshold to be no greater than the scene threshold.
+self_collision_proximity_threshold: 0.005
+# Guarded vertical placement intentionally approaches a known scene surface.
+# Begin proximity scaling only in the final 5 mm; the Fz contact detector and
+# independent wrench safety caps stop the motion at physical contact.
+scene_collision_proximity_threshold: 0.005
 
 use_smoothing: true
 smoothing_filter_plugin_name: online_signal_smoothing::ButterworthFilterPlugin

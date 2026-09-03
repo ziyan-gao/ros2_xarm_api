@@ -75,11 +75,16 @@ class PlanningSceneObstacles(Node):
         return obj
 
     def _table_objects(self):
+        # The robot base is yawed -90 degrees relative to the frame in which
+        # the table measurements were taken. Express the unchanged tables in
+        # link_base with the inverse (+90 degree) rotation.
+        table_orientation = (0.0, 0.0, math.sin(math.pi / 4.0),
+                             math.cos(math.pi / 4.0))
         return [
             self._box('work_table', (1.5, 2.5, 1.3),
-                      (0.6, -0.5, -0.03 - 1.3 / 2.0)),
-            self._box('secondary_table', (2.5, 1.8, 1.9),
-                      (-1.5, 1.2, 1.0 - 1.9 / 2.0)),
+                      (0.6, 0.6, -0.03 - 1.3 / 2.0), table_orientation),
+            self._box('secondary_table', (1.3, 2.5, 1.4),
+                      (0.2, -1.7, 0.1 - 1.4 / 2.0), table_orientation),
         ]
 
     def _apply(self, objects, description, on_success=None):
@@ -171,16 +176,20 @@ class PlanningSceneObstacles(Node):
         except TransformException as exc:
             self.get_logger().warning(f'cannot attach item without TCP TF: {exc}')
             return
-        t, q = tf.transform.translation, tf.transform.rotation
+        q = tf.transform.rotation
         tcp_q = (q.x, q.y, q.z, q.w)
-        center = self._rotate((snapshot['x_m'], snapshot['y_m'],
-                               snapshot['center_z_m']), tcp_q)
-        center = (center[0] + t.x, center[1] + t.y, center[2] + t.z)
         yaw = float(snapshot['yaw_rad'])
         item_q = self._multiply(
             tcp_q, (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)))
         item_size = (
             snapshot['size_x_m'], snapshot['size_y_m'], snapshot['size_z_m'])
+        # The suction TCP is the confirmed top-face contact point. Deriving
+        # the vertical attachment offset from the earlier depth center and a
+        # later TF sample made that offset sensitive to depth/TF disagreement
+        # and could consume the intended pre-place clearance. The pre-grasp is
+        # centered laterally, so model the object center as half its measured
+        # height below the contact point in the object's local frame.
+        center = self._rotate((0.0, 0.0, -item_size[2] / 2.0), item_q)
         obj = self._box(object_id, item_size, center, item_q)
         obj.header.frame_id = 'link_tcp'
         attached = AttachedCollisionObject()
@@ -298,6 +307,10 @@ class PlanningSceneObstacles(Node):
             'pallet_applied': self.pallet_applied,
             'attachment_pending': self.attachment_pending,
             'attached_item_id': self.attached_item_id,
+            'attached_item_size_m': self.attached_item_size,
+            'attached_item_center_in_tcp_m': self.attached_item_center,
+            'attached_item_orientation_in_tcp_xyzw':
+                self.attached_item_orientation,
             'placed_item_ids': list(self.placed_item_ids),
             'placed_item_count': len(self.placed_item_ids),
             'add_placed_item_obstacle': self.add_placed_item_obstacle,

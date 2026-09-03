@@ -65,6 +65,7 @@ class MotionCoordinator(Node):
         self.refined_boxes = {}
         self.pre_place_pose = None
         self.pre_place_pose_time = None
+        self.attached_item_geometry = None
         self.pallet_locked = False
         self.planned_pregrasp = None
         self.last_joint_state_time = None
@@ -92,6 +93,9 @@ class MotionCoordinator(Node):
         self.create_subscription(
             String, '/pallet_localization/status',
             self.pallet_status_callback, 10)
+        self.create_subscription(
+            String, '/planning_scene_obstacles/status',
+            self.planning_scene_status_callback, 10)
         self.create_subscription(
             JointState, self.joint_state_topic, self.joint_state_callback, 10)
 
@@ -239,6 +243,75 @@ class MotionCoordinator(Node):
     def pallet_status_callback(self, message):
         self.pallet_locked = message.data == 'LOCKED'
 
+    def planning_scene_status_callback(self, message):
+        try:
+            status = json.loads(message.data)
+            size = status.get('attached_item_size_m')
+            center = status.get('attached_item_center_in_tcp_m')
+            orientation = status.get(
+                'attached_item_orientation_in_tcp_xyzw')
+            if (status.get('attached_item_id') and len(size) == 3 and
+                    len(center) == 3 and len(orientation) == 4):
+                values = [*size, *center, *orientation]
+                if all(math.isfinite(float(value)) for value in values):
+                    self.attached_item_geometry = {
+                        'size': tuple(map(float, size)),
+                        'center': tuple(map(float, center)),
+                        'orientation': tuple(map(float, orientation)),
+                    }
+                    return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        self.attached_item_geometry = None
+
+    @staticmethod
+    def _quat_multiply(left, right):
+        lx, ly, lz, lw = left
+        rx, ry, rz, rw = right
+        return (
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        )
+
+    @classmethod
+    def _quat_rotate(cls, vector, quaternion):
+        qx, qy, qz, qw = quaternion
+        rotated = cls._quat_multiply(
+            cls._quat_multiply(quaternion, (*vector, 0.0)),
+            (-qx, -qy, -qz, qw))
+        return rotated[:3]
+
+    def _object_corner_to_tcp_pose(self, corner_pose):
+        if self.attached_item_geometry is None:
+            raise ValueError('attached-item grasp geometry is unavailable')
+        geometry = self.attached_item_geometry
+        object_q = (
+            float(corner_pose.orientation.x),
+            float(corner_pose.orientation.y),
+            float(corner_pose.orientation.z),
+            float(corner_pose.orientation.w))
+        relative_q = geometry['orientation']
+        tcp_q = self._quat_multiply(
+            object_q,
+            (-relative_q[0], -relative_q[1], -relative_q[2], relative_q[3]))
+        half_size = tuple(value / 2.0 for value in geometry['size'])
+        corner = (float(corner_pose.position.x),
+                  float(corner_pose.position.y),
+                  float(corner_pose.position.z))
+        center_offset = self._quat_rotate(half_size, object_q)
+        object_center = tuple(
+            corner[index] + center_offset[index] for index in range(3))
+        tcp_to_center = self._quat_rotate(geometry['center'], tcp_q)
+        tcp_position = tuple(
+            object_center[index] - tcp_to_center[index] for index in range(3))
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = tcp_position
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = tcp_q
+        return pose
+
     def plan_pre_place_callback(self, _request, response):
         if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
@@ -255,7 +328,11 @@ class MotionCoordinator(Node):
         if not self.pose_plan_client.service_is_ready():
             response.message = 'xArm pose planning service is unavailable'
             return response
-        pose = self.pre_place_pose
+        try:
+            pose = self._object_corner_to_tcp_pose(self.pre_place_pose)
+        except ValueError as exc:
+            response.message = str(exc)
+            return response
         values = (
             pose.position.x, pose.position.y, pose.position.z,
             pose.orientation.x, pose.orientation.y,
@@ -277,7 +354,7 @@ class MotionCoordinator(Node):
             lambda completed: self._plan_completed(request_id, completed))
         response.success = True
         response.message = (
-            'Planning pallet-relative pre-place at '
+            'Planning TCP for pallet-relative object-corner pre-place at '
             f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
             f'{pose.position.z:.3f}] m; operation_id={request_id}')
         return response

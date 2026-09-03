@@ -241,8 +241,8 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   pre_place_form->setRowWrapPolicy(QFormLayout::WrapAllRows);
   pre_place_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
   const char * pre_place_names[] = {
-    "Pre-place pallet X (mm)", "Pre-place pallet Y (mm)",
-    "Pre-place pallet Z (mm)"};
+    "Final object corner X (mm)", "Final object corner Y (mm)",
+    "Final object corner Z (mm)"};
   const double pre_place_defaults[] = {600.0, 500.0, 200.0};
   for (size_t i = 0; i < pre_place_pose_.size(); ++i) {
     pre_place_pose_[i] = new QDoubleSpinBox(this);
@@ -255,6 +255,9 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   pre_place_form->addRow(rotate_item_90_);
   keep_tcp_roll_pitch_ = new QCheckBox("Keep current TCP roll/pitch", this);
   keep_tcp_roll_pitch_->setChecked(false);
+  keep_tcp_roll_pitch_->setEnabled(false);
+  keep_tcp_roll_pitch_->setToolTip(
+    "Object-corner placement derives TCP orientation from the captured grasp");
   pre_place_form->addRow(keep_tcp_roll_pitch_);
   add_placed_item_obstacle_ =
     new QCheckBox("Add placed item as MoveIt obstacle", this);

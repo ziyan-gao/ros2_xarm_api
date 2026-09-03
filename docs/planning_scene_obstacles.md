@@ -7,12 +7,14 @@ through `/apply_planning_scene`. All dimensions and poses use metres in
 ## Fixed tables
 
 The supplied poses describe each top-face center. Collision-box centers are
-therefore shifted downward by half the full height.
+therefore shifted downward by half the full height. The robot base is rotated
+-90 degrees about Z relative to the table measurement frame, so table poses in
+`link_base` use the inverse transform: `(x, y) -> (-y, x)` and +90 degrees yaw.
 
-| ID | Size X/Y/Z | Top-face center | Collision-box center |
-| --- | --- | --- | --- |
-| `work_table` | 1.5 / 2.5 / 1.3 | 0.6 / -0.5 / -0.03 | 0.6 / -0.5 / -0.68 |
-| `secondary_table` | 2.5 / 1.8 / 1.9 | -1.5 / 1.2 / 1.0 | -1.5 / 1.2 / 0.05 |
+| ID | Size X/Y/Z | Top-face center in `link_base` | Collision-box center in `link_base` | Yaw |
+| --- | --- | --- | --- | --- |
+| `work_table` | 1.5 / 2.5 / 1.3 | 0.6 / 0.6 / -0.03 | 0.6 / 0.6 / -0.68 | +90 deg |
+| `secondary_table` | 1.3 / 2.5 / 1.4 | 0.2 / -1.7 / 0.1 | 0.2 / -1.7 / -0.6 | +90 deg |
 
 ## Pallet surface
 
