@@ -85,6 +85,11 @@ class PickupSupervisor(Node):
         self.declare_parameter('workspace_y_max_mm', 360.0)
         self.declare_parameter('workspace_z_min_mm', 50.0)
         self.declare_parameter('workspace_z_max_mm', 800.0)
+        self.declare_parameter('transfer_radius_max_mm', 820.0)
+        self.declare_parameter('transfer_z_min_mm', 50.0)
+        self.declare_parameter('transfer_z_max_mm', 800.0)
+        self.declare_parameter('pre_place_clearance_m', 0.04)
+        self.declare_parameter('container_height_m', 0.45)
 
         def p(name):
             return self.get_parameter(name).value
@@ -128,6 +133,11 @@ class PickupSupervisor(Node):
             float(p('workspace_y_min_mm')), float(p('workspace_y_max_mm')),
             float(p('workspace_z_min_mm')), float(p('workspace_z_max_mm')),
         )
+        self.transfer_radius_max_mm = float(p('transfer_radius_max_mm'))
+        self.transfer_z_bounds_mm = (
+            float(p('transfer_z_min_mm')), float(p('transfer_z_max_mm')))
+        self.pre_place_clearance = float(p('pre_place_clearance_m'))
+        self.container_height = float(p('container_height_m'))
         if not 0.0 <= self.contact_search_margin <= self.max_descent:
             raise ValueError(
                 'contact_search_margin_m must be within '
@@ -159,6 +169,11 @@ class PickupSupervisor(Node):
         self.retreat_started = None
         self.retreat_target_z = None
         self.retreat_start_z = None
+        self.retreat_start_xyz = None
+        self.direct_target_z = None
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
+        self.place_target_z = None
         self.post_retreat_fault = ''
         self.dry_run = True
         self.vacuum_verified = False
@@ -182,6 +197,7 @@ class PickupSupervisor(Node):
         self.robot_mode = None
         self.robot_error = None
         self.robot_state_time = None
+        self.robot_tcp_xyz = None
         self._ft_settle_timer = None
         self._post_ft_state_timer = None
         self.pre_descent_wait_callback = None
@@ -211,6 +227,9 @@ class PickupSupervisor(Node):
             String, '/pallet_localization/status',
             self.pallet_status_callback, 10)
         self.create_subscription(
+            Float64MultiArray, '/pallet_localization/config_state',
+            self.pallet_config_callback, 10)
+        self.create_subscription(
             JointState, self.joint_state_topic, self.joint_state_callback, 10)
         self.create_subscription(
             RobotMsg, '/ufactory/robot_states', self.robot_state_callback, 10)
@@ -239,6 +258,10 @@ class PickupSupervisor(Node):
         self.create_service(
             Trigger, '/pickup_supervisor/start_place', self.start_place_callback)
         self.create_service(
+            Trigger, '/pickup_supervisor/start_loading', self.start_loading_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/start_transfer', self.start_transfer_callback)
+        self.create_service(
             Trigger, '/pickup_supervisor/retreat', self.retreat_callback)
         self.create_service(Trigger, '/pickup_supervisor/abort', self.abort_callback)
         self.create_service(Trigger, '/pickup_supervisor/reset', self.reset_callback)
@@ -262,6 +285,10 @@ class PickupSupervisor(Node):
         self.robot_mode = int(message.mode)
         self.robot_error = int(message.err)
         self.robot_state_time = time.monotonic()
+        if len(message.pose) >= 3:
+            xyz = tuple(float(value) / 1000.0 for value in message.pose[:3])
+            if all(math.isfinite(value) for value in xyz):
+                self.robot_tcp_xyz = xyz
 
     def servo_status_callback(self, message):
         try:
@@ -285,6 +312,10 @@ class PickupSupervisor(Node):
 
     def pallet_status_callback(self, message):
         self.pallet_locked = message.data == 'LOCKED'
+
+    def pallet_config_callback(self, message):
+        if len(message.data) >= 12:
+            self.place_target_z = float(message.data[11]) / 1000.0
 
     def _validate_pregrasp_ready(self):
         if self.motion_status.get('state') != 'SUCCEEDED' or not str(
@@ -331,11 +362,25 @@ class PickupSupervisor(Node):
         keys = ('tcp_x_m', 'tcp_y_m', 'tcp_z_m')
         if self.servo_status_time is None or (
                 time.monotonic() - self.servo_status_time > self.status_timeout):
-            raise ValueError('safe-servo status is stale')
+            if (self.robot_tcp_xyz is not None and
+                    self.robot_state_time is not None and
+                    time.monotonic() - self.robot_state_time <= self.status_timeout):
+                return self.robot_tcp_xyz
+            raise ValueError('TCP telemetry is stale')
         joint_age = self.servo_status.get('joint_state_age_sec')
-        if joint_age is None or float(joint_age) > self.status_timeout:
+        supervisor_joint_age = (
+            None if self.last_joint_state_time is None else
+            time.monotonic() - self.last_joint_state_time)
+        safe_servo_joint_fresh = (
+            joint_age is not None and float(joint_age) <= self.status_timeout)
+        supervisor_joint_fresh = (
+            supervisor_joint_age is not None and
+            supervisor_joint_age <= self.status_timeout)
+        if not safe_servo_joint_fresh and not supervisor_joint_fresh:
             raise ValueError(
-                f'/joint_states is stale or unavailable (age={joint_age})')
+                '/joint_states is stale or unavailable '
+                f'(safe_servo_age={joint_age}, '
+                f'supervisor_age={supervisor_joint_age})')
         try:
             xyz = tuple(float(self.servo_status[key]) for key in keys)
         except (KeyError, TypeError, ValueError):
@@ -377,6 +422,21 @@ class PickupSupervisor(Node):
             response.message = str(exc)
             return response
 
+        object_height = float(snapshot['size_z_m'])
+        if self.place_target_z is None:
+            response.message = 'place target Z is unavailable'
+            return response
+        lift = self.pre_place_clearance + object_height + self.place_target_z
+        if lift > self.container_height:
+            lift = self.pre_place_clearance + self.place_target_z
+        self.direct_target_z = z + lift
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
+        if self.direct_target_z > self.servo_bounds_mm[5] / 1000.0:
+            response.message = (
+                f'nominal pickup retreat Z {self.direct_target_z:.3f} m exceeds '
+                'the configured workspace ceiling')
+            return response
         self.operation_id += 1
         self.operation_kind = 'pickup'
         self.fault = ''
@@ -385,6 +445,8 @@ class PickupSupervisor(Node):
         self.vacuum_verify_count = 0
         self.contact_detected = False
         self.pregrasp_z = z
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
         self.floor_z = floor_z
         self.virtual_z = z
         self.state = self.ARMING_DESCENT
@@ -432,8 +494,8 @@ class PickupSupervisor(Node):
             response.message = f'supervisor already active in {self.state}'
             return response
         if self.motion_status.get('state') != 'SUCCEEDED' or (
-                self.motion_status.get('target') != 'pre_place'):
-            response.message = 'execute the pallet-relative pre-place pose first'
+                self.motion_status.get('target') != 'transfer_ready'):
+            response.message = 'execute transfer and linear loading first'
             return response
         if not self.pallet_locked:
             response.message = 'pallet pose is not LOCKED'
@@ -455,6 +517,17 @@ class PickupSupervisor(Node):
         self.post_retreat_fault = ''
         self.contact_detected = False
         self.pregrasp_z = z
+        try:
+            self.direct_target_z = float(
+                self.motion_status['transfer_tcp_z_m'])
+        except (KeyError, TypeError, ValueError):
+            response.message = 'recorded transfer retreat height is unavailable'
+            return response
+        if self.direct_target_z < z - self.tolerance:
+            response.message = 'recorded transfer retreat height is below TCP'
+            return response
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
         servo_floor_z = self.servo_bounds_mm[4] / 1000.0
         self.floor_z = max(z - self.max_descent, servo_floor_z)
         if z - self.floor_z < self.minimum_contact_descent:
@@ -473,6 +546,102 @@ class PickupSupervisor(Node):
         response.message = (
             f'place contact descent is arming from Z {z:.3f} m; '
             f'maximum descent={self.max_descent:.3f} m')
+        return response
+
+    def start_loading_callback(self, _request, response):
+        if self.state in self.ACTIVE:
+            response.message = f'supervisor already active in {self.state}'
+            return response
+        if (self.motion_status.get('state') != 'SUCCEEDED' or
+                self.motion_status.get('target') != 'transfer_ready'):
+            response.message = 'execute the nominal transfer pose first'
+            return response
+        target_z = self.motion_status.get('pre_place_tcp_z_m')
+        try:
+            current_z = self._tcp_xyz()[2]
+            target_z = float(target_z)
+        except (TypeError, ValueError) as exc:
+            response.message = f'loading target is unavailable: {exc}'
+            return response
+        if target_z > current_z + self.tolerance:
+            response.message = 'loading target must not move upward'
+            return response
+        self.operation_id += 1
+        self.operation_kind = 'loading'
+        self.fault = ''
+        self.post_retreat_fault = ''
+        self.pregrasp_z = target_z
+        self.direct_target_z = target_z
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
+        self._disable_servo_then_direct_retreat()
+        response.success = True
+        response.message = (
+            f'linear loading started: TCP Z {current_z:.3f} -> {target_z:.3f} m')
+        return response
+
+    def start_transfer_callback(self, _request, response):
+        if self.state in self.ACTIVE:
+            response.message = f'supervisor already active in {self.state}'
+            return response
+        if (self.motion_status.get('state') != 'SUCCEEDED' or
+                self.motion_status.get('target') != 'transfer_ready'):
+            response.message = 'prepare the nominal transfer target first'
+            return response
+        target = self.motion_status.get('transfer_tcp_xyz_m')
+        quaternion = self.motion_status.get('transfer_tcp_quaternion_xyzw')
+        if not isinstance(target, (list, tuple)) or len(target) != 3:
+            response.message = 'transfer XYZ target is incomplete'
+            return response
+        if not isinstance(quaternion, (list, tuple)) or len(quaternion) != 4:
+            response.message = 'transfer orientation target is incomplete'
+            return response
+        try:
+            current = self._tcp_xyz()
+            target = tuple(float(value) for value in target)
+            quaternion = tuple(float(value) for value in quaternion)
+        except (TypeError, ValueError) as exc:
+            response.message = f'transfer target is unavailable: {exc}'
+            return response
+        if len(target) != 3 or not all(math.isfinite(value) for value in target):
+            response.message = 'transfer target is invalid'
+            return response
+        if len(quaternion) != 4 or not all(
+                math.isfinite(value) for value in quaternion):
+            response.message = 'transfer orientation is invalid'
+            return response
+        x_mm, y_mm, z_mm = (value * 1000.0 for value in target)
+        radius_mm = math.hypot(x_mm, y_mm)
+        if (radius_mm > self.transfer_radius_max_mm or
+                not self.transfer_z_bounds_mm[0] <= z_mm <=
+                self.transfer_z_bounds_mm[1]):
+            response.message = (
+                'transfer target is outside the nominal transfer envelope: '
+                f'radius={radius_mm:.1f} mm '
+                f'(max {self.transfer_radius_max_mm:.1f}), Z={z_mm:.1f} mm '
+                f'(limits {self.transfer_z_bounds_mm[0]:.1f}..'
+                f'{self.transfer_z_bounds_mm[1]:.1f})')
+            return response
+        qx, qy, qz, qw = quaternion
+        roll = math.atan2(2.0 * (qw * qx + qy * qz),
+                          1.0 - 2.0 * (qx * qx + qy * qy))
+        pitch = math.asin(max(-1.0, min(
+            1.0, 2.0 * (qw * qy - qz * qx))))
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy),
+                         1.0 - 2.0 * (qy * qy + qz * qz))
+        self.operation_id += 1
+        self.operation_kind = 'transfer'
+        self.fault = ''
+        self.post_retreat_fault = ''
+        self.direct_target_xyz = target
+        self.direct_target_rpy = (roll, pitch, yaw)
+        self.direct_target_z = target[2]
+        self._disable_servo_then_direct_retreat()
+        response.success = True
+        response.message = (
+            'nominal Cartesian transfer started: '
+            f'[{current[0]:.3f}, {current[1]:.3f}, {current[2]:.3f}] -> '
+            f'[{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}] m')
         return response
 
     def _reset_servo_then_begin_place(self, z, floor_z):
@@ -962,15 +1131,16 @@ class PickupSupervisor(Node):
         self._begin_direct_retreat()
 
     def _begin_direct_retreat(self):
-        if self.pregrasp_z is None:
-            self._fault('pre-grasp retreat height is unavailable')
+        if self.direct_target_z is None:
+            self._fault('direct vertical target height is unavailable')
             return
         if self.dry_run:
-            self.virtual_z = self.pregrasp_z
+            self.virtual_z = self.direct_target_z
             self._finish_retreat()
             return
         try:
-            self.retreat_start_z = self._tcp_xyz()[2]
+            self.retreat_start_xyz = self._tcp_xyz()
+            self.retreat_start_z = self.retreat_start_xyz[2]
         except ValueError as exc:
             self._fault(f'cannot start direct retreat: {exc}')
             return
@@ -1065,20 +1235,33 @@ class PickupSupervisor(Node):
             self._fault('direct retreat start Z snapshot is unavailable')
             return
         current_z = self.retreat_start_z
-        distance_mm = (self.pregrasp_z - current_z) * 1000.0
-        if distance_mm <= self.tolerance * 1000.0:
+        absolute_pose = (
+            self.direct_target_xyz is not None and
+            self.direct_target_rpy is not None)
+        if self.direct_target_xyz is None:
+            delta = (0.0, 0.0, self.direct_target_z - current_z)
+        else:
+            start_xyz = self.retreat_start_xyz
+            delta = tuple(
+                self.direct_target_xyz[index] - start_xyz[index]
+                for index in range(3))
+        distance_mm = tuple(value * 1000.0 for value in delta)
+        if math.sqrt(sum(value * value for value in delta)) <= self.tolerance:
             self._restore_ros2_control_mode()
             return
         request = MoveCartesian.Request()
-        request.pose = [0.0, 0.0, distance_mm, 0.0, 0.0, 0.0]
+        request.pose = (
+            [*(value * 1000.0 for value in self.direct_target_xyz),
+             *self.direct_target_rpy]
+            if absolute_pose else [*distance_mm, 0.0, 0.0, 0.0])
         request.speed = self.retreat_speed
         request.acc = self.retreat_acc
         request.mvtime = 0.0
         request.wait = True
-        request.relative = True
+        request.relative = not absolute_pose
         self.state = self.RETREATING
         self.retreat_started = time.monotonic()
-        self.retreat_target_z = self.pregrasp_z
+        self.retreat_target_z = self.direct_target_z
         future = self.retreat_client.call_async(request)
         future.add_done_callback(self._direct_retreat_completed)
 
@@ -1104,7 +1287,7 @@ class PickupSupervisor(Node):
             self._restore_ros2_control_mode()
             return
         self.retreat_started = None
-        self.get_logger().info('direct vertical retreat to pre-grasp succeeded')
+        self.get_logger().info('direct vertical Cartesian motion succeeded')
         self._restore_ros2_control_mode()
 
     def _restore_ros2_control_mode(self):
@@ -1468,6 +1651,9 @@ class PickupSupervisor(Node):
         self.state = self.IDLE
         self.fault = ''
         self.pregrasp_z = None
+        self.direct_target_z = None
+        self.direct_target_xyz = None
+        self.direct_target_rpy = None
         self.floor_z = None
         self.virtual_z = None
         self.descent_target_z = None
@@ -1480,6 +1666,7 @@ class PickupSupervisor(Node):
         self.retreat_started = None
         self.retreat_target_z = None
         self.retreat_start_z = None
+        self.retreat_start_xyz = None
         self.post_retreat_fault = ''
         self.restore_wait_sequence = None
         self.restore_wait_deadline = None

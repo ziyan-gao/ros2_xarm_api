@@ -31,8 +31,8 @@ pallet_pose:
 pre_place_pose:
   frame_id: pallet_frame
   position_m:
-  - 0.0
-  - 0.0
+  - 0.4
+  - 0.4
   - 0.0
   rotate_item_90_deg: false
   keep_tcp_roll_pitch: false

@@ -214,17 +214,17 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   connect(reset_motion, &QPushButton::clicked,
     this, &SafeServoPanel::resetMotionCoordinator);
 
-  auto * pickup_group = new QGroupBox("Pickup cycle", this);
+  auto * pickup_group = new QGroupBox("PickAndPlace cycle", this);
   auto * pickup_layout = new QVBoxLayout(pickup_group);
   auto * pickup_buttons = new QVBoxLayout();
-  auto * start_pickup = new QPushButton("Start pickup", this);
+  auto * start_pickup = new QPushButton("Start PickAndPlace", this);
   auto * abort_pickup = new QPushButton("Abort", this);
   auto * reset_pickup = new QPushButton("Reset", this);
   pickup_buttons->addWidget(start_pickup);
   pickup_buttons->addWidget(abort_pickup);
   pickup_buttons->addWidget(reset_pickup);
   pickup_layout->addLayout(pickup_buttons);
-  pickup_state_label_ = new QLabel("Pickup pipeline: unavailable", this);
+  pickup_state_label_ = new QLabel("PickAndPlace pipeline: unavailable", this);
   pickup_state_label_->setWordWrap(true);
   pickup_layout->addWidget(pickup_state_label_);
   layout->addWidget(pickup_group);
@@ -235,7 +235,7 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   connect(reset_pickup, &QPushButton::clicked,
     this, &SafeServoPanel::resetPickup);
 
-  auto * place_group = new QGroupBox("Place cycle", this);
+  auto * place_group = new QGroupBox("Placement target", this);
   auto * place_layout = new QVBoxLayout(place_group);
   auto * pre_place_form = new QFormLayout();
   pre_place_form->setRowWrapPolicy(QFormLayout::WrapAllRows);
@@ -265,33 +265,15 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   pre_place_form->addRow(add_placed_item_obstacle_);
   place_layout->addLayout(pre_place_form);
   auto * save_place_config = new QPushButton("Apply/save place target", this);
-  auto * plan_pre_place = new QPushButton("Plan pre-place", this);
   auto * place_config_buttons = new QVBoxLayout();
   place_config_buttons->addWidget(save_place_config);
-  place_config_buttons->addWidget(plan_pre_place);
   place_layout->addLayout(place_config_buttons);
-  auto * place_buttons = new QVBoxLayout();
-  auto * start_place = new QPushButton("Start place", this);
-  auto * abort_place = new QPushButton("Abort", this);
-  auto * reset_place = new QPushButton("Reset", this);
-  place_buttons->addWidget(start_place);
-  place_buttons->addWidget(abort_place);
-  place_buttons->addWidget(reset_place);
-  place_layout->addLayout(place_buttons);
   place_state_label_ = new QLabel("Place pipeline: unavailable", this);
   place_state_label_->setWordWrap(true);
   place_layout->addWidget(place_state_label_);
   layout->addWidget(place_group);
-  connect(start_place, &QPushButton::clicked,
-    this, &SafeServoPanel::startPlace);
   connect(save_place_config, &QPushButton::clicked,
     this, &SafeServoPanel::applyPalletConfig);
-  connect(plan_pre_place, &QPushButton::clicked,
-    this, &SafeServoPanel::planPrePlace);
-  connect(abort_place, &QPushButton::clicked,
-    this, &SafeServoPanel::abortPlace);
-  connect(reset_place, &QPushButton::clicked,
-    this, &SafeServoPanel::resetPlace);
   layout->addStretch();
 }
 
@@ -403,13 +385,13 @@ void SafeServoPanel::onInitialize()
       motion_state_label_->setText(QString::fromStdString(msg->data));
     });
   start_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
-    "/pickup_pipeline/start");
+    "/pick_place_pipeline/start");
   abort_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
-    "/pickup_pipeline/abort");
+    "/pick_place_pipeline/abort");
   reset_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
-    "/pickup_pipeline/reset");
+    "/pick_place_pipeline/reset");
   pickup_status_sub_ = node_->create_subscription<std_msgs::msg::String>(
-    "/pickup_pipeline/status", 10,
+    "/pick_place_pipeline/status", 10,
     [this](const std_msgs::msg::String::SharedPtr msg) {
       pickup_state_label_->setText(QString::fromStdString(msg->data));
     });
@@ -682,10 +664,13 @@ void SafeServoPanel::startPickup()
     return;
   }
   publishConfig();
-  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-  start_pickup_client_->async_send_request(request, [this](
-    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
-    pickup_state_label_->setText(QString::fromStdString(future.get()->message));
+  applyPalletConfig();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    start_pickup_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      pickup_state_label_->setText(QString::fromStdString(future.get()->message));
+    });
   });
 }
 

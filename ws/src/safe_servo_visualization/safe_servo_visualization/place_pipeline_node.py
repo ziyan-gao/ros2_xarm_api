@@ -11,19 +11,23 @@ class PlacePipeline(Node):
     """Move to pre-place, guarded-place, retreat, and return to observation."""
 
     IDLE = 'IDLE'
-    MOVE_PRE_PLACE = 'MOVE_PRE_PLACE'
+    MOVE_TRANSFER = 'MOVE_TRANSFER'
+    LOAD_PRE_PLACE = 'LOAD_PRE_PLACE'
     CONTACT_PLACE = 'CONTACT_PLACE'
     MOVE_OBSERVATION = 'MOVE_OBSERVATION'
     SUCCEEDED = 'SUCCEEDED'
     FAULT = 'FAULT'
     ABORTING = 'ABORTING'
-    ACTIVE = {MOVE_PRE_PLACE, CONTACT_PLACE, MOVE_OBSERVATION, ABORTING}
+    ACTIVE = {MOVE_TRANSFER, LOAD_PRE_PLACE, CONTACT_PLACE, MOVE_OBSERVATION, ABORTING}
 
     def __init__(self):
         super().__init__('place_pipeline')
         self.declare_parameter('motion_timeout_sec', 120.0)
+        self.declare_parameter('post_loading_settle_sec', 0.75)
         self.motion_timeout = float(
             self.get_parameter('motion_timeout_sec').value)
+        self.post_loading_settle = float(
+            self.get_parameter('post_loading_settle_sec').value)
         self.state, self.fault, self.pending_motion = self.IDLE, '', None
         self.operation_id = 0
         self.phase_started = None
@@ -33,6 +37,7 @@ class PlacePipeline(Node):
         self.pallet_status = 'UNLOCALIZED'
         self.expected_motion_operation_id = None
         self.expected_supervisor_operation_id = None
+        self.loading_succeeded_at = None
         self.status_pub = self.create_publisher(String, '/place_pipeline/status', 10)
         self.create_subscription(
             String, '/motion_coordinator/status', self._motion_status, 10)
@@ -42,8 +47,8 @@ class PlacePipeline(Node):
             String, '/planning_scene_obstacles/status', self._scene_status, 10)
         self.create_subscription(
             String, '/pallet_localization/status', self._pallet_status, 10)
-        self.plan_pre_place = self.create_client(
-            Trigger, '/motion_coordinator/plan_pre_place')
+        self.prepare_transfer = self.create_client(
+            Trigger, '/motion_coordinator/prepare_nominal_transfer')
         self.plan_observation = self.create_client(
             Trigger, '/motion_coordinator/plan_observation')
         self.execute_motion = self.create_client(
@@ -52,6 +57,10 @@ class PlacePipeline(Node):
             Trigger, '/motion_coordinator/cancel')
         self.start_place = self.create_client(
             Trigger, '/pickup_supervisor/start_place')
+        self.start_loading = self.create_client(
+            Trigger, '/pickup_supervisor/start_loading')
+        self.start_transfer = self.create_client(
+            Trigger, '/pickup_supervisor/start_transfer')
         self.abort_supervisor = self.create_client(
             Trigger, '/pickup_supervisor/abort')
         self.create_service(Trigger, '/place_pipeline/start', self.start_callback)
@@ -88,22 +97,22 @@ class PlacePipeline(Node):
                 response, 'no carried item is attached; complete pickup first')
         if self.pallet_status != 'LOCKED':
             return self._reject_start(response, 'pallet pose is not LOCKED')
-        if not self.plan_pre_place.service_is_ready():
+        if not self.prepare_transfer.service_is_ready():
             return self._reject_start(
-                response, 'pre-place planning service is unavailable')
+                response, 'transfer planning service is unavailable')
         self.operation_id += 1
         self.fault = ''
-        self.state = self.MOVE_PRE_PLACE
-        self.pending_motion = 'pre_place'
+        self.state = self.MOVE_TRANSFER
+        self.pending_motion = 'transfer_prepare'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.expected_supervisor_operation_id = None
         self.phase_started = time.monotonic()
-        future = self.plan_pre_place.call_async(Trigger.Request())
+        future = self.prepare_transfer.call_async(Trigger.Request())
         future.add_done_callback(
-            lambda done: self._plan_completed(done, 'pre-place'))
+            lambda done: self._prepare_transfer_completed(done))
         response.success = True
-        response.message = 'place pipeline started: planning pre-place'
+        response.message = 'place pipeline started: planning nominal transfer'
         self.publish_status()
         return response
 
@@ -125,6 +134,28 @@ class PlacePipeline(Node):
         if result is None or not result.success:
             message = 'no response' if result is None else result.message
             self._fault(f'plan {label} rejected: {message}')
+
+    def _prepare_transfer_completed(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'prepare transfer failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(f'prepare transfer rejected: {message}')
+            return
+        self.pending_motion = 'transfer_waiting_for_status'
+
+    def _start_transfer_completed(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'nominal transfer start failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(f'nominal transfer rejected: {message}')
 
     def _execute(self):
         if not self.execute_motion.service_is_ready():
@@ -152,29 +183,93 @@ class PlacePipeline(Node):
         if self.motion_status.get('state') == 'FAULT' and self.state != self.CONTACT_PLACE:
             self._fault(self.motion_status.get('fault', 'MoveIt motion failed'))
             return
-        if self.state == self.MOVE_PRE_PLACE:
-            self._tick_pre_place()
+        if self.state == self.MOVE_TRANSFER:
+            self._tick_transfer()
+        elif self.state == self.LOAD_PRE_PLACE:
+            self._tick_loading()
         elif self.state == self.CONTACT_PLACE:
             self._tick_contact_place()
         elif self.state == self.MOVE_OBSERVATION:
             self._tick_observation()
 
-    def _tick_pre_place(self):
-        state = self.motion_status.get('state')
-        operation_matches = (
-            self.expected_motion_operation_id is not None and
-            int(self.motion_status.get('operation_id', -1)) >=
-            self.expected_motion_operation_id)
-        if (operation_matches and state == 'PLANNED' and
-                self.pending_motion == 'pre_place'):
-            self.pending_motion = 'pre_place_executing'
-            self._execute()
-        elif (operation_matches and state == 'SUCCEEDED' and
-              self.motion_status.get('target') == 'pre_place'):
+    def _tick_transfer(self):
+        if self.pending_motion == 'transfer_waiting_for_status':
+            operation_matches = (
+                self.expected_motion_operation_id is not None and
+                int(self.motion_status.get('operation_id', -1)) >=
+                self.expected_motion_operation_id)
+            pose_complete = (
+                isinstance(self.motion_status.get('transfer_tcp_xyz_m'), list) and
+                len(self.motion_status['transfer_tcp_xyz_m']) == 3 and
+                isinstance(
+                    self.motion_status.get('transfer_tcp_quaternion_xyzw'), list) and
+                len(self.motion_status['transfer_tcp_quaternion_xyzw']) == 4)
+            if not (operation_matches and pose_complete and
+                    self.motion_status.get('state') == 'SUCCEEDED' and
+                    self.motion_status.get('target') == 'transfer_ready'):
+                return
+            if not self.start_transfer.service_is_ready():
+                self._fault('nominal Cartesian transfer service is unavailable')
+                return
+            self.pending_motion = 'transfer_executing'
+            self.expected_supervisor_operation_id = int(
+                self.supervisor_status.get('operation_id', 0)) + 1
+            transfer = self.start_transfer.call_async(Trigger.Request())
+            transfer.add_done_callback(self._start_transfer_completed)
+            return
+        if self.supervisor_status.get('operation_kind') != 'transfer':
+            return
+        if int(self.supervisor_status.get('operation_id', -1)) < int(
+                self.expected_supervisor_operation_id or 0):
+            return
+        state = self.supervisor_status.get('state')
+        if state == 'FAULT':
+            self._fault(self.supervisor_status.get('fault', 'transfer failed'))
+        elif state == 'SUCCEEDED':
+            if not self.start_loading.service_is_ready():
+                self._fault('linear loading service is unavailable')
+                return
+            self.state = self.LOAD_PRE_PLACE
+            self.phase_started = time.monotonic()
+            self.expected_supervisor_operation_id = int(
+                self.supervisor_status.get('operation_id', 0)) + 1
+            future = self.start_loading.call_async(Trigger.Request())
+            future.add_done_callback(self._start_loading_completed)
+
+    def _start_loading_completed(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'linear loading start failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(f'linear loading rejected: {message}')
+
+    def _tick_loading(self):
+        if self.supervisor_status.get('operation_kind') != 'loading':
+            return
+        if int(self.supervisor_status.get('operation_id', -1)) < int(
+                self.expected_supervisor_operation_id or 0):
+            return
+        state = self.supervisor_status.get('state')
+        if state == 'FAULT':
+            self._fault(self.supervisor_status.get('fault', 'linear loading failed'))
+        elif state == 'SUCCEEDED':
+            if self.loading_succeeded_at is None:
+                self.loading_succeeded_at = time.monotonic()
+                self.get_logger().info(
+                    'linear loading succeeded; waiting '
+                    f'{self.post_loading_settle:.2f} s for TCP telemetry')
+                return
+            if (time.monotonic() - self.loading_succeeded_at <
+                    self.post_loading_settle):
+                return
             if not self.start_place.service_is_ready():
                 self._fault('guarded place supervisor is unavailable')
                 return
             self.state = self.CONTACT_PLACE
+            self.loading_succeeded_at = None
             self.phase_started = time.monotonic()
             self.expected_supervisor_operation_id = int(
                 self.supervisor_status.get('operation_id', 0)) + 1
@@ -256,6 +351,7 @@ class PlacePipeline(Node):
         self.state, self.fault, self.pending_motion = self.IDLE, '', None
         self.expected_motion_operation_id = None
         self.expected_supervisor_operation_id = None
+        self.loading_succeeded_at = None
         response.success = True
         response.message = 'place pipeline reset to IDLE'
         self.publish_status()

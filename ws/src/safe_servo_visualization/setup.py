@@ -23,6 +23,7 @@ setup(
         'pickup_supervisor = safe_servo_visualization.pickup_supervisor_node:main',
         'pickup_pipeline = safe_servo_visualization.pickup_pipeline_node:main',
         'place_pipeline = safe_servo_visualization.place_pipeline_node:main',
+        'pick_place_pipeline = safe_servo_visualization.pick_place_pipeline_node:main',
         'planning_scene_obstacles = safe_servo_visualization.planning_scene_obstacles_node:main',
     ]},
 )

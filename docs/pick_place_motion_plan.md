@@ -14,14 +14,17 @@ The intended cycle is:
 1. Move to the item observation configuration.
 2. Detect the item's pose and dimensions.
 3. Move above the item, descend, and pick it up.
-4. Use MoveIt to transfer it to the pallet-relative pre-place pose and place it.
-5. Retreat vertically and use MoveIt to return to observation.
+4. Follow the configured nominal Cartesian path to the pallet and place it.
+5. Reverse the vertical loading path, then use MoveIt to return to observation.
 
 ## Design principles
 
 ### Separate transit and contact control
 
-Use MoveIt for collision-checked movement through free space. Use safe servo only for short vertical approaches near an item or placement surface. After contact, use the existing UFACTORY driver's slow straight-line Cartesian service for the short vertical retreat. Long transfers must not be performed by Cartesian servoing.
+Use safe servo only for short vertical contact searches near an item or placement
+surface. The automatic cycle currently uses the UFACTORY Cartesian service for
+the commissioned nominal clearance and transfer segments. MoveIt planning
+interfaces remain available for manual operation and as a future fallback.
 
 Only one command source may control the robot at a time. Switching between MoveIt trajectory execution and SDK servo mode must be explicit, and the previous motion must be stopped and confirmed complete first.
 
@@ -76,7 +79,7 @@ Reject the cycle if any validation fails.
 5. Stop at the target height or configured force/contact condition.
 6. Enable the vacuum gripper.
 7. Confirm vacuum/grasp success when feedback is available.
-8. Servo vertically back to `pre_grasp_pose`.
+8. Use the Cartesian service to retreat vertically to `pick_clearance`.
 9. Stop safe-servo commands and switch back to trajectory control.
 10. Attach the detected item geometry to the tool in the MoveIt planning scene.
 
@@ -84,26 +87,31 @@ No lateral movement is allowed until the tool has returned to the pre-grasp clea
 
 ### 4. Transfer and placement
 
-Teach `pre_place` above the target surface with sufficient vertical clearance.
-Use MoveIt to plan and execute a collision-checked trajectory:
+The automatic cycle defines two elevated waypoints: `pick_clearance` above the
+grasp and `place_transfer` above the final target. Their nominal vertical value
+is calculated in metres as:
 
 ```text
-pre-grasp -> pre-place
+nominal_height = clearance + object_height + final_target_Z
+if nominal_height > 0.450:
+    nominal_height = clearance + final_target_Z
 ```
 
-MoveIt checks the attached item together with the robot and world obstacles.
-The optional intermediate waypoint remains available for manual commissioning,
-but is not required by the automatic place pipeline.
+The pickup retreat uses `nominal_height` as its vertical lift distance. The
+place transfer uses it as the object bottom-corner height in `pallet_frame`.
+The service-controlled sequence is `pick_clearance -> place_transfer`, followed
+by a vertical linear move to the 40 mm pre-place clearance.
 
 At `pre_place_pose`:
 
 1. Switch to safe-servo control.
-2. Descend vertically to `place_pose`.
+2. Descend vertically until guarded placement contact.
 3. Disable the vacuum gripper.
 4. Confirm release when feedback is available.
 5. Remove the attached item from the tool and add its released box geometry to
    the world as a placed-item collision obstacle.
-6. Use the direct driver to retreat vertically back to `pre_place_pose`.
+6. Disable safe-servo and use the Cartesian service to retreat vertically back
+   to `place_transfer`.
 7. Switch back to trajectory control.
 
 ### 5. Retreat and return
@@ -111,7 +119,7 @@ At `pre_place_pose`:
 Plan and execute a collision-checked MoveIt trajectory:
 
 ```text
-pre-place -> observation joint configuration
+place-transfer -> observation joint configuration
 ```
 
 Plan the return independently after releasing the item because the planning scene and payload state have changed.
@@ -147,12 +155,13 @@ IDLE
   -> VACUUM_ON
   -> SERVO_GRASP_RETREAT
   -> ATTACH_OBJECT
-  -> PLAN_TRANSFER
-  -> EXECUTE_TRANSFER
+  -> PICK_CLEARANCE
+  -> CARTESIAN_TRANSFER
+  -> LINEAR_LOAD_TO_PRE_PLACE
   -> SERVO_PLACE_DESCENT
   -> VACUUM_OFF
   -> DETACH_OBJECT
-  -> SERVO_PLACE_RETREAT
+  -> LINEAR_RETREAT_TO_TRANSFER
   -> PLAN_RETURN
   -> EXECUTE_RETURN
   -> MOVE_TO_OBSERVATION

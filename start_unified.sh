@@ -89,6 +89,8 @@ start_required "pickup pipeline orchestrator" \
   ros2 run safe_servo_visualization pickup_pipeline
 start_required "place pipeline orchestrator" \
   ros2 run safe_servo_visualization place_pipeline
+start_required "combined PickAndPlace orchestrator" \
+  ros2 run safe_servo_visualization pick_place_pipeline
 start_required "supervised Phase 4 pickup coordinator" \
   ros2 run safe_servo_visualization pickup_supervisor --ros-args \
     -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}"

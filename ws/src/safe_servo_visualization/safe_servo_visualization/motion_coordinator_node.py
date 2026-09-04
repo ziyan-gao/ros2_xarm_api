@@ -40,6 +40,8 @@ class MotionCoordinator(Node):
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('joint_state_timeout_sec', 0.5)
+        self.declare_parameter('pre_place_clearance_m', 0.04)
+        self.declare_parameter('container_height_m', 0.45)
         self.waypoint_file = Path(
             self.get_parameter('waypoint_file').value).expanduser()
         self.pregrasp_snapshot_file = Path(
@@ -52,6 +54,8 @@ class MotionCoordinator(Node):
         self.max_detection_age = float(p('max_detection_age_sec'))
         self.joint_state_topic = str(p('joint_state_topic'))
         self.joint_state_timeout = float(p('joint_state_timeout_sec'))
+        self.pre_place_clearance = float(p('pre_place_clearance_m'))
+        self.container_height = float(p('container_height_m'))
         if self.pregrasp_clearance <= 0.0:
             raise ValueError('pregrasp_clearance_m must be positive')
         if self.joint_state_timeout <= 0.0:
@@ -66,6 +70,9 @@ class MotionCoordinator(Node):
         self.pre_place_pose = None
         self.pre_place_pose_time = None
         self.attached_item_geometry = None
+        self.pre_place_tcp_pose = None
+        self.transfer_tcp_pose = None
+        self.nominal_transfer_corner_z = None
         self.pallet_locked = False
         self.planned_pregrasp = None
         self.last_joint_state_time = None
@@ -107,6 +114,12 @@ class MotionCoordinator(Node):
             Trigger, '/motion_coordinator/plan_intermediate',
             lambda request, response: self.plan_waypoint(
                 'intermediate', response))
+        self.create_service(
+            Trigger, '/motion_coordinator/prepare_nominal_transfer',
+            self.prepare_nominal_transfer_callback)
+        self.create_service(
+            Trigger, '/motion_coordinator/plan_transfer',
+            self.plan_transfer_callback)
         self.create_service(
             Trigger, '/motion_coordinator/plan_pre_place',
             self.plan_pre_place_callback)
@@ -219,6 +232,24 @@ class MotionCoordinator(Node):
             'executor_ready': self.exec_client.service_is_ready(),
             'cancel_ready': self.cancel_client.service_is_ready(),
             'planned_pregrasp': self.planned_pregrasp,
+            'pre_place_tcp_z_m': (
+                None if self.pre_place_tcp_pose is None else
+                self.pre_place_tcp_pose.position.z),
+            'transfer_tcp_z_m': (
+                None if self.transfer_tcp_pose is None else
+                self.transfer_tcp_pose.position.z),
+            'transfer_tcp_xyz_m': (
+                None if self.transfer_tcp_pose is None else [
+                    self.transfer_tcp_pose.position.x,
+                    self.transfer_tcp_pose.position.y,
+                    self.transfer_tcp_pose.position.z]),
+            'transfer_tcp_quaternion_xyzw': (
+                None if self.transfer_tcp_pose is None else [
+                    self.transfer_tcp_pose.orientation.x,
+                    self.transfer_tcp_pose.orientation.y,
+                    self.transfer_tcp_pose.orientation.z,
+                    self.transfer_tcp_pose.orientation.w]),
+            'nominal_transfer_corner_z_m': self.nominal_transfer_corner_z,
             'joint_state_age_sec': (
                 None if self.last_joint_state_time is None else
                 time.monotonic() - self.last_joint_state_time),
@@ -313,10 +344,63 @@ class MotionCoordinator(Node):
         return pose
 
     def plan_pre_place_callback(self, _request, response):
+        return self._plan_place_pose(response, transfer=False)
+
+    def plan_transfer_callback(self, _request, response):
+        return self._plan_place_pose(response, transfer=True)
+
+    def prepare_nominal_transfer_callback(self, _request, response):
+        if not self.pallet_locked:
+            response.message = 'pallet pose is not LOCKED'
+            return response
+        if (self.pre_place_pose is None or self.pre_place_pose_time is None or
+                time.monotonic() - self.pre_place_pose_time > 1.0):
+            response.message = 'fresh pallet-relative pre-place pose is unavailable'
+            return response
+        try:
+            self._calculate_place_poses()
+        except (TypeError, ValueError) as exc:
+            response.message = str(exc)
+            return response
+        self.operation_id += 1
+        self.target = 'transfer_ready'
+        self._set_state(self.SUCCEEDED)
+        response.success = True
+        response.message = (
+            'nominal transfer prepared at TCP XYZ '
+            f'[{self.transfer_tcp_pose.position.x:.3f}, '
+            f'{self.transfer_tcp_pose.position.y:.3f}, '
+            f'{self.transfer_tcp_pose.position.z:.3f}] m')
+        return response
+
+    def _calculate_place_poses(self):
+        corner_pose = Pose()
+        corner_pose.position.x = self.pre_place_pose.position.x
+        corner_pose.position.y = self.pre_place_pose.position.y
+        corner_pose.position.z = self.pre_place_pose.position.z
+        corner_pose.orientation = self.pre_place_pose.orientation
+        if self.attached_item_geometry is None:
+            raise ValueError('attached-item grasp geometry is unavailable')
+        object_height = self.attached_item_geometry['size'][2]
+        final_z = corner_pose.position.z - self.pre_place_clearance
+        candidate = final_z + self.pre_place_clearance + object_height
+        self.nominal_transfer_corner_z = (
+            final_z + self.pre_place_clearance
+            if candidate > self.container_height else candidate)
+        self.pre_place_tcp_pose = self._object_corner_to_tcp_pose(corner_pose)
+        transfer_corner = Pose()
+        transfer_corner.position.x = corner_pose.position.x
+        transfer_corner.position.y = corner_pose.position.y
+        transfer_corner.position.z = self.nominal_transfer_corner_z
+        transfer_corner.orientation = corner_pose.orientation
+        self.transfer_tcp_pose = self._object_corner_to_tcp_pose(transfer_corner)
+
+    def _plan_place_pose(self, response, transfer):
         if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
-        if not self._require_fresh_joint_state(response, 'plan pre-place'):
+        label = 'transfer' if transfer else 'pre-place'
+        if not self._require_fresh_joint_state(response, f'plan {label}'):
             return response
         if not self.pallet_locked:
             response.message = 'pallet pose is not LOCKED'
@@ -329,8 +413,9 @@ class MotionCoordinator(Node):
             response.message = 'xArm pose planning service is unavailable'
             return response
         try:
-            pose = self._object_corner_to_tcp_pose(self.pre_place_pose)
-        except ValueError as exc:
+            self._calculate_place_poses()
+            pose = self.transfer_tcp_pose if transfer else self.pre_place_tcp_pose
+        except (TypeError, ValueError) as exc:
             response.message = str(exc)
             return response
         values = (
@@ -342,7 +427,7 @@ class MotionCoordinator(Node):
             return response
         self.operation_id += 1
         request_id = self.operation_id
-        self.target = 'pre_place'
+        self.target = 'transfer' if transfer else 'pre_place'
         self.planned_pregrasp = None
         self._clear_pregrasp_snapshot()
         self.cancel_requested = self.pause_requested = False
@@ -354,7 +439,7 @@ class MotionCoordinator(Node):
             lambda completed: self._plan_completed(request_id, completed))
         response.success = True
         response.message = (
-            'Planning TCP for pallet-relative object-corner pre-place at '
+            f'Planning TCP for pallet-relative {label} at '
             f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
             f'{pose.position.z:.3f}] m; operation_id={request_id}')
         return response
