@@ -1,0 +1,73 @@
+diff --git a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+index f4817fd..f4fa547 100644
+--- a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
++++ b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+@@ -8,6 +8,7 @@
+ #ifndef __UF_ROBOT_SYSTEM_HARDWARE_INTERFACE_H__
+ #define __UF_ROBOT_SYSTEM_HARDWARE_INTERFACE_H__
+ 
++#include <atomic>
+ #include <vector>
+ #include <thread>
+ #include <queue>
+@@ -75,6 +76,7 @@ namespace uf_robot_hardware
+         bool initialized_;
+         bool read_ready_;
+         bool reactivate_controller_later_;
++        std::atomic_bool ros_control_active_{false};
+ 
+         long int read_cnts_;
+         long int read_failed_cnts_;
+diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+index d654894..91cf0b2 100644
+--- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
++++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
+@@ -250,6 +250,9 @@ namespace uf_robot_hardware
+ 
+     CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
+     {
++        // Keep the real-time read/write callbacks inert until activation has
++        // established a fresh report snapshot and initialized all commands.
++        ros_control_active_.store(false, std::memory_order_release);
+         xarm_driver_.arm->clean_error();
+         xarm_driver_.arm->clean_warn();
+         xarm_driver_.arm->motion_enable(true);
+@@ -303,6 +306,7 @@ namespace uf_robot_hardware
+                 velocity_cmds_[i] = velocity_states_[i];
+             }
+         }
++        ros_control_active_.store(true, std::memory_order_release);
+         
+         RCLCPP_INFO(LOGGER, "[%s] System Sucessfully started!", robot_ip_.c_str());
+         return CallbackReturn::SUCCESS;
+@@ -310,6 +314,10 @@ namespace uf_robot_hardware
+ 
+     CallbackReturn UFRobotSystemHardware::on_deactivate(const rclcpp_lifecycle::State& previous_state)
+     {
++        // controller_manager can continue invoking read() for an inactive
++        // component. Disable both watchdog and writes before direct pose mode
++        // intentionally stops the high-rate report stream.
++        ros_control_active_.store(false, std::memory_order_release);
+         RCLCPP_INFO(LOGGER, "[%s] Stopping ...please wait...", robot_ip_.c_str());
+ 
+         xarm_driver_.arm->set_mode(XARM_MODE::POSE);
+@@ -318,6 +326,9 @@ namespace uf_robot_hardware
+ 
+     hardware_interface::return_type UFRobotSystemHardware::read(const rclcpp::Time & time, const rclcpp::Duration &period)
+     {
++        if (!ros_control_active_.load(std::memory_order_acquire)) {
++            return hardware_interface::return_type::OK;
++        }
+         read_cnts_ += 1;
+         read_ready_ = _xarm_is_ready_read();
+         rclcpp::Time start = node_->get_clock()->now();
+@@ -373,6 +384,9 @@ namespace uf_robot_hardware
+ 
+     hardware_interface::return_type UFRobotSystemHardware::write(const rclcpp::Time & time, const rclcpp::Duration &period)
+     {
++        if (!ros_control_active_.load(std::memory_order_acquire)) {
++            return hardware_interface::return_type::OK;
++        }
+         if (_need_reset()) {
+             initialized_ = false;
+             _deactivate_controller();

@@ -1,0 +1,32 @@
+diff --git a/xarm_description/urdf/uf850/uf850_robot_macro.xacro b/xarm_description/urdf/uf850/uf850_robot_macro.xacro
+index ef66bcb..f386a3e 100644
+--- a/xarm_description/urdf/uf850/uf850_robot_macro.xacro
++++ b/xarm_description/urdf/uf850/uf850_robot_macro.xacro
+@@ -34,19 +34,19 @@
+           robot_ip="${robot_ip}" report_type="${report_type}"
+           baud_checkset="${baud_checkset}" default_gripper_baud="${default_gripper_baud}"
+-          joint1_lower_limit="${-pi*0.99}" joint1_upper_limit="${pi*0.99}"
++          joint1_lower_limit="${-2.0*pi}" joint1_upper_limit="${2.0*pi}"
+           joint2_lower_limit="${-2.3038346}" joint2_upper_limit="${2.3038346}"
+-          joint3_lower_limit="${-pi*0.99}" joint3_upper_limit="${0.061087}"
+-          joint4_lower_limit="${-pi*0.99}" joint4_upper_limit="${pi*0.99}"
++          joint3_lower_limit="${-4.2236968}" joint3_upper_limit="${0.061087}"
++          joint4_lower_limit="${-2.0*pi}" joint4_upper_limit="${2.0*pi}"
+           joint5_lower_limit="${-2.1642}" joint5_upper_limit="${2.1642}"
+-          joint6_lower_limit="${-pi*0.99}" joint6_upper_limit="${pi*0.99}"/>
++          joint6_lower_limit="${-2.0*pi}" joint6_upper_limit="${2.0*pi}"/>
+       </xacro:if>
+       <xacro:uf850_urdf prefix="${prefix}"
+-        joint1_lower_limit="${-pi*0.99}" joint1_upper_limit="${pi*0.99}"
++        joint1_lower_limit="${-2.0*pi}" joint1_upper_limit="${2.0*pi}"
+         joint2_lower_limit="${-2.3038346}" joint2_upper_limit="${2.3038346}"
+-        joint3_lower_limit="${-pi*0.99}" joint3_upper_limit="${0.061087}"
+-        joint4_lower_limit="${-pi*0.99}" joint4_upper_limit="${pi*0.99}"
++        joint3_lower_limit="${-4.2236968}" joint3_upper_limit="${0.061087}"
++        joint4_lower_limit="${-2.0*pi}" joint4_upper_limit="${2.0*pi}"
+         joint5_lower_limit="${-2.1642}" joint5_upper_limit="${2.1642}"
+-        joint6_lower_limit="${-pi*0.99}" joint6_upper_limit="${pi*0.99}"
++        joint6_lower_limit="${-2.0*pi}" joint6_upper_limit="${2.0*pi}"
+         model_num="${model_num}"
+         inertial_params_filename="${inertial_params_filename}"
+         kinematics_params_filename="${kinematics_params_filename}"/>

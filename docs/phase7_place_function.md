@@ -3,7 +3,7 @@
 The placement target is the carried object's minimum-X/minimum-Y/bottom corner
 relative to `pallet_frame`, not a fixed robot TCP or joint waypoint. If the
 pallet pose is not `LOCKED`, planning and the automatic place cycle are
-rejected. A 40 mm vertical clearance is added automatically for the pre-place
+rejected. A 30 mm vertical clearance is added automatically for the pre-place
 motion; guarded descent then brings the object to the configured final height.
 The attached object's vertical grasp offset is established at confirmed
 suction contact: the TCP is the top-face contact point and the object center is

@@ -47,7 +47,21 @@ services:
       - MOVEIT_SERVO_DRY_RUN=${MOVEIT_SERVO_DRY_RUN:-false}
       - SERVO_DESCENT_SPEED_M_S=${SERVO_DESCENT_SPEED_M_S:-0.05}
       - SERVO_DESCENT_KP_Z=${SERVO_DESCENT_KP_Z:-3.0}
+      - PICKUP_FORCE_THRESHOLD_N=${PICKUP_FORCE_THRESHOLD_N:-5.0}
       - PLACE_FORCE_THRESHOLD_N=${PLACE_FORCE_THRESHOLD_N:-4.0}
+      - PLACE_DESCENT_TIMEOUT_SEC=${PLACE_DESCENT_TIMEOUT_SEC:-20.0}
+      - PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC=${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC:-20.0}
+      - PLACE_SINGULARITY_STEP_M=${PLACE_SINGULARITY_STEP_M:-0.003}
+      - PLACE_SINGULARITY_STEP_SPEED_MM_S=${PLACE_SINGULARITY_STEP_SPEED_MM_S:-10.0}
+      - RANDOM_LOADING_AUTO_START=${RANDOM_LOADING_AUTO_START:-false}
+      - RANDOM_LOADING_CLEARANCE_MM=${RANDOM_LOADING_CLEARANCE_MM:-10}
+      - RANDOM_LOADING_SAMPLE_FRACTION=${RANDOM_LOADING_SAMPLE_FRACTION:-0.30}
+      - RANDOM_LOADING_COM_BOUND_RATIO=${RANDOM_LOADING_COM_BOUND_RATIO:-0.20}
+      - TRANSFER_CORNER_HEIGHT_M=${TRANSFER_CORNER_HEIGHT_M:-0.47}
+      - PLACE_WORKSPACE_Z_MIN_MM=${PLACE_WORKSPACE_Z_MIN_MM:--100.0}
+      - RANDOM_LOADING_VISUALIZE=${RANDOM_LOADING_VISUALIZE:-true}
+      - RANDOM_LOADING_VISUAL_PORT=${RANDOM_LOADING_VISUAL_PORT:-8765}
+      - PYTHONPATH=/opt/neuromeka_bin_packing
       - RVIZ_CONFIG=/workspace/ws/src/rviz_config/rviz_scene.rviz
 
     volumes:
@@ -55,6 +69,7 @@ services:
       - ${XAUTHORITY:-/run/user/1000/gdm/Xauthority}:/tmp/.docker.xauth:ro
       - /dev/bus/usb:/dev/bus/usb
       - ./:/workspace
+      - ../../neuromeka_bin_packing:/opt/neuromeka_bin_packing:ro
       - ./config/xarm_user_params.yaml:/opt/xarm_ws/install/xarm_api/share/xarm_api/config/xarm_user_params.yaml:ro
 
     working_dir: /workspace

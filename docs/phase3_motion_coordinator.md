@@ -41,10 +41,13 @@ active.
 
 ## Commissioning safety
 
-UFACTORY's planner source sets a fixed velocity scale of 0.30, which is
-independent of the RViz scaling control. The Docker build applies
-`patches/xarm_planner_low_speed.patch` to set both planner velocity and
-acceleration scaling to 0.10 during commissioning.
+UFACTORY's planner defaults to a fixed velocity scale. The Docker build applies
+`patches/xarm_planner_low_speed.patch` as a 0.10 startup fallback and
+`patches/xarm_planner_runtime_speed.patch` so the panel's unified non-servo
+speed slider can update MoveIt's velocity scaling before planning. The slider
+is capped at 0.30, the upstream vendor default; acceleration scaling remains at
+the conservative 0.10 limit. The same slider controls local direct Cartesian
+service velocity but does not alter safe-servo descent speed.
 
 Rebuild the image before testing Phase 3:
 
@@ -80,18 +83,24 @@ For the first real test:
 Do not use the panel's safe-servo execution controls while MoveIt owns the
 trajectory controller.
 
-## UF850 joint4 planning range
+## UF850 planning ranges
 
-The upstream limited UF850 model sets joint4 to `±0.99*pi`, while the
-underlying UF850 joint definition supports `±2*pi`. A real state close to
-`-pi` can therefore be valid for the hardware but rejected by MoveIt's Jazzy
-`CheckStartStateBounds` adapter.
+The Docker build applies the commissioned UF850 hardware ranges from
+`patches/xarm_uf850_hardware_joint_limits.patch` to both the limited robot
+description used by MoveIt and the ros2_control command model:
 
-The Docker build applies `patches/xarm_uf850_joint4_pi_limit.patch` to use
-`±pi` for joint4 in both the limited robot description and ros2_control
-command model. The planning range remains substantially inside the underlying
-`±2*pi` definition. All other joint limits remain unchanged, and both RViz
-and the application planner receive the same model.
+```text
+joint1: -360 .. +360 deg
+joint2: -132 .. +132 deg
+joint3: -242 .. +3.5 deg
+joint4: -360 .. +360 deg
+joint5: -124 .. +124 deg
+joint6: -360 .. +360 deg
+```
+
+This avoids rejecting hardware-valid start or goal IK states at the narrower
+upstream `±0.99*pi` limits. RViz, MoveIt, ros2_control, and the supervisor's
+post-retreat joint-6 check use matching ranges.
 
 ## Validation
 

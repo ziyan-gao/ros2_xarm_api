@@ -1,14 +1,14 @@
 import json
 import math
-from pathlib import Path
 import time
+from pathlib import Path
 
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Point, Pose, PoseStamped
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 from xarm_msgs.srv import PlanExec, PlanJoint, PlanPose
@@ -40,8 +40,8 @@ class MotionCoordinator(Node):
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('joint_state_timeout_sec', 0.5)
-        self.declare_parameter('pre_place_clearance_m', 0.04)
-        self.declare_parameter('container_height_m', 0.45)
+        self.declare_parameter('pre_place_clearance_m', 0.03)
+        self.declare_parameter('transfer_corner_height_m', 0.47)
         self.waypoint_file = Path(
             self.get_parameter('waypoint_file').value).expanduser()
         self.pregrasp_snapshot_file = Path(
@@ -55,11 +55,13 @@ class MotionCoordinator(Node):
         self.joint_state_topic = str(p('joint_state_topic'))
         self.joint_state_timeout = float(p('joint_state_timeout_sec'))
         self.pre_place_clearance = float(p('pre_place_clearance_m'))
-        self.container_height = float(p('container_height_m'))
+        self.transfer_corner_height = float(p('transfer_corner_height_m'))
         if self.pregrasp_clearance <= 0.0:
             raise ValueError('pregrasp_clearance_m must be positive')
         if self.joint_state_timeout <= 0.0:
             raise ValueError('joint_state_timeout_sec must be positive')
+        if self.transfer_corner_height <= 0.0:
+            raise ValueError('transfer_corner_height_m must be positive')
         self.state = self.IDLE
         self.target = None
         self.fault = ''
@@ -73,7 +75,11 @@ class MotionCoordinator(Node):
         self.pre_place_tcp_pose = None
         self.transfer_tcp_pose = None
         self.nominal_transfer_corner_z = None
+        self.placement_corner_correction = (0.0, 0.0, 0.0)
         self.pallet_locked = False
+        self.rotate_item_90 = False
+        self.keep_eef_perpendicular = True
+        self.place_target_xyz = None
         self.planned_pregrasp = None
         self.last_joint_state_time = None
         self._restore_pregrasp_snapshot()
@@ -82,6 +88,8 @@ class MotionCoordinator(Node):
             PlanJoint, '/xarm_joint_plan')
         self.pose_plan_client = self.create_client(
             PlanPose, '/xarm_pose_plan')
+        self.constrained_pose_plan_client = self.create_client(
+            PlanPose, '/xarm_pose_plan_orientation_constrained')
         self.exec_client = self.create_client(
             PlanExec, '/xarm_exec_plan')
         self.cancel_client = self.create_client(
@@ -101,6 +109,9 @@ class MotionCoordinator(Node):
             String, '/pallet_localization/status',
             self.pallet_status_callback, 10)
         self.create_subscription(
+            Float64MultiArray, '/pallet_localization/config_state',
+            self.pallet_config_callback, 10)
+        self.create_subscription(
             String, '/planning_scene_obstacles/status',
             self.planning_scene_status_callback, 10)
         self.create_subscription(
@@ -114,9 +125,6 @@ class MotionCoordinator(Node):
             Trigger, '/motion_coordinator/plan_intermediate',
             lambda request, response: self.plan_waypoint(
                 'intermediate', response))
-        self.create_service(
-            Trigger, '/motion_coordinator/prepare_nominal_transfer',
-            self.prepare_nominal_transfer_callback)
         self.create_service(
             Trigger, '/motion_coordinator/plan_transfer',
             self.plan_transfer_callback)
@@ -136,6 +144,9 @@ class MotionCoordinator(Node):
             Trigger, '/motion_coordinator/resume', self.resume_callback)
         self.create_service(
             Trigger, '/motion_coordinator/reset', self.reset_callback)
+        self.create_service(
+            Trigger, '/motion_coordinator/accept_direct_transfer',
+            self.accept_direct_transfer_callback)
         self.create_timer(0.5, self.publish_status)
         self.get_logger().info(
             f'motion coordinator ready; waypoint_file={self.waypoint_file}')
@@ -229,6 +240,8 @@ class MotionCoordinator(Node):
             'operation_id': self.operation_id,
             'planner_ready': self.plan_client.service_is_ready(),
             'pose_planner_ready': self.pose_plan_client.service_is_ready(),
+            'constrained_pose_planner_ready': (
+                self.constrained_pose_plan_client.service_is_ready()),
             'executor_ready': self.exec_client.service_is_ready(),
             'cancel_ready': self.cancel_client.service_is_ready(),
             'planned_pregrasp': self.planned_pregrasp,
@@ -250,6 +263,11 @@ class MotionCoordinator(Node):
                     self.transfer_tcp_pose.orientation.z,
                     self.transfer_tcp_pose.orientation.w]),
             'nominal_transfer_corner_z_m': self.nominal_transfer_corner_z,
+            'transfer_corner_height_pallet_m': self.transfer_corner_height,
+            'rotate_item_90': self.rotate_item_90,
+            'keep_eef_perpendicular_to_pallet': self.keep_eef_perpendicular,
+            'placement_corner_correction_xyz_m':
+                self.placement_corner_correction,
             'joint_state_age_sec': (
                 None if self.last_joint_state_time is None else
                 time.monotonic() - self.last_joint_state_time),
@@ -273,6 +291,15 @@ class MotionCoordinator(Node):
 
     def pallet_status_callback(self, message):
         self.pallet_locked = message.data == 'LOCKED'
+
+    def pallet_config_callback(self, message):
+        if len(message.data) >= 12:
+            self.place_target_xyz = tuple(
+                float(value) / 1000.0 for value in message.data[9:12])
+        if len(message.data) >= 13:
+            self.rotate_item_90 = bool(message.data[12] > 0.5)
+        if len(message.data) >= 14:
+            self.keep_eef_perpendicular = bool(message.data[13] > 0.5)
 
     def planning_scene_status_callback(self, message):
         try:
@@ -314,6 +341,42 @@ class MotionCoordinator(Node):
             (-qx, -qy, -qz, qw))
         return rotated[:3]
 
+    @staticmethod
+    def _quat_inverse(quaternion):
+        x, y, z, w = map(float, quaternion)
+        norm_squared = x * x + y * y + z * z + w * w
+        if norm_squared <= 1e-12:
+            raise ValueError('cannot invert a zero-length quaternion')
+        return (-x / norm_squared, -y / norm_squared,
+                -z / norm_squared, w / norm_squared)
+
+    def _perpendicular_tcp_orientation(self, object_q, unconstrained_tcp_q):
+        item_yaw = -math.pi / 2.0 if self.rotate_item_90 else 0.0
+        item_yaw_q = self._quaternion_from_rpy(0.0, 0.0, item_yaw)
+        pallet_q = self._quat_multiply(
+            object_q, self._quat_inverse(item_yaw_q))
+        # Loading and guarded descent are along link_base Z.  Pallet
+        # localization can contain a few degrees of roll/pitch noise; carrying
+        # that noise into the path constraint makes the accurately vertical
+        # post-pick start state invalid (the constraint tolerance is 3 deg).
+        # Retain the localized pallet yaw, but level its Z axis to link_base so
+        # "perpendicular" has the same meaning during pickup, transfer and
+        # loading.
+        px, py, pz, pw = pallet_q
+        pallet_yaw = math.atan2(
+            2.0 * (pw * pz + px * py),
+            1.0 - 2.0 * (py * py + pz * pz))
+        level_pallet_q = self._quaternion_from_rpy(
+            0.0, 0.0, pallet_yaw)
+        tcp_in_pallet = self._quat_multiply(
+            self._quat_inverse(level_pallet_q), unconstrained_tcp_q)
+        x, y, z, w = tcp_in_pallet
+        yaw = math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z))
+        downward_tcp_q = self._quaternion_from_rpy(math.pi, 0.0, yaw)
+        return self._quat_multiply(level_pallet_q, downward_tcp_q)
+
     def _object_corner_to_tcp_pose(self, corner_pose):
         if self.attached_item_geometry is None:
             raise ValueError('attached-item grasp geometry is unavailable')
@@ -327,6 +390,8 @@ class MotionCoordinator(Node):
         tcp_q = self._quat_multiply(
             object_q,
             (-relative_q[0], -relative_q[1], -relative_q[2], relative_q[3]))
+        if self.keep_eef_perpendicular:
+            tcp_q = self._perpendicular_tcp_orientation(object_q, tcp_q)
         half_size = tuple(value / 2.0 for value in geometry['size'])
         corner = (float(corner_pose.position.x),
                   float(corner_pose.position.y),
@@ -349,30 +414,6 @@ class MotionCoordinator(Node):
     def plan_transfer_callback(self, _request, response):
         return self._plan_place_pose(response, transfer=True)
 
-    def prepare_nominal_transfer_callback(self, _request, response):
-        if not self.pallet_locked:
-            response.message = 'pallet pose is not LOCKED'
-            return response
-        if (self.pre_place_pose is None or self.pre_place_pose_time is None or
-                time.monotonic() - self.pre_place_pose_time > 1.0):
-            response.message = 'fresh pallet-relative pre-place pose is unavailable'
-            return response
-        try:
-            self._calculate_place_poses()
-        except (TypeError, ValueError) as exc:
-            response.message = str(exc)
-            return response
-        self.operation_id += 1
-        self.target = 'transfer_ready'
-        self._set_state(self.SUCCEEDED)
-        response.success = True
-        response.message = (
-            'nominal transfer prepared at TCP XYZ '
-            f'[{self.transfer_tcp_pose.position.x:.3f}, '
-            f'{self.transfer_tcp_pose.position.y:.3f}, '
-            f'{self.transfer_tcp_pose.position.z:.3f}] m')
-        return response
-
     def _calculate_place_poses(self):
         corner_pose = Pose()
         corner_pose.position.x = self.pre_place_pose.position.x
@@ -381,18 +422,58 @@ class MotionCoordinator(Node):
         corner_pose.orientation = self.pre_place_pose.orientation
         if self.attached_item_geometry is None:
             raise ValueError('attached-item grasp geometry is unavailable')
-        object_height = self.attached_item_geometry['size'][2]
-        final_z = corner_pose.position.z - self.pre_place_clearance
-        candidate = final_z + self.pre_place_clearance + object_height
-        self.nominal_transfer_corner_z = (
-            final_z + self.pre_place_clearance
-            if candidate > self.container_height else candidate)
+        if self.place_target_xyz is None:
+            raise ValueError('pallet-frame place target XYZ is unavailable')
+        object_q = (
+            float(corner_pose.orientation.x),
+            float(corner_pose.orientation.y),
+            float(corner_pose.orientation.z),
+            float(corner_pose.orientation.w))
+        item_yaw = -math.pi / 2.0 if self.rotate_item_90 else 0.0
+        pallet_q = self._quat_multiply(
+            object_q,
+            self._quat_inverse(
+                self._quaternion_from_rpy(0.0, 0.0, item_yaw)))
+        local_pre_place = (
+            self.place_target_xyz[0],
+            self.place_target_xyz[1],
+            self.place_target_xyz[2] + self.pre_place_clearance)
+        pre_place_offset = self._quat_rotate(local_pre_place, pallet_q)
+        pallet_origin = tuple(
+            float(getattr(self.pre_place_pose.position, axis)) -
+            pre_place_offset[index]
+            for index, axis in enumerate(('x', 'y', 'z')))
+        transfer_offset = self._quat_rotate(
+            (self.place_target_xyz[0], self.place_target_xyz[1],
+             self.transfer_corner_height),
+            pallet_q)
+        transfer_reference_corner = tuple(
+            pallet_origin[index] + transfer_offset[index]
+            for index in range(3))
+        self.placement_corner_correction = (0.0, 0.0, 0.0)
+        if self.rotate_item_90:
+            # pre_place_xyz always denotes the minimum pallet-X/minimum
+            # pallet-Y/bottom corner of the final footprint. A clockwise
+            # rotation about the original object corner makes the footprint
+            # extend in negative pallet Y. Shift the original corner by one
+            # object X dimension along positive pallet Y so the configured
+            # point remains the rotated footprint's requested corner.
+            object_x = float(self.attached_item_geometry['size'][0])
+            correction = self._quat_rotate((-object_x, 0.0, 0.0), object_q)
+            self.placement_corner_correction = correction
+            corner_pose.position.x += correction[0]
+            corner_pose.position.y += correction[1]
+            corner_pose.position.z += correction[2]
         self.pre_place_tcp_pose = self._object_corner_to_tcp_pose(corner_pose)
         transfer_corner = Pose()
-        transfer_corner.position.x = corner_pose.position.x
-        transfer_corner.position.y = corner_pose.position.y
-        transfer_corner.position.z = self.nominal_transfer_corner_z
+        transfer_corner.position.x = (
+            transfer_reference_corner[0] + self.placement_corner_correction[0])
+        transfer_corner.position.y = (
+            transfer_reference_corner[1] + self.placement_corner_correction[1])
+        transfer_corner.position.z = (
+            transfer_reference_corner[2] + self.placement_corner_correction[2])
         transfer_corner.orientation = corner_pose.orientation
+        self.nominal_transfer_corner_z = transfer_corner.position.z
         self.transfer_tcp_pose = self._object_corner_to_tcp_pose(transfer_corner)
 
     def _plan_place_pose(self, response, transfer):
@@ -409,8 +490,15 @@ class MotionCoordinator(Node):
                 time.monotonic() - self.pre_place_pose_time > 1.0):
             response.message = 'fresh pallet-relative pre-place pose is unavailable'
             return response
-        if not self.pose_plan_client.service_is_ready():
-            response.message = 'xArm pose planning service is unavailable'
+        orientation_locked_transfer = transfer and self.keep_eef_perpendicular
+        planner = (
+            self.constrained_pose_plan_client
+            if orientation_locked_transfer else self.pose_plan_client)
+        if not planner.service_is_ready():
+            planner_name = (
+                'orientation-constrained pose'
+                if orientation_locked_transfer else 'pose')
+            response.message = f'xArm {planner_name} planning service is unavailable'
             return response
         try:
             self._calculate_place_poses()
@@ -432,14 +520,19 @@ class MotionCoordinator(Node):
         self._clear_pregrasp_snapshot()
         self.cancel_requested = self.pause_requested = False
         self._set_state(self.PLANNING)
+        # A generic pose plan constrains only the endpoint and may tilt the
+        # carried object between pickup and transfer.  The dedicated planner
+        # applies a MoveIt path OrientationConstraint to link_tcp: roll and
+        # pitch stay near the target while yaw remains free for routing.
         request = PlanPose.Request()
         request.target = pose
-        future = self.pose_plan_client.call_async(request)
+        future = planner.call_async(request)
         future.add_done_callback(
             lambda completed: self._plan_completed(request_id, completed))
         response.success = True
         response.message = (
-            f'Planning TCP for pallet-relative {label} at '
+            f'Planning TCP for pallet-relative {label}'
+            f'{" with a roll/pitch path constraint" if orientation_locked_transfer else ""} at '
             f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
             f'{pose.position.z:.3f}] m; operation_id={request_id}')
         return response
@@ -765,6 +858,30 @@ class MotionCoordinator(Node):
         self._set_state(self.IDLE)
         response.success = True
         response.message = 'Coordinator reset to IDLE'
+        return response
+
+    def accept_direct_transfer_callback(self, request, response):
+        """Acknowledge a verified direct-service replacement for MoveIt transfer."""
+        del request
+        if self.state != self.FAULT or self.target != 'transfer':
+            response.message = (
+                'Direct transfer acknowledgement requires a failed transfer; '
+                f'got state={self.state}, target={self.target}')
+            return response
+        if self.pre_place_tcp_pose is None or self.transfer_tcp_pose is None:
+            response.message = (
+                'Direct transfer acknowledgement requires cached pre-place '
+                'and transfer TCP poses')
+            return response
+        # Preserve operation_id and both cached poses. The direct-motion
+        # supervisor already verified the reached TCP; downstream loading and
+        # Servo must continue to reference this same placement operation.
+        self.cancel_requested = False
+        self.pause_requested = False
+        self._set_state(self.SUCCEEDED)
+        response.success = True
+        response.message = (
+            'Verified direct transfer accepted; coordinator state is SUCCEEDED')
         return response
 
 

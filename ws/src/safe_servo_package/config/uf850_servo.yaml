@@ -25,20 +25,25 @@ publish_joint_accelerations: false
 is_primary_planning_scene_monitor: false
 monitored_planning_scene_topic: /monitored_planning_scene
 check_octomap_collisions: false
-check_collisions: true
+check_collisions: false
 collision_check_rate: 20.0
-# This vertical-only guarded Servo operates in a tightly constrained path.
-# MoveIt requires the self threshold to be no greater than the scene threshold.
+# Collision checking is intentionally disabled for this Servo instance because
+# it is used only for force-guarded vertical pickup/place descent. The carried
+# item must be allowed to approach the pallet and registered support objects.
+# MoveIt collision checking remains active for planned pre-grasp, transfer,
+# retreat-to-observation, and all other trajectory motions. These thresholds
+# remain valid if Servo collision checking is re-enabled later.
 self_collision_proximity_threshold: 0.005
-# Guarded vertical placement intentionally approaches a known scene surface.
-# Begin proximity scaling only in the final 5 mm; the Fz contact detector and
-# independent wrench safety caps stop the motion at physical contact.
 scene_collision_proximity_threshold: 0.005
 
 use_smoothing: true
 smoothing_filter_plugin_name: online_signal_smoothing::ButterworthFilterPlugin
-lower_singularity_threshold: 12.0
-hard_stop_singularity_threshold: 25.0
+# Allow guarded vertical motion through moderately ill-conditioned postures.
+# The monitor remains enabled: Servo begins scaling at 25 and still performs
+# a hard stop at 45. Prefer changing the pre-place IK/posture if this limit is
+# reached repeatedly instead of increasing it again.
+lower_singularity_threshold: 25.0
+hard_stop_singularity_threshold: 45.0
 leaving_singularity_threshold_multiplier: 2.0
 joint_limit_margins: [0.12]
 halt_all_joints_in_joint_mode: true

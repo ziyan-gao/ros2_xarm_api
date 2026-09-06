@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     python3-rosdep \
+    python3-scipy \
+    python3-shapely \
     git \
     ros-jazzy-rmw-cyclonedds-cpp \
     ros-jazzy-realsense2-camera \
@@ -23,7 +25,8 @@ RUN apt-get update && apt-get install -y \
 
 # 安装基础 Python 包
 RUN python3 -m pip install --break-system-packages build pyproject_hooks && \
-    python3 -m pip install --break-system-packages --no-deps opencv-python-headless
+    python3 -m pip install --break-system-packages --no-deps opencv-python-headless && \
+    python3 -m pip install --break-system-packages gymnasium==1.0.0
 
 # 安装 xArm Python SDK（按官方 source code 方式）
 RUN git clone https://github.com/xArm-Developer/xArm-Python-SDK.git /opt/xArm-Python-SDK && \
@@ -33,12 +36,16 @@ RUN git clone https://github.com/xArm-Developer/xArm-Python-SDK.git /opt/xArm-Py
 COPY patches/xarm_moveit_config_no_gazebo.patch /tmp/xarm_moveit_config_no_gazebo.patch
 COPY patches/xarm_planner_low_speed.patch /tmp/xarm_planner_low_speed.patch
 COPY patches/xarm_planner_display_path.patch /tmp/xarm_planner_display_path.patch
-COPY patches/xarm_uf850_joint4_pi_limit.patch /tmp/xarm_uf850_joint4_pi_limit.patch
+COPY patches/xarm_planner_runtime_speed.patch /tmp/xarm_planner_runtime_speed.patch
+COPY patches/xarm_planner_orientation_constraint.patch /tmp/xarm_planner_orientation_constraint.patch
+COPY patches/xarm_planner_robust_planning.patch /tmp/xarm_planner_robust_planning.patch
+COPY patches/xarm_uf850_hardware_joint_limits.patch /tmp/xarm_uf850_hardware_joint_limits.patch
 COPY patches/xarm_uf850_sensor_stack.patch /tmp/xarm_uf850_sensor_stack.patch
 COPY patches/xarm_vacuum_services.patch /tmp/xarm_vacuum_services.patch
 COPY patches/xarm_realmove_joint_states.patch /tmp/xarm_realmove_joint_states.patch
 COPY patches/xarm_control_write_watchdog.patch /tmp/xarm_control_write_watchdog.patch
 COPY patches/xarm_nonblocking_report_states.patch /tmp/xarm_nonblocking_report_states.patch
+COPY patches/xarm_control_handoff_lifecycle_guard.patch /tmp/xarm_control_handoff_lifecycle_guard.patch
 
 # Official UFACTORY ROS 2 driver and collision-aware planning stack. Gazebo is
 # excluded from this real-robot image by the manifest-only patch copied above.
@@ -52,12 +59,16 @@ RUN mkdir -p /opt/xarm_ws/src && \
     git apply /tmp/xarm_moveit_config_no_gazebo.patch && \
     git apply /tmp/xarm_planner_low_speed.patch && \
     git apply /tmp/xarm_planner_display_path.patch && \
-    git apply /tmp/xarm_uf850_joint4_pi_limit.patch && \
+    git apply /tmp/xarm_planner_runtime_speed.patch && \
+    git apply /tmp/xarm_planner_orientation_constraint.patch && \
+    git apply /tmp/xarm_planner_robust_planning.patch && \
+    git apply /tmp/xarm_uf850_hardware_joint_limits.patch && \
     git apply /tmp/xarm_uf850_sensor_stack.patch && \
     git apply /tmp/xarm_vacuum_services.patch && \
     git apply /tmp/xarm_realmove_joint_states.patch && \
     git apply /tmp/xarm_control_write_watchdog.patch && \
     git apply /tmp/xarm_nonblocking_report_states.patch && \
+    git apply /tmp/xarm_control_handoff_lifecycle_guard.patch && \
     source /opt/ros/jazzy/setup.bash && \
     rosdep update && \
     rosdep install --from-paths \

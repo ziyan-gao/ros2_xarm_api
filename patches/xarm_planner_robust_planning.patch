@@ -1,0 +1,96 @@
+diff --git a/xarm_planner/src/xarm_planner.cpp b/xarm_planner/src/xarm_planner.cpp
+index 4520d81..61c2be3 100644
+--- a/xarm_planner/src/xarm_planner.cpp
++++ b/xarm_planner/src/xarm_planner.cpp
+@@ -15,6 +15,10 @@ const double jump_threshold = 0.0;
+ const double eef_step = 0.005;
+ const double max_velocity_scaling_factor = 0.1;  // commissioning safety limit
+ const double max_acceleration_scaling_factor = 0.1;  // [move_group_interface] default is 0.1
++const double planning_time_seconds = 15.0;
++const unsigned int planning_attempts = 5;
++const double goal_position_tolerance = 0.001;  // 1 mm
++const double goal_orientation_tolerance = 0.017453292519943295;  // 1 degree
+ 
+ XArmPlanner::XArmPlanner(const rclcpp::Node::SharedPtr& node, const std::string& group_name)
+     : node_(node)
+@@ -38,6 +42,10 @@ void XArmPlanner::init(const std::string& group_name)
+     std::copy(move_group_->getJointModelGroupNames().begin(), move_group_->getJointModelGroupNames().end(), std::ostream_iterator<std::string>(std::cout, ", "));
+     move_group_->setMaxVelocityScalingFactor(max_velocity_scaling_factor);
+     move_group_->setMaxAccelerationScalingFactor(max_acceleration_scaling_factor);
++    move_group_->setPlanningTime(planning_time_seconds);
++    move_group_->setNumPlanningAttempts(planning_attempts);
++    move_group_->setGoalPositionTolerance(goal_position_tolerance);
++    move_group_->setGoalOrientationTolerance(goal_orientation_tolerance);
+     display_path_publisher_ = node_->create_publisher<moveit_msgs::msg::DisplayTrajectory>(
+         "/display_planned_path",
+         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+@@ -46,9 +54,14 @@ void XArmPlanner::init(const std::string& group_name)
+ 
+ bool XArmPlanner::planJointTarget(const std::vector<double>& joint_target)
+ {
++    move_group_->clearPathConstraints();
++    move_group_->clearPoseTargets();
++    move_group_->setStartStateToCurrentState();
+     bool success = move_group_->setJointValueTarget(joint_target);
+-    if (!success)
++    if (!success) {
+         RCLCPP_WARN(node_->get_logger(), "setJointValueTarget: out of bounds");
++        return false;
++    }
+     success = (move_group_->plan(xarm_plan_) == moveit::core::MoveItErrorCode::SUCCESS);
+     if (!success)
+         RCLCPP_ERROR(node_->get_logger(), "planJointTarget: plan failed");
+@@ -60,15 +73,23 @@ bool XArmPlanner::planJointTarget(const std::vector<double>& joint_target)
+ 
+ bool XArmPlanner::planPoseTarget(const geometry_msgs::msg::Pose& pose_target)
+ {
++    move_group_->clearPathConstraints();
++    move_group_->clearPoseTargets();
++    move_group_->setStartStateToCurrentState();
+     bool success = move_group_->setPoseTarget(pose_target);
+-    if (!success)
++    if (!success) {
+         RCLCPP_WARN(node_->get_logger(), "setPoseTarget: out of bounds");
++        return false;
++    }
+     success = (move_group_->plan(xarm_plan_) == moveit::core::MoveItErrorCode::SUCCESS);
++    move_group_->clearPoseTargets();
+     if (!success)
+         RCLCPP_ERROR(node_->get_logger(), "planPoseTarget: plan failed");
+     else
+         publishPlan();
+     is_trajectory_ = false;
++    RCLCPP_INFO(node_->get_logger(),
++        "pose planning used up to %u attempts with a %.1f s budget", planning_attempts, planning_time_seconds);
+     return success;
+ }
+ 
+@@ -75,5 +96,8 @@ bool XArmPlanner::planPoseTargetOrientationConstrained(
+     const geometry_msgs::msg::Pose& pose_target)
+ {
++    move_group_->clearPathConstraints();
++    move_group_->clearPoseTargets();
++    move_group_->setStartStateToCurrentState();
+     moveit_msgs::msg::OrientationConstraint orientation_constraint;
+     orientation_constraint.header.frame_id = move_group_->getPlanningFrame();
+     orientation_constraint.link_name = move_group_->getEndEffectorLink();
+@@ -101,15 +125,19 @@ bool XArmPlanner::planPoseTargetOrientationConstrained(
+             "setPoseTarget orientation-constrained: out of bounds");
+         move_group_->clearPathConstraints();
+         return false;
+     }
+     success = (move_group_->plan(xarm_plan_) ==
+         moveit::core::MoveItErrorCode::SUCCESS);
+     move_group_->clearPathConstraints();
++    move_group_->clearPoseTargets();
+     if (!success)
+         RCLCPP_ERROR(node_->get_logger(),
+             "planPoseTarget orientation-constrained: plan failed");
+     else
+         publishPlan();
+     is_trajectory_ = false;
++    RCLCPP_INFO(node_->get_logger(),
++        "constrained pose planning used up to %u attempts with a %.1f s budget",
++        planning_attempts, planning_time_seconds);
+     return success;
+ }

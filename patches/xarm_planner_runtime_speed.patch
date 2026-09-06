@@ -1,0 +1,104 @@
+diff --git a/xarm_planner/include/xarm_planner/xarm_planner.h b/xarm_planner/include/xarm_planner/xarm_planner.h
+index 665f806..385d1df 100644
+--- a/xarm_planner/include/xarm_planner/xarm_planner.h
++++ b/xarm_planner/include/xarm_planner/xarm_planner.h
+@@ -40,6 +40,7 @@ namespace xarm_planner
+         bool planCartesianPath(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector);
+ 
+         bool executePath(bool wait = true);
++        bool setVelocityScalingFactor(double factor);
+     private:
+         void init(const std::string& group_name);
+         void publishPlan();
+diff --git a/xarm_planner/src/xarm_planner.cpp b/xarm_planner/src/xarm_planner.cpp
+index 451cb11..541203f 100644
+--- a/xarm_planner/src/xarm_planner.cpp
++++ b/xarm_planner/src/xarm_planner.cpp
+@@ -6,6 +6,7 @@
+  * Author: Vinman <vinman.cub@gmail.com>
+  ============================================================================*/
+  
++#include <cmath>
+ #include "xarm_planner/xarm_planner.h"
+ 
+ namespace xarm_planner
+@@ -95,6 +95,18 @@ void XArmPlanner::publishPlan()
+     display_path_publisher_->publish(display_trajectory);
+ }
+ 
++bool XArmPlanner::setVelocityScalingFactor(double factor)
++{
++    if (!std::isfinite(factor) || factor <= 0.0 || factor > 1.0) {
++        RCLCPP_ERROR(node_->get_logger(),
++            "velocity scaling factor must be finite and in (0, 1], got %.3f", factor);
++        return false;
++    }
++    move_group_->setMaxVelocityScalingFactor(factor);
++    RCLCPP_INFO(node_->get_logger(), "MoveIt velocity scaling set to %.1f%%", factor * 100.0);
++    return true;
++}
++
+ bool XArmPlanner::planCartesianPath(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector)
+ {   
+     // moveit_msgs::msg::RobotTrajectory trajectory;
+diff --git a/xarm_planner/src/xarm_planner_node.cpp b/xarm_planner/src/xarm_planner_node.cpp
+index b64c560..9f5c4b2 100644
+--- a/xarm_planner/src/xarm_planner_node.cpp
++++ b/xarm_planner/src/xarm_planner_node.cpp
+@@ -7,9 +7,11 @@
+  ============================================================================*/
+ 
++#include <cmath>
+ #include <signal.h>
+ #include <rclcpp/rclcpp.hpp>
+ #include "xarm_planner/xarm_planner.h"
+ #include <std_msgs/msg/bool.hpp>
++#include <std_msgs/msg/float64_multi_array.hpp>
+ #include <xarm_msgs/srv/plan_pose.hpp>
+ #include <xarm_msgs/srv/plan_joint.hpp>
+ #include <xarm_msgs/srv/plan_exec.hpp>
+@@ -28,6 +30,7 @@ private:
+     bool do_joint_plan(const std::shared_ptr<xarm_msgs::srv::PlanJoint::Request> req, std::shared_ptr<xarm_msgs::srv::PlanJoint::Response> res);
+     bool do_single_cartesian_plan(const std::shared_ptr<xarm_msgs::srv::PlanSingleStraight::Request> req, std::shared_ptr<xarm_msgs::srv::PlanSingleStraight::Response> res);
+     bool exec_plan_cb(const std::shared_ptr<xarm_msgs::srv::PlanExec::Request> req, std::shared_ptr<xarm_msgs::srv::PlanExec::Response> res);
++    void motion_speed_cb(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+     
+ private:
+     rclcpp::Node::SharedPtr node_;
+@@ -35,5 +38,6 @@ private:
+ 
+     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr exec_plan_sub_;
++    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr motion_speed_sub_;
+ 
+     rclcpp::Service<xarm_msgs::srv::PlanExec>::SharedPtr exec_plan_server_;
+     rclcpp::Service<xarm_msgs::srv::PlanPose>::SharedPtr pose_plan_server_;
+@@ -62,6 +66,9 @@ XArmPlannerRunner::XArmPlannerRunner(rclcpp::Node::SharedPtr& node)
+ 
+     xarm_planner_ = std::make_shared<xarm_planner::XArmPlanner>(group_name);
+ 
++    motion_speed_sub_ = node_->create_subscription<std_msgs::msg::Float64MultiArray>(
++        "/motion_speed/config", 10,
++        std::bind(&XArmPlannerRunner::motion_speed_cb, this, std::placeholders::_1));
+     exec_plan_server_ = node_->create_service<xarm_msgs::srv::PlanExec>("xarm_exec_plan", BIND_CLS_CB(&XArmPlannerRunner::exec_plan_cb));
+     pose_plan_server_ = node_->create_service<xarm_msgs::srv::PlanPose>("xarm_pose_plan", BIND_CLS_CB(&XArmPlannerRunner::do_pose_plan));
+     joint_plan_server_ = node_->create_service<xarm_msgs::srv::PlanJoint>("xarm_joint_plan", BIND_CLS_CB(&XArmPlannerRunner::do_joint_plan));
+@@ -69,5 +76,19 @@ XArmPlannerRunner::XArmPlannerRunner(rclcpp::Node::SharedPtr& node)
+ }
+ 
++void XArmPlannerRunner::motion_speed_cb(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
++{
++    if (msg->data.empty()) {
++        RCLCPP_WARN(node_->get_logger(), "ignoring empty motion speed configuration");
++        return;
++    }
++    const double velocity_scaling = msg->data[0];
++    if (!std::isfinite(velocity_scaling) || velocity_scaling <= 0.0 || velocity_scaling > 1.0) {
++        RCLCPP_WARN(node_->get_logger(), "ignoring invalid MoveIt velocity scaling %.3f", velocity_scaling);
++        return;
++    }
++    xarm_planner_->setVelocityScalingFactor(velocity_scaling);
++}
++
+ bool XArmPlannerRunner::do_pose_plan(const std::shared_ptr<xarm_msgs::srv::PlanPose::Request> req, std::shared_ptr<xarm_msgs::srv::PlanPose::Response> res)
+ {
+     bool success = xarm_planner_->planPoseTarget(req->target);

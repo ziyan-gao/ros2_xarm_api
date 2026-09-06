@@ -55,11 +55,22 @@ def rpy_matrix(roll, pitch, yaw):
     ])
 
 
+def level_quaternion(q):
+    """Return the same yaw with roll and pitch constrained to zero."""
+    quaternion = np.asarray(q, dtype=float)
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm <= 1e-9:
+        raise ValueError('pallet quaternion is invalid')
+    rotation = quat_matrix(quaternion / norm)
+    yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    return np.array([0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)])
+
+
 class PalletLocalization(Node):
     def __init__(self):
         super().__init__('pallet_localization')
         self.base_frame = 'link_base'
-        self.declare_parameter('pre_place_clearance_m', 0.04)
+        self.declare_parameter('pre_place_clearance_m', 0.03)
         self.pre_place_clearance = max(
             0.0, float(self.get_parameter('pre_place_clearance_m').value))
         self.marker_id = 49
@@ -75,7 +86,7 @@ class PalletLocalization(Node):
         self.configured_pose_valid = False
         self.pre_place_xyz = np.array([0.6, 0.5, 0.20])
         self.rotate_item_90 = False
-        self.keep_tcp_roll_pitch = False
+        self.keep_eef_perpendicular = True
         self.add_placed_item_obstacle = True
         self.samples = []
         self.last_stamp = None
@@ -97,9 +108,14 @@ class PalletLocalization(Node):
             Float64MultiArray, '/pallet_localization/config_state', 10)
         self.pre_place_pub = self.create_publisher(
             PoseStamped, '/pallet_localization/pre_place_pose', 10)
+        self.loading_target_applied_pub = self.create_publisher(
+            Float64MultiArray, '/random_stable_loading/target_applied', 10)
         self.create_subscription(
             Float64MultiArray, '/pallet_localization/config',
             self.config_callback, 10)
+        self.create_subscription(
+            Float64MultiArray, '/random_stable_loading/target',
+            self.loading_target_callback, 10)
         self.create_service(
             Trigger, '/pallet_localization/start', self.start_callback)
         self.create_service(
@@ -142,7 +158,7 @@ class PalletLocalization(Node):
         self.pre_place_xyz = np.asarray(msg.data[9:12], dtype=float) / 1000.0
         self.rotate_item_90 = bool(msg.data[12] > 0.5)
         if len(msg.data) >= 14:
-            self.keep_tcp_roll_pitch = bool(msg.data[13] > 0.5)
+            self.keep_eef_perpendicular = bool(msg.data[13] > 0.5)
         if len(msg.data) >= 15:
             self.add_placed_item_obstacle = bool(msg.data[14] > 0.5)
         self._save_config()
@@ -151,6 +167,62 @@ class PalletLocalization(Node):
             self.publish_status('LOCKED')
         elif not self.collecting:
             self.publish_status('CONFIGURED AND SAVED')
+
+    def loading_target_callback(self, msg):
+        """Apply a bin-packing FLB target without replacing pallet settings.
+
+        Message layout (lengths in millimeters):
+        [sequence_id, item_id, x, y, z, rotate_90,
+         raw_dx, raw_dy, raw_dz, virtual_dx, virtual_dy, virtual_dz]
+        """
+        if len(msg.data) < 12:
+            self.get_logger().error(
+                'random loading target requires 12 numeric fields')
+            return
+        values = np.asarray(msg.data[:12], dtype=float)
+        sequence_id = int(round(values[0])) if math.isfinite(values[0]) else 0
+        if not np.isfinite(values).all():
+            self.get_logger().error('random loading target contains non-finite values')
+            self._acknowledge_loading_target(sequence_id, False, 1)
+            return
+        item_id = int(round(values[1]))
+        xyz_mm = values[2:5]
+        virtual_dim_mm = values[9:12]
+        if sequence_id < 1 or np.any(xyz_mm < 0.0) or np.any(virtual_dim_mm <= 0.0):
+            self.get_logger().error('random loading target contains invalid values')
+            self._acknowledge_loading_target(sequence_id, False, 1)
+            return
+        if xyz_mm[0] + virtual_dim_mm[0] > self.pallet_x * 1000.0 + 1e-6:
+            self.get_logger().error('random loading target exceeds pallet X extent')
+            self._acknowledge_loading_target(sequence_id, False, 2)
+            return
+        if xyz_mm[1] + virtual_dim_mm[1] > self.pallet_y * 1000.0 + 1e-6:
+            self.get_logger().error('random loading target exceeds pallet Y extent')
+            self._acknowledge_loading_target(sequence_id, False, 3)
+            return
+
+        self.pre_place_xyz = xyz_mm / 1000.0
+        self.rotate_item_90 = bool(values[5] > 0.5)
+        self._save_config()
+        self.publish_config_state()
+        if self.locked and self.preview is not None:
+            self.publish_pre_place_pose()
+            self.publish_status('LOCKED')
+
+        self._acknowledge_loading_target(sequence_id, True, 0)
+        self.get_logger().info(
+            'applied random loading target %d for item %d: '
+            'corner=(%.0f, %.0f, %.0f) mm, rotate_90=%s' % (
+                sequence_id, item_id, *xyz_mm, self.rotate_item_90))
+
+    def _acknowledge_loading_target(self, sequence_id, accepted, reason_code):
+        acknowledgement = Float64MultiArray()
+        acknowledgement.data = [
+            float(sequence_id),
+            1.0 if accepted else 0.0,
+            float(reason_code),
+        ]
+        self.loading_target_applied_pub.publish(acknowledgement)
 
     def _load_config(self):
         try:
@@ -179,8 +251,8 @@ class PalletLocalization(Node):
             if isinstance(pallet, dict):
                 self.configured_position = np.asarray(
                     pallet['position_m'], dtype=float)
-                self.configured_q = np.asarray(
-                    pallet['orientation_xyzw'], dtype=float)
+                self.configured_q = level_quaternion(
+                    pallet['orientation_xyzw'])
                 self.configured_pose_valid = True
             self.pre_place_xyz = np.asarray(pre_place['position_m'], dtype=float)
             if 'rotate_item_90_deg' in pre_place:
@@ -189,8 +261,8 @@ class PalletLocalization(Node):
                 legacy_rpy = np.asarray(pre_place.get(
                     'rpy_deg', [180.0, 0.0, 0.0]), dtype=float)
                 self.rotate_item_90 = abs(legacy_rpy[2]) > 45.0
-            self.keep_tcp_roll_pitch = bool(
-                pre_place.get('keep_tcp_roll_pitch', False))
+            self.keep_eef_perpendicular = bool(pre_place.get(
+                'keep_eef_perpendicular_to_pallet', True))
             self.add_placed_item_obstacle = bool(
                 pre_place.get('add_placed_item_obstacle', True))
         except FileNotFoundError:
@@ -226,7 +298,8 @@ class PalletLocalization(Node):
                 'frame_id': 'pallet_frame',
                 'position_m': [float(value) for value in self.pre_place_xyz],
                 'rotate_item_90_deg': bool(self.rotate_item_90),
-                'keep_tcp_roll_pitch': bool(self.keep_tcp_roll_pitch),
+                'keep_eef_perpendicular_to_pallet': bool(
+                    self.keep_eef_perpendicular),
                 'add_placed_item_obstacle': bool(
                     self.add_placed_item_obstacle),
             },
@@ -250,7 +323,7 @@ class PalletLocalization(Node):
             *[float(value) for value in np.degrees(self.offset_rpy)],
             *[float(value) for value in self.pre_place_xyz * 1000.0],
             1.0 if self.rotate_item_90 else 0.0,
-            1.0 if self.keep_tcp_roll_pitch else 0.0,
+            1.0 if self.keep_eef_perpendicular else 0.0,
             1.0 if self.add_placed_item_obstacle else 0.0,
             *[float(value) for value in self.marker_offset_xyz * 1000.0],
         ]
@@ -343,7 +416,9 @@ class PalletLocalization(Node):
         marker_rotation = quat_matrix(mean_q)
         rotation = marker_rotation @ rpy_matrix(*self.offset_rpy)
         pallet_position = mean_position + marker_rotation @ self.marker_offset_xyz
-        self.preview = (pallet_position, matrix_quat(rotation))
+        # The physical pallet is level. Marker roll/pitch is measurement noise
+        # and must not tilt pallet_frame or any derived loading pose.
+        self.preview = (pallet_position, level_quaternion(matrix_quat(rotation)))
         self.publish_preview('pallet_preview')
         self.publish_status(
             f'READY TO LOCK: spread {position_spread*1000:.1f} mm, '
@@ -357,7 +432,7 @@ class PalletLocalization(Node):
         position, q = self.preview
         self.locked = True
         self.configured_position = position.copy()
-        self.configured_q = q.copy()
+        self.configured_q = level_quaternion(q)
         self.configured_pose_valid = True
         self._save_config()
         self.publish_config_state()
@@ -434,7 +509,7 @@ class PalletLocalization(Node):
         # motion coordinator uses the captured TCP-to-object grasp transform
         # to derive the corresponding TCP target.
         target_rotation = rotation @ rpy_matrix(
-            0.0, 0.0, math.pi / 2.0 if self.rotate_item_90 else 0.0)
+            0.0, 0.0, -math.pi / 2.0 if self.rotate_item_90 else 0.0)
         target_q = matrix_quat(target_rotation)
         msg = PoseStamped()
         msg.header.frame_id = self.base_frame

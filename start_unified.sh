@@ -19,7 +19,20 @@ set -u
 : "${MOVEIT_SERVO_DRY_RUN:=false}"
 : "${SERVO_DESCENT_SPEED_M_S:=0.05}"
 : "${SERVO_DESCENT_KP_Z:=3.0}"
+: "${PICKUP_FORCE_THRESHOLD_N:=5.0}"
 : "${PLACE_FORCE_THRESHOLD_N:=4.0}"
+: "${PLACE_DESCENT_TIMEOUT_SEC:=20.0}"
+: "${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC:=20.0}"
+: "${PLACE_SINGULARITY_STEP_M:=0.003}"
+: "${PLACE_SINGULARITY_STEP_SPEED_MM_S:=10.0}"
+: "${RANDOM_LOADING_AUTO_START:=false}"
+: "${RANDOM_LOADING_CLEARANCE_MM:=10}"
+: "${RANDOM_LOADING_SAMPLE_FRACTION:=0.30}"
+: "${RANDOM_LOADING_COM_BOUND_RATIO:=0.20}"
+: "${TRANSFER_CORNER_HEIGHT_M:=0.47}"
+: "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
+: "${RANDOM_LOADING_VISUALIZE:=true}"
+: "${RANDOM_LOADING_VISUAL_PORT:=8765}"
 
 if [[ "${XARM_REPORT_TYPE}" != "dev" ]]; then
   echo "FATAL: XARM_REPORT_TYPE must be 'dev' for non-blocking 100 Hz joint feedback." >&2
@@ -79,10 +92,12 @@ start_required "RealSense camera" \
 start_required "camera calibration TF and force visualization" \
   ros2 run safe_servo_visualization visualization_node
 
-start_required "taught-waypoint storage" \
+start_required "observation waypoint storage" \
   ros2 run safe_servo_visualization waypoint_store
+
 start_required "MoveIt motion coordinator" \
-  ros2 run safe_servo_visualization motion_coordinator
+  ros2 run safe_servo_visualization motion_coordinator --ros-args \
+    -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}"
 start_required "MoveIt planning-scene obstacles" \
   ros2 run safe_servo_visualization planning_scene_obstacles
 start_required "pickup pipeline orchestrator" \
@@ -93,7 +108,14 @@ start_required "combined PickAndPlace orchestrator" \
   ros2 run safe_servo_visualization pick_place_pipeline
 start_required "supervised Phase 4 pickup coordinator" \
   ros2 run safe_servo_visualization pickup_supervisor --ros-args \
-    -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}"
+    -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
+    -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}" \
+    -p place_descent_timeout_sec:="${PLACE_DESCENT_TIMEOUT_SEC}" \
+    -p singularity_place_recovery_timeout_sec:="${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC}" \
+    -p singularity_place_step_m:="${PLACE_SINGULARITY_STEP_M}" \
+    -p singularity_place_step_speed_mm_s:="${PLACE_SINGULARITY_STEP_SPEED_MM_S}" \
+    -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
+    -p place_workspace_z_min_mm:="${PLACE_WORKSPACE_Z_MIN_MM}"
 start_required "MoveIt Servo and guarded vertical bridge (dry_run=${MOVEIT_SERVO_DRY_RUN}, descent_speed=${SERVO_DESCENT_SPEED_M_S}m/s)" \
   ros2 launch safe_servo_package uf850_moveit_servo.launch.py \
     dry_run:="${MOVEIT_SERVO_DRY_RUN}" \
@@ -107,6 +129,15 @@ start_required "pallet localization supervisor" \
   ros2 run safe_servo_visualization pallet_localization
 start_required "incoming-item localization supervisor" \
   ros2 run safe_servo_visualization item_localization
+start_required "real-platform random stable-loading coordinator" \
+  ros2 run safe_servo_visualization random_stable_loading --ros-args \
+    -p container_size_mm:="[450, 550, 450]" \
+    -p clearance_mm:="${RANDOM_LOADING_CLEARANCE_MM}" \
+    -p candidate_sample_fraction:="${RANDOM_LOADING_SAMPLE_FRACTION}" \
+    -p com_bound_ratio:="${RANDOM_LOADING_COM_BOUND_RATIO}" \
+    -p auto_start_pick_place:="${RANDOM_LOADING_AUTO_START}" \
+    -p visualization_enabled:="${RANDOM_LOADING_VISUALIZE}" \
+    -p visualization_port:="${RANDOM_LOADING_VISUAL_PORT}"
 
 echo "Unified stack is running; MoveIt is the sole motion owner."
 echo "Direct-SDK safe servo is disabled; guarded descent uses the real MoveIt Servo bridge."

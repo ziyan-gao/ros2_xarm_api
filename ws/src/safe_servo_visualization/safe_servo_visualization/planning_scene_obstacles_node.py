@@ -2,7 +2,8 @@ import json
 import math
 
 from geometry_msgs.msg import Pose
-from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningScene
+from moveit_msgs.msg import (
+    AttachedCollisionObject, CollisionObject, ObjectColor, PlanningScene)
 from moveit_msgs.srv import ApplyPlanningScene
 import rclpy
 from rclpy.duration import Duration
@@ -23,6 +24,8 @@ class PlanningSceneObstacles(Node):
         self.static_applied = self.pallet_locked = self.pallet_applied = False
         self.apply_pending = self.attachment_pending = False
         self.pregrasp_snapshot = None
+        self.pending_pickup_operation_id = None
+        self.last_attached_pickup_operation_id = -1
         self.attached_item_id = ''
         self.attached_item_size = None
         self.attached_item_center = None
@@ -30,7 +33,12 @@ class PlanningSceneObstacles(Node):
         self.placed_item_ids = []
         self.placed_item_counter = 0
         self.last_placement_error = ''
+        self.last_placed_item_pose_source = ''
+        self.motion_state = None
         self.add_placed_item_obstacle = True
+        self.place_singularity_fallback = False
+        self.random_loading_target = None
+        self.random_loading_status = {}
         self.touch_links = [
             'link_tcp', 'link_eef', 'ft_sensor_link',
             'xarm_vacuum_gripper_link']
@@ -50,9 +58,18 @@ class PlanningSceneObstacles(Node):
             String, '/motion_coordinator/status', self.motion_status_callback, 10)
         self.create_subscription(
             String, '/pickup_supervisor/status', self.pickup_status_callback, 10)
+        self.create_subscription(
+            Float64MultiArray, '/random_stable_loading/target',
+            self.random_loading_target_callback, 10)
+        self.create_subscription(
+            String, '/random_stable_loading/status',
+            self.random_loading_status_callback, 10)
         self.create_service(
             Trigger, '/planning_scene_obstacles/detach_item',
             self.detach_item_callback)
+        self.create_service(
+            Trigger, '/planning_scene_obstacles/clear_placed_items',
+            self.clear_placed_items_callback)
         self.status_pub = self.create_publisher(
             String, '/planning_scene_obstacles/status', 10)
         self.create_timer(0.5, self.ensure_scene)
@@ -80,11 +97,26 @@ class PlanningSceneObstacles(Node):
         # link_base with the inverse (+90 degree) rotation.
         table_orientation = (0.0, 0.0, math.sin(math.pi / 4.0),
                              math.cos(math.pi / 4.0))
+        # Treat the measured 1.0 m distance as the clearance from link_base to
+        # the wall's nearest face.  The collision box therefore starts at
+        # x=-1.0 m and extends 50 mm farther in the negative-X direction.
+        negative_x_wall_thickness = 0.05
+        # The positive-Y wall uses the same convention: its nearest face is
+        # y=+1.2 m and its collision volume extends away from the robot.
+        positive_y_wall_thickness = 0.05
         return [
             self._box('work_table', (1.5, 2.5, 1.3),
                       (0.6, 0.6, -0.03 - 1.3 / 2.0), table_orientation),
             self._box('secondary_table', (1.3, 2.5, 1.4),
-                      (0.2, -1.7, 0.1 - 1.4 / 2.0), table_orientation),
+                      (0.2, -2.5, 0.1 - 1.4 / 2.0), table_orientation),
+            self._box(
+                'negative_x_wall',
+                (negative_x_wall_thickness, 6.0, 3.0),
+                (-1.0 - negative_x_wall_thickness / 2.0, -1.0, 0.0)),
+            self._box(
+                'positive_y_wall',
+                (6.0, positive_y_wall_thickness, 3.0),
+                (0.0, 1.2 + positive_y_wall_thickness / 2.0, 0.0)),
         ]
 
     def _apply(self, objects, description, on_success=None):
@@ -120,7 +152,7 @@ class PlanningSceneObstacles(Node):
 
     def ensure_scene(self):
         if not self.static_applied:
-            self._apply(self._table_objects(), 'fixed table collision objects',
+            self._apply(self._table_objects(), 'fixed workspace collision objects',
                         lambda: setattr(self, 'static_applied', True))
             return
         if self.pallet_locked and not self.pallet_applied:
@@ -132,7 +164,9 @@ class PlanningSceneObstacles(Node):
 
     def motion_status_callback(self, message):
         try:
-            snapshot = json.loads(message.data).get('planned_pregrasp')
+            status = json.loads(message.data)
+            self.motion_state = status.get('state')
+            snapshot = status.get('planned_pregrasp')
             if isinstance(snapshot, dict):
                 self._validate_snapshot(snapshot)
                 self.pregrasp_snapshot = dict(snapshot)
@@ -144,11 +178,74 @@ class PlanningSceneObstacles(Node):
             status = json.loads(message.data)
         except (json.JSONDecodeError, TypeError):
             return
-        if (not status.get('dry_run', True)
-                and status.get('contact_detected')
-                and status.get('vacuum_verified')):
-            self.attachment_pending = True
-            self._attach_detected_item()
+        if status.get('operation_kind') == 'place':
+            self.place_singularity_fallback = bool(
+                status.get('place_fallback_used'))
+        # Attachment is a one-shot event belonging to a specific pickup
+        # operation. A queued status from the preceding cycle must not re-arm
+        # attachment after detachment and capture the next item's transform
+        # while the robot is still moving to pre-grasp.
+        if (status.get('operation_kind') != 'pickup' or
+                status.get('dry_run', True) or
+                not status.get('contact_detected') or
+                not status.get('vacuum_verified')):
+            return
+        try:
+            pickup_operation_id = int(status['operation_id'])
+        except (KeyError, TypeError, ValueError):
+            self.get_logger().warning(
+                'ignored verified pickup status without a valid operation_id')
+            return
+        if pickup_operation_id <= self.last_attached_pickup_operation_id:
+            return
+        if (self.pending_pickup_operation_id is not None and
+                self.pending_pickup_operation_id != pickup_operation_id):
+            self.get_logger().warning(
+                'ignored pickup attachment operation %d while operation %d '
+                'is still pending' % (
+                    pickup_operation_id,
+                    self.pending_pickup_operation_id))
+            return
+        if self.attached_item_id:
+            return
+        if not self.attachment_pending:
+            self.get_logger().info(
+                f'arming item attachment for pickup operation '
+                f'{pickup_operation_id}')
+        self.pending_pickup_operation_id = pickup_operation_id
+        self.attachment_pending = True
+        self._attach_detected_item()
+
+    def random_loading_target_callback(self, message):
+        if len(message.data) < 12:
+            self.get_logger().warning(
+                'ignored incomplete random stable-loading target for '
+                'fallback obstacle placement')
+            return
+        values = tuple(map(float, message.data[:12]))
+        if not all(math.isfinite(value) for value in values):
+            self.get_logger().warning(
+                'ignored non-finite random stable-loading target')
+            return
+        if any(value <= 0.0 for value in values[6:9]):
+            self.get_logger().warning(
+                'ignored random stable-loading target with invalid dimensions')
+            return
+        self.random_loading_target = {
+            'sequence_id': int(round(values[0])),
+            'item_id': int(round(values[1])),
+            'corner_m': tuple(value / 1000.0 for value in values[2:5]),
+            'rotated': values[5] > 0.5,
+            'size_m': tuple(value / 1000.0 for value in values[6:9]),
+        }
+
+    def random_loading_status_callback(self, message):
+        try:
+            status = json.loads(message.data)
+            self.random_loading_status = (
+                status if isinstance(status, dict) else {})
+        except (json.JSONDecodeError, TypeError):
+            self.random_loading_status = {}
 
     @staticmethod
     def _validate_snapshot(snapshot):
@@ -198,18 +295,27 @@ class PlanningSceneObstacles(Node):
         scene = PlanningScene()
         scene.is_diff = scene.robot_state.is_diff = True
         scene.robot_state.attached_collision_objects = [attached]
+        pickup_operation_id = self.pending_pickup_operation_id
         self._apply_scene(
             scene, f'attached collision object {object_id}',
             lambda: self._attachment_succeeded(
-                object_id, item_size, center, item_q))
+                object_id, item_size, center, item_q,
+                pickup_operation_id))
 
     def _attachment_succeeded(
-            self, object_id, item_size, center, orientation):
+            self, object_id, item_size, center, orientation,
+            pickup_operation_id):
         self.attached_item_id, self.attachment_pending = object_id, False
         self.attached_item_size = tuple(map(float, item_size))
         self.attached_item_center = tuple(map(float, center))
         self.attached_item_orientation = tuple(map(float, orientation))
+        if pickup_operation_id is not None:
+            self.last_attached_pickup_operation_id = max(
+                self.last_attached_pickup_operation_id,
+                int(pickup_operation_id))
+        self.pending_pickup_operation_id = None
         self.last_placement_error = ''
+        self.place_singularity_fallback = False
         self.publish_status()
 
     def _placed_item_from_attached(self):
@@ -229,6 +335,56 @@ class PlanningSceneObstacles(Node):
         placed_id = f'placed_item_{self.placed_item_counter + 1}'
         return self._box(
             placed_id, self.attached_item_size, center, orientation)
+
+    def _active_random_fallback_target(self):
+        target = self.random_loading_target
+        if not self.place_singularity_fallback or target is None:
+            return None
+        if self.random_loading_status.get('state') not in (
+                'STARTING', 'EXECUTING'):
+            return None
+        try:
+            pending_sequence = int(
+                self.random_loading_status.get('pending_sequence_id'))
+            attached_item = int(self.pregrasp_snapshot['box_id'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (pending_sequence != target['sequence_id'] or
+                attached_item != target['item_id']):
+            return None
+        return target
+
+    def _placed_item_from_random_target(self, target):
+        tf = self.tf_buffer.lookup_transform(
+            self.base_frame, 'pallet_frame', rclpy.time.Time(),
+            timeout=Duration(seconds=0.25))
+        t, q = tf.transform.translation, tf.transform.rotation
+        pallet_q = (q.x, q.y, q.z, q.w)
+        size_x, size_y, size_z = target['size_m']
+        corner_x, corner_y, corner_z = target['corner_m']
+        if target['rotated']:
+            # The placement flag now means -90 degrees around pallet Z. The
+            # target still denotes the rotated footprint's minimum X/Y/bottom
+            # corner, so its center offsets are (original Y/2, original X/2).
+            local_center = (
+                corner_x + size_y / 2.0,
+                corner_y + size_x / 2.0,
+                corner_z + size_z / 2.0)
+            item_yaw_q = (
+                0.0, 0.0, math.sin(-math.pi / 4.0),
+                math.cos(-math.pi / 4.0))
+            orientation = self._multiply(pallet_q, item_yaw_q)
+        else:
+            local_center = (
+                corner_x + size_x / 2.0,
+                corner_y + size_y / 2.0,
+                corner_z + size_z / 2.0)
+            orientation = pallet_q
+        offset = self._rotate(local_center, pallet_q)
+        center = (t.x + offset[0], t.y + offset[1], t.z + offset[2])
+        placed_id = f'placed_item_{self.placed_item_counter + 1}'
+        return self._box(
+            placed_id, target['size_m'], center, orientation)
 
     def detach_item_callback(self, _request, response):
         if not self.attached_item_id:
@@ -253,23 +409,43 @@ class PlanningSceneObstacles(Node):
         placed_object = None
         if self.add_placed_item_obstacle:
             try:
-                placed_object = self._placed_item_from_attached()
+                predicted_target = self._active_random_fallback_target()
+                if predicted_target is not None:
+                    placed_object = self._placed_item_from_random_target(
+                        predicted_target)
+                    self.last_placed_item_pose_source = (
+                        'random_stable_loading_target')
+                    self.get_logger().warning(
+                        'place singularity fallback: assigning placed-item '
+                        'obstacle to the predicted random-loading target pose')
+                else:
+                    placed_object = self._placed_item_from_attached()
+                    self.last_placed_item_pose_source = 'measured_release_pose'
                 self.last_placement_error = ''
             except (TransformException, ValueError) as exc:
                 # The physical release must still be allowed to complete. Keep
                 # the scene internally consistent by removing the attached
                 # object, but expose the missing obstacle in status and logs.
                 self.last_placement_error = str(exc)
+                self.last_placed_item_pose_source = ''
                 self.get_logger().error(
                     f'cannot create placed-item collision object: {exc}')
         else:
             self.last_placement_error = ''
+            self.last_placed_item_pose_source = ''
         scene = PlanningScene()
         scene.is_diff = scene.robot_state.is_diff = True
         scene.robot_state.attached_collision_objects = [attached]
         scene.world.collision_objects = [world_object]
         if placed_object is not None:
             scene.world.collision_objects.append(placed_object)
+            color = ObjectColor()
+            color.id = placed_object.id
+            color.color.r = 0.95
+            color.color.g = 0.65
+            color.color.b = 0.10
+            color.color.a = 0.90
+            scene.object_colors = [color]
         item_id = self.attached_item_id
         placed_id = '' if placed_object is None else placed_object.id
         accepted = self._apply_scene(
@@ -295,9 +471,52 @@ class PlanningSceneObstacles(Node):
         self.attached_item_orientation = None
         self.pregrasp_snapshot = None
         self.attachment_pending = False
+        self.pending_pickup_operation_id = None
+        self.place_singularity_fallback = False
         if placed_id:
             self.placed_item_counter += 1
             self.placed_item_ids.append(placed_id)
+        self.publish_status()
+
+    def clear_placed_items_callback(self, _request, response):
+        if self.apply_pending:
+            response.message = 'planning-scene update is busy; retry clear'
+            return response
+        if self.motion_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+            response.message = (
+                f'cannot clear obstacles while MoveIt is in '
+                f'{self.motion_state}')
+            return response
+        if self.attached_item_id or self.attachment_pending:
+            response.message = (
+                'cannot clear placed obstacles while an item is attached or '
+                'awaiting attachment')
+            return response
+        if not self.placed_item_ids:
+            response.success = True
+            response.message = 'no placed-item obstacles to clear'
+            return response
+        objects = []
+        for object_id in self.placed_item_ids:
+            obj = CollisionObject()
+            obj.header.frame_id = self.base_frame
+            obj.id = object_id
+            obj.operation = CollisionObject.REMOVE
+            objects.append(obj)
+        count = len(objects)
+        accepted = self._apply(
+            objects, f'removal of {count} placed-item obstacles',
+            self._placed_items_cleared)
+        response.success = accepted
+        response.message = (
+            f'clearing {count} placed-item obstacles'
+            if accepted else 'apply_planning_scene is unavailable')
+        return response
+
+    def _placed_items_cleared(self):
+        self.placed_item_ids = []
+        self.last_placement_error = ''
+        self.last_placed_item_pose_source = ''
         self.publish_status()
 
     def publish_status(self):
@@ -306,6 +525,9 @@ class PlanningSceneObstacles(Node):
             'static_applied': self.static_applied,
             'pallet_applied': self.pallet_applied,
             'attachment_pending': self.attachment_pending,
+            'pending_pickup_operation_id': self.pending_pickup_operation_id,
+            'last_attached_pickup_operation_id':
+                self.last_attached_pickup_operation_id,
             'attached_item_id': self.attached_item_id,
             'attached_item_size_m': self.attached_item_size,
             'attached_item_center_in_tcp_m': self.attached_item_center,
@@ -315,6 +537,7 @@ class PlanningSceneObstacles(Node):
             'placed_item_count': len(self.placed_item_ids),
             'add_placed_item_obstacle': self.add_placed_item_obstacle,
             'last_placement_error': self.last_placement_error,
+            'last_placed_item_pose_source': self.last_placed_item_pose_source,
         }, separators=(',', ':'))
         self.status_pub.publish(message)
 
@@ -355,6 +578,7 @@ class PlanningSceneObstacles(Node):
         self.pallet_applied = False
         self.placed_item_ids = []
         self.last_placement_error = ''
+        self.last_placed_item_pose_source = ''
         self.publish_status()
 
     def _apply_locked_pallet(self):

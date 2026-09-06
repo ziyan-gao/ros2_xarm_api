@@ -14,7 +14,7 @@ The intended cycle is:
 1. Move to the item observation configuration.
 2. Detect the item's pose and dimensions.
 3. Move above the item, descend, and pick it up.
-4. Follow the configured nominal Cartesian path to the pallet and place it.
+4. Use MoveIt to transfer the attached item above the pallet and place it.
 5. Reverse the vertical loading path, then use MoveIt to return to observation.
 
 ## Design principles
@@ -22,11 +22,28 @@ The intended cycle is:
 ### Separate transit and contact control
 
 Use safe servo only for short vertical contact searches near an item or placement
-surface. The automatic cycle currently uses the UFACTORY Cartesian service for
-the commissioned nominal clearance and transfer segments. MoveIt planning
-interfaces remain available for manual operation and as a future fallback.
+surface. The automatic cycle uses the UFACTORY Cartesian service only for local
+vertical lift, loading, and retreat segments. Cross-table transfer and return to
+observation use collision-checked MoveIt plans so the planner selects a valid
+joint-space branch and checks the complete swept volume.
 
 Only one command source may control the robot at a time. Switching between MoveIt trajectory execution and SDK servo mode must be explicit, and the previous motion must be stopped and confirmed complete first.
+
+### Unified non-servo speed control
+
+The panel's **Non-servo motion speed** slider controls both MoveIt trajectory
+velocity scaling and UFACTORY Cartesian-service velocity. It intentionally does
+not change safe-servo descent speed. The slider is a percentage of the
+application's commissioned envelope:
+
+```text
+MoveIt velocity scaling = slider_percent * 0.003  (1.5% .. 30%)
+Cartesian service speed = slider_percent mm/s    (5 .. 100 mm/s)
+```
+
+For example, 30% selects 9% MoveIt velocity scaling and 30 mm/s linear-service
+motion. MoveIt acceleration scaling remains at the conservative configured
+limit.
 
 ### Save taught configurations as joint positions
 
@@ -88,19 +105,37 @@ No lateral movement is allowed until the tool has returned to the pre-grasp clea
 ### 4. Transfer and placement
 
 The automatic cycle defines two elevated waypoints: `pick_clearance` above the
-grasp and `place_transfer` above the final target. Their nominal vertical value
-is calculated in metres as:
+grasp and `place_transfer` above the final target. Both use the same configured
+height for the carried item's left-bottom-depth corner:
 
 ```text
-nominal_height = clearance + object_height + final_target_Z
-if nominal_height > 0.450:
-    nominal_height = clearance + final_target_Z
+item corner in pallet_frame: Z = TRANSFER_CORNER_HEIGHT_M = 0.470 m
 ```
 
-The pickup retreat uses `nominal_height` as its vertical lift distance. The
-place transfer uses it as the object bottom-corner height in `pallet_frame`.
-The service-controlled sequence is `pick_clearance -> place_transfer`, followed
-by a vertical linear move to the 40 mm pre-place clearance.
+After contact, pickup converts this corner height to the corresponding absolute
+TCP Z using the pallet pose, measured item height, and configured grasp offset.
+It then retreats vertically to `pick_clearance`. The place-transfer target uses
+the same pallet-frame corner height above the configured pre-place X/Y, making
+the cross-table transfer nominally level.
+After the vertical pickup retreat reaches `pick_clearance`, MoveIt plans and
+executes the collision-checked cross-table motion to `place_transfer`. When
+**Keep EEF perpendicular to pallet** is enabled, the transfer plan also carries
+a path orientation constraint: TCP roll/pitch remain within 3 degrees of the
+downward target orientation while yaw is unrestricted. The downward direction
+is aligned with `link_base` Z: localized pallet yaw is retained, but measured
+pallet roll/pitch is deliberately removed so localization noise cannot make the
+post-pick vertical TCP an invalid constrained-planning start state. A direct
+linear service move then descends vertically to the 30 mm pre-place clearance.
+
+If MoveIt reports a planning failure before transfer execution begins, the
+place pipeline can use a degraded direct-transfer fallback. It hands control
+from `ros2_control` to the xArm driver and sends the already validated transfer
+TCP XYZ/RPY to `/ufactory/set_position` with `motion_type=1` (prefer linear
+motion, then use the controller's joint-space IK). This fallback deliberately
+bypasses MoveIt collision checking. It is never started for a failed or
+partially executed trajectory, and a rejected xArm motion remains a hard fault.
+After the target is reached, `ros2_control` and fresh joint-state feedback are
+restored before linear loading begins.
 
 At `pre_place_pose`:
 
@@ -113,6 +148,46 @@ At `pre_place_pose`:
 6. Disable safe-servo and use the Cartesian service to retreat vertically back
    to `place_transfer`.
 7. Switch back to trajectory control.
+
+If MoveIt Servo reports its specific singularity hard-stop during the guarded
+place descent, the supervisor honors that stop and disables Servo. It then
+hands exclusive control to the direct xArm Cartesian service and continues
+downward in synchronous `PLACE_SINGULARITY_STEP_M` increments (3 mm by default,
+at 10 mm/s). After every completed step it reads fresh TCP and Fz telemetry.
+The next step is issued only while contact has not been detected, the configured
+place floor has not been reached, and the separate
+`PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC` recovery window (20 seconds by
+default) has not expired. The recovery window starts when the system changes
+from Servo to direct stepping, so a Servo deceleration timeout cannot consume
+it before the first step. Contact, floor/timeout exhaustion, or stale telemetry
+causes the item to be released and detached, followed by a vertical retreat to the
+recorded `place_transfer` height and a MoveIt return to observation. Thus any
+unobserved contact travel is bounded to one 3 mm step rather than one continuous
+service descent. Other Servo faults remain hard failures, and a singularity
+during pickup does not release the item automatically.
+
+The direct linear move from `place_transfer` to the pre-place pose is also
+guarded using a fresh transfer-waypoint Fz baseline. Two consecutive samples at
+or above the configured 4 N baseline-relative threshold interrupt the linear
+descent, release and detach the item, reverse vertically to `place_transfer`,
+and return to observation without starting the safe-servo place descent.
+
+The transfer-to-pre-place command uses `wait=false`, allowing the supervisor to
+continue monitoring live TCP Z and Fz and to call `/ufactory/set_state`
+immediately. Reaching the requested Z restores `ros2_control` and starts
+safe-servo. If either this linear loading descent or the subsequent safe-servo
+place descent exceeds `PLACE_DESCENT_TIMEOUT_SEC` (20 seconds by default), the
+same degraded release, detach, vertical-retreat, and observation-return
+sequence is used. Waiting for the direct-motion stop acknowledgement is also
+bounded; if stopping cannot be confirmed, automatic release is blocked and the
+pipeline faults rather than opening the gripper while motion may still be
+active.
+
+Pickup keeps its commissioned `+50 mm` TCP lower bound. Placement uses the
+separate `PLACE_WORKSPACE_Z_MIN_MM` bound, currently `-100 mm`, because the
+pallet-side TCP can legitimately pass below the robot-base Z origin. The
+150 mm maximum place search, force-contact stop, and independent force/torque
+safety caps still apply.
 
 ### 5. Retreat and return
 
@@ -156,7 +231,8 @@ IDLE
   -> SERVO_GRASP_RETREAT
   -> ATTACH_OBJECT
   -> PICK_CLEARANCE
-  -> CARTESIAN_TRANSFER
+  -> PLAN_MOVEIT_TRANSFER
+  -> EXECUTE_MOVEIT_TRANSFER
   -> LINEAR_LOAD_TO_PRE_PLACE
   -> SERVO_PLACE_DESCENT
   -> VACUUM_OFF
@@ -242,8 +318,20 @@ The attachment behavior and test procedure are documented in
 [Phase 5 planning-scene attachment](phase5_planning_scene_attachment.md).
 The place target specifies the carried object's minimum-X/minimum-Y/bottom
 corner in `pallet_frame`. The captured TCP-to-object grasp transform converts
-that target into the required TCP pose, with 40 mm of automatic vertical
-pre-place clearance before guarded descent.
+that target into the required TCP pose, with 30 mm of automatic vertical
+pre-place clearance before guarded descent. When **Rotate item 90 deg clockwise
+about pallet Z** is enabled, the coordinator shifts the object's local corner
+using its measured X dimension. Clockwise is defined when looking along the
+positive pallet-Z axis toward the pallet. The configured XYZ remains the rotated
+footprint's minimum pallet-X/minimum pallet-Y/bottom corner; the box does not
+rotate around and retain its former physical corner.
+
+When **Keep EEF perpendicular to pallet** is enabled, the target TCP is
+reconstructed so its tool-Z axis follows downward `link_base` Z. Placement and
+pallet yaw are preserved, but incidental roll/pitch from both the captured
+grasp transform and pallet localization are not reproduced. This gives pickup,
+constrained transfer, vertical loading, and guarded descent one consistent
+definition of vertical.
 Marker-to-pallet XYZ calibration corrects any displacement between the ArUco
 origin and the physical pallet top; the current calibrated Z offset is
 `+21.3 mm`. Placement contact triggers on either a debounced raw-Fz sign
@@ -257,12 +345,18 @@ and torque safety caps remain active.
 
 Completion criterion: deliberately obstructed or self-colliding transfer requests are rejected before robot motion.
 
-### Phase 6: Removed — standard MoveIt transfer
+### Phase 6: Standard MoveIt transfer
 
-The separate continuous/blended-transfer phase is no longer required. Standard
-MoveIt collision-checked plans move the attached item to pre-place and return
-the released robot to observation. An intermediate waypoint is optional rather
-than part of the place pipeline.
+MoveIt plans and executes the cross-table motion from pickup clearance to the
+elevated place-transfer TCP pose while the item is attached in the planning
+scene. The dedicated constrained-pose service applies the orientation constraint
+to the complete transfer path, rather than only setting the endpoint quaternion.
+The UF850 OMPL group declares a joint-space projection evaluator so constrained
+RRTConnect planning can construct and explore its start tree reliably.
+Only the subsequent vertical load to pre-place uses the direct Cartesian service.
+After release and vertical retreat, MoveIt independently plans the return to
+observation. An intermediate taught waypoint remains optional rather than
+mandatory.
 
 ### Phase 7: Placement and complete cycle
 
@@ -289,6 +383,12 @@ Completion criterion: multiple supervised cycles finish successfully, and every 
 - Replan if the environment, start state, or detected object changes.
 - Log state transitions, plans, execution results, force events, and vacuum events.
 - Test cancellation and communication loss at every motion state.
+
+The panel's manual operations provide **Open gripper**, **Close gripper**, and
+**Clear placed obstacles**. Gripper commands are rejected while the pickup
+supervisor is active. Clearing obstacles removes only accumulated placed-item
+boxes; the tables, pallet surface, robot/tool geometry, and any currently
+attached item remain in the planning scene.
 
 ## First implementation task
 

@@ -83,9 +83,10 @@ expire after five minutes and are cleared by any unrelated waypoint plan.
 
 The supervisor arms Servo once and continuously refreshes the measured box-top
 Z target. The bridge advances downward continuously and immediately pauses when
-the baseline-relative force increase reaches the configured threshold. Reaching
-the box-top safety floor without force contact is a fault. Lateral and
-rotational commands remain unavailable.
+the baseline-relative Fz increase reaches the configured threshold. Pickup uses
+a 5 N default (`PICKUP_FORCE_THRESHOLD_N`), independently of the 4 N placement
+threshold. Reaching the box-top safety floor without force contact is a fault.
+Lateral and rotational commands remain unavailable.
 
 At the measured box top, the supervisor calls the vacuum service on the
 ros2_control hardware driver's existing connection. It requests pressure

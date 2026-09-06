@@ -16,15 +16,28 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 BOX_DIMENSIONS_MM = {
-    0: (220.0, 180.0, 110.0),
-    1: (200.0, 100.0, 150.0),
-    2: (150.0, 100.0, 200.0),
-    4: (100.0, 100.0, 150.0),
-    5: (220.0, 170.0, 80.0),
-    6: (150.0, 150.0, 150.0),
-    7: (190.0, 190.0, 110.0),
-    9: (220.0, 160.0, 120.0),
+    1: (210.0, 110.0, 160.0),
+    2: (160.0, 110.0, 210.0),
+    4: (110.0, 110.0, 150.0),
+    6: (160.0, 160.0, 160.0),
+    7: (170.0, 170.0, 110.0),
+    9: (220.0, 170.0, 120.0),
 }
+
+# Printed ArUco sizes are not identical across all boxes.  solvePnP scales
+# translation directly from this edge length, so using the 63 mm default for
+# marker 5 places its pose about 68 mm too close to the camera.
+MARKER_LENGTH_OVERRIDES_M = {
+    5: 0.075,
+}
+
+
+def marker_object_points(marker_length):
+    half = marker_length / 2.0
+    return np.array([
+        [-half, half, 0.0], [half, half, 0.0],
+        [half, -half, 0.0], [-half, -half, 0.0],
+    ], dtype=np.float32)
 
 
 def quaternion_matrix(q):
@@ -107,11 +120,7 @@ class BoxMarkerDetector(Node):
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.detector = cv2.aruco.ArucoDetector(
             self.dictionary, cv2.aruco.DetectorParameters())
-        half = self.marker_length / 2.0
-        self.object_points = np.array([
-            [-half, half, 0.0], [half, half, 0.0],
-            [half, -half, 0.0], [-half, -half, 0.0],
-        ], dtype=np.float32)
+        self.object_points = marker_object_points(self.marker_length)
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -193,15 +202,21 @@ class BoxMarkerDetector(Node):
                 # OpenCV 4 returns shape (N, 1), while OpenCV 5 may return
                 # shape (N,); normalize both forms.
                 marker_id = int(np.asarray(marker_id_array).reshape(-1)[0])
+                marker_length = MARKER_LENGTH_OVERRIDES_M.get(
+                    marker_id, self.marker_length)
+                object_points = (
+                    marker_object_points(marker_length)
+                    if marker_length != self.marker_length
+                    else self.object_points)
                 ok, rvec, tvec = cv2.solvePnP(
-                    self.object_points, corner.reshape(4, 2),
+                    object_points, corner.reshape(4, 2),
                     self.camera_matrix, self.distortion,
                     flags=cv2.SOLVEPNP_IPPE_SQUARE)
                 if not ok:
                     continue
                 cv2.drawFrameAxes(
                     image, self.camera_matrix, self.distortion,
-                    rvec, tvec, self.marker_length / 2.0)
+                    rvec, tvec, marker_length / 2.0)
                 detected_ids.append(marker_id)
                 if h_base_camera is None:
                     continue

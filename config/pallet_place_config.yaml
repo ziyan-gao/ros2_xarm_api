@@ -1,13 +1,13 @@
 format_version: 1
 frame_id: link_base
 pallet_geometry:
-  length_x_m: 0.5
-  length_y_m: 0.5
+  length_x_m: 0.45
+  length_y_m: 0.55
   surface_thickness_m: 0.005
   origin: corner_of_top_face
 localization:
   marker_id: 14
-  required_samples: 27
+  required_samples: 50
   position_tolerance_m: 0.005
   angle_tolerance_deg: 2.0
   marker_offset_rpy_deg:
@@ -17,23 +17,23 @@ localization:
   marker_offset_xyz_m:
   - 0.0
   - 0.0
-  - 0.0213
+  - 0.0013
 pallet_pose:
   position_m:
-  - 0.4924156959949447
-  - -0.6822023079779164
-  - -0.04314690818251143
+  - 0.33981455390227194
+  - -0.7060431973496575
+  - -0.18139075716921246
   orientation_xyzw:
-  - -0.005835848387898373
-  - 0.004664320074044492
-  - 0.7484316939673658
-  - 0.6631698021298765
+  - 0.0
+  - 0.0
+  - 0.6957341765196998
+  - 0.7182993495907226
 pre_place_pose:
   frame_id: pallet_frame
   position_m:
-  - 0.4
-  - 0.4
-  - 0.0
+  - 0.12
+  - 0.24
+  - 0.27
   rotate_item_90_deg: false
-  keep_tcp_roll_pitch: false
-  add_placed_item_obstacle: false
+  keep_eef_perpendicular_to_pallet: true
+  add_placed_item_obstacle: true

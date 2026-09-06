@@ -1,0 +1,127 @@
+diff --git a/xarm_planner/include/xarm_planner/xarm_planner.h b/xarm_planner/include/xarm_planner/xarm_planner.h
+index 385d1df..766e7e4 100644
+--- a/xarm_planner/include/xarm_planner/xarm_planner.h
++++ b/xarm_planner/include/xarm_planner/xarm_planner.h
+@@ -36,6 +36,7 @@ namespace xarm_planner
+ 
+         bool planJointTarget(const std::vector<double>& joint_target);
+         bool planPoseTarget(const geometry_msgs::msg::Pose& pose_target);
++        bool planPoseTargetOrientationConstrained(const geometry_msgs::msg::Pose& pose_target);
+         bool planPoseTargets(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector);
+         bool planCartesianPath(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector);
+ 
+diff --git a/xarm_planner/src/xarm_planner.cpp b/xarm_planner/src/xarm_planner.cpp
+index 541203f..4520d81 100644
+--- a/xarm_planner/src/xarm_planner.cpp
++++ b/xarm_planner/src/xarm_planner.cpp
+@@ -8,6 +8,8 @@
+  
+ #include <cmath>
+ #include "xarm_planner/xarm_planner.h"
++#include <moveit_msgs/msg/constraints.hpp>
++#include <moveit_msgs/msg/orientation_constraint.hpp>
+ 
+ namespace xarm_planner
+ {
+@@ -69,6 +71,48 @@ bool XArmPlanner::planPoseTarget(const geometry_msgs::msg::Pose& pose_target)
+     return success;
+ }
+ 
++bool XArmPlanner::planPoseTargetOrientationConstrained(
++    const geometry_msgs::msg::Pose& pose_target)
++{
++    moveit_msgs::msg::OrientationConstraint orientation_constraint;
++    orientation_constraint.header.frame_id = move_group_->getPlanningFrame();
++    orientation_constraint.link_name = move_group_->getEndEffectorLink();
++    orientation_constraint.orientation = pose_target.orientation;
++    // Keep the tool tilt within three degrees while allowing arbitrary yaw
++    // about its own Z axis. Rotation-vector parameterization avoids the Euler
++    // singularity at the commanded downward (roll=pi) tool orientation.
++    constexpr double tilt_tolerance = 0.05235987755982989;
++    orientation_constraint.absolute_x_axis_tolerance = tilt_tolerance;
++    orientation_constraint.absolute_y_axis_tolerance = tilt_tolerance;
++    orientation_constraint.absolute_z_axis_tolerance = 3.141592653589793;
++    orientation_constraint.weight = 1.0;
++    orientation_constraint.parameterization =
++        moveit_msgs::msg::OrientationConstraint::ROTATION_VECTOR;
++
++    moveit_msgs::msg::Constraints path_constraints;
++    path_constraints.name = "keep_tcp_roll_pitch";
++    path_constraints.orientation_constraints.push_back(orientation_constraint);
++    move_group_->setPathConstraints(path_constraints);
++
++    bool success = move_group_->setPoseTarget(pose_target);
++    if (!success) {
++        RCLCPP_WARN(node_->get_logger(),
++            "setPoseTarget orientation-constrained: out of bounds");
++        move_group_->clearPathConstraints();
++        return false;
++    }
++    success = (move_group_->plan(xarm_plan_) ==
++        moveit::core::MoveItErrorCode::SUCCESS);
++    move_group_->clearPathConstraints();
++    if (!success)
++        RCLCPP_ERROR(node_->get_logger(),
++            "planPoseTarget orientation-constrained: plan failed");
++    else
++        publishPlan();
++    is_trajectory_ = false;
++    return success;
++}
++
+ bool XArmPlanner::planPoseTargets(const std::vector<geometry_msgs::msg::Pose>& pose_target_vector)
+ {
+     bool success = move_group_->setPoseTargets(pose_target_vector);
+diff --git a/xarm_planner/src/xarm_planner_node.cpp b/xarm_planner/src/xarm_planner_node.cpp
+index b64c560..c78adba 100644
+--- a/xarm_planner/src/xarm_planner_node.cpp
++++ b/xarm_planner/src/xarm_planner_node.cpp
+@@ -25,6 +25,7 @@ public:
+ 
+ private:
+     bool do_pose_plan(const std::shared_ptr<xarm_msgs::srv::PlanPose::Request> req, std::shared_ptr<xarm_msgs::srv::PlanPose::Response> res);
++    bool do_orientation_constrained_pose_plan(const std::shared_ptr<xarm_msgs::srv::PlanPose::Request> req, std::shared_ptr<xarm_msgs::srv::PlanPose::Response> res);
+     bool do_joint_plan(const std::shared_ptr<xarm_msgs::srv::PlanJoint::Request> req, std::shared_ptr<xarm_msgs::srv::PlanJoint::Response> res);
+     bool do_single_cartesian_plan(const std::shared_ptr<xarm_msgs::srv::PlanSingleStraight::Request> req, std::shared_ptr<xarm_msgs::srv::PlanSingleStraight::Response> res);
+     bool exec_plan_cb(const std::shared_ptr<xarm_msgs::srv::PlanExec::Request> req, std::shared_ptr<xarm_msgs::srv::PlanExec::Response> res);
+@@ -39,6 +40,7 @@ private:
+     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr motion_speed_sub_;
+ 
+     rclcpp::Service<xarm_msgs::srv::PlanExec>::SharedPtr exec_plan_server_;
++    rclcpp::Service<xarm_msgs::srv::PlanPose>::SharedPtr constrained_pose_plan_server_;
+     rclcpp::Service<xarm_msgs::srv::PlanPose>::SharedPtr pose_plan_server_;
+     rclcpp::Service<xarm_msgs::srv::PlanJoint>::SharedPtr joint_plan_server_;
+     rclcpp::Service<xarm_msgs::srv::PlanSingleStraight>::SharedPtr single_straight_plan_server_;
+@@ -78,6 +80,7 @@ XArmPlannerRunner::XArmPlannerRunner(rclcpp::Node::SharedPtr& node)
+         std::bind(&XArmPlannerRunner::motion_speed_cb, this, std::placeholders::_1));
+     exec_plan_server_ = node_->create_service<xarm_msgs::srv::PlanExec>("xarm_exec_plan", BIND_CLS_CB(&XArmPlannerRunner::exec_plan_cb));
+     pose_plan_server_ = node_->create_service<xarm_msgs::srv::PlanPose>("xarm_pose_plan", BIND_CLS_CB(&XArmPlannerRunner::do_pose_plan));
++    constrained_pose_plan_server_ = node_->create_service<xarm_msgs::srv::PlanPose>("xarm_pose_plan_orientation_constrained", BIND_CLS_CB(&XArmPlannerRunner::do_orientation_constrained_pose_plan));
+     joint_plan_server_ = node_->create_service<xarm_msgs::srv::PlanJoint>("xarm_joint_plan", BIND_CLS_CB(&XArmPlannerRunner::do_joint_plan));
+     single_straight_plan_server_ = node_->create_service<xarm_msgs::srv::PlanSingleStraight>("xarm_straight_plan", BIND_CLS_CB(&XArmPlannerRunner::do_single_cartesian_plan));
+ }
+@@ -101,6 +104,13 @@ bool XArmPlannerRunner::do_pose_plan(const std::shared_ptr<xarm_msgs::srv::PlanP
+     return success;
+ }
+ 
++bool XArmPlannerRunner::do_orientation_constrained_pose_plan(const std::shared_ptr<xarm_msgs::srv::PlanPose::Request> req, std::shared_ptr<xarm_msgs::srv::PlanPose::Response> res)
++{
++    bool success = xarm_planner_->planPoseTargetOrientationConstrained(req->target);
++    res->success = success;
++    return success;
++}
++
+ bool XArmPlannerRunner::do_joint_plan(const std::shared_ptr<xarm_msgs::srv::PlanJoint::Request> req, std::shared_ptr<xarm_msgs::srv::PlanJoint::Response> res)
+ {
+     bool success = xarm_planner_->planJointTarget(req->target);
+diff --git a/xarm_moveit_config/config/uf850/ompl_planning.yaml b/xarm_moveit_config/config/uf850/ompl_planning.yaml
+index 47f8385..3db472f 100644
+--- a/xarm_moveit_config/config/uf850/ompl_planning.yaml
++++ b/xarm_moveit_config/config/uf850/ompl_planning.yaml
+@@ -1,5 +1,6 @@
+ uf850:
+   default_planner_config: RRTConnect
++  projection_evaluator: joints(joint1,joint2)
+   planner_configs:
+     - SBL
+     - EST
