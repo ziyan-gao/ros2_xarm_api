@@ -12,6 +12,7 @@ from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
+from xarm_msgs.srv import SetInt16
 
 
 class PlanningSceneObstacles(Node):
@@ -35,6 +36,7 @@ class PlanningSceneObstacles(Node):
         self.last_placement_error = ''
         self.last_placed_item_pose_source = ''
         self.motion_state = None
+        self.pickup_state = None
         self.add_placed_item_obstacle = True
         self.place_singularity_fallback = False
         self.random_loading_target = None
@@ -68,8 +70,17 @@ class PlanningSceneObstacles(Node):
             Trigger, '/planning_scene_obstacles/detach_item',
             self.detach_item_callback)
         self.create_service(
+            Trigger, '/planning_scene_obstacles/detach_staged_item',
+            self.detach_staged_item_callback)
+        self.create_service(
             Trigger, '/planning_scene_obstacles/clear_placed_items',
             self.clear_placed_items_callback)
+        self.create_service(
+            Trigger, '/planning_scene_obstacles/clear_picked_item',
+            self.clear_picked_item_callback)
+        self.create_service(
+            SetInt16, '/planning_scene_obstacles/remove_placed_item',
+            self.remove_placed_item_callback)
         self.status_pub = self.create_publisher(
             String, '/planning_scene_obstacles/status', 10)
         self.create_timer(0.5, self.ensure_scene)
@@ -178,9 +189,15 @@ class PlanningSceneObstacles(Node):
             status = json.loads(message.data)
         except (json.JSONDecodeError, TypeError):
             return
-        if status.get('operation_kind') == 'place':
+        self.pickup_state = status.get('state')
+        if (status.get('operation_kind') == 'place' and
+                not status.get('staging_place_active', False)):
             self.place_singularity_fallback = bool(
                 status.get('place_fallback_used'))
+        elif status.get('staging_place_active', False):
+            # A staging release must be registered at its measured slot pose,
+            # never at a stale random-loading target on the pallet.
+            self.place_singularity_fallback = False
         # Attachment is a one-shot event belonging to a specific pickup
         # operation. A queued status from the preceding cycle must not re-arm
         # attachment after detachment and capture the next item's transform
@@ -464,6 +481,15 @@ class PlanningSceneObstacles(Node):
             response.message = 'apply_planning_scene is unavailable'
         return response
 
+    def detach_staged_item_callback(self, request, response):
+        """Detach a staged item while always retaining its collision object."""
+        configured = self.add_placed_item_obstacle
+        self.add_placed_item_obstacle = True
+        try:
+            return self.detach_item_callback(request, response)
+        finally:
+            self.add_placed_item_obstacle = configured
+
     def _detachment_succeeded(self, placed_id):
         self.attached_item_id = ''
         self.attached_item_size = None
@@ -512,6 +538,80 @@ class PlanningSceneObstacles(Node):
             f'clearing {count} placed-item obstacles'
             if accepted else 'apply_planning_scene is unavailable')
         return response
+
+    def clear_picked_item_callback(self, _request, response):
+        """Forget the attached planning-scene item without moving hardware."""
+        if self.apply_pending:
+            response.message = 'planning-scene update is busy; retry clear'
+            return response
+        if self.motion_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+            response.message = (
+                f'cannot clear picked item while MoveIt is in '
+                f'{self.motion_state}')
+            return response
+        if self.pickup_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+            response.message = (
+                f'cannot clear picked item while pickup supervisor is in '
+                f'{self.pickup_state}')
+            return response
+        if self.attachment_pending:
+            response.message = 'cannot clear while item attachment is pending'
+            return response
+        if not self.attached_item_id:
+            response.success = True
+            response.message = 'no picked item to clear'
+            return response
+        item_id = self.attached_item_id
+        attached = AttachedCollisionObject()
+        attached.link_name = 'link_tcp'
+        attached.object.id = item_id
+        attached.object.operation = CollisionObject.REMOVE
+        world_object = CollisionObject()
+        world_object.header.frame_id = self.base_frame
+        world_object.id = item_id
+        world_object.operation = CollisionObject.REMOVE
+        scene = PlanningScene()
+        scene.is_diff = scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects = [attached]
+        scene.world.collision_objects = [world_object]
+        accepted = self._apply_scene(
+            scene, f'clear picked item {item_id}',
+            lambda: self._detachment_succeeded(''))
+        response.success = accepted
+        response.message = (
+            f'clearing picked item {item_id} from planning scene; '
+            'gripper command unchanged'
+            if accepted else 'apply_planning_scene is unavailable')
+        return response
+
+    def remove_placed_item_callback(self, request, response):
+        """Remove one staged world object before its supervised pickup."""
+        object_id = f'placed_item_{int(request.data)}'
+        if self.apply_pending:
+            response.ret = 1
+            response.message = 'planning-scene update is busy'
+            return response
+        if object_id not in self.placed_item_ids:
+            response.ret = 2
+            response.message = f'placed collision object not found: {object_id}'
+            return response
+        obj = CollisionObject()
+        obj.header.frame_id = self.base_frame
+        obj.id = object_id
+        obj.operation = CollisionObject.REMOVE
+        accepted = self._apply(
+            [obj], f'remove staged collision object {object_id}',
+            lambda: self._one_placed_item_removed(object_id))
+        response.ret = 0 if accepted else 3
+        response.message = (
+            f'removal requested for {object_id}' if accepted
+            else 'apply_planning_scene is unavailable')
+        return response
+
+    def _one_placed_item_removed(self, object_id):
+        if object_id in self.placed_item_ids:
+            self.placed_item_ids.remove(object_id)
+        self.publish_status()
 
     def _placed_items_cleared(self):
         self.placed_item_ids = []

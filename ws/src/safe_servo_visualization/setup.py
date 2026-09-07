@@ -26,5 +26,6 @@ setup(
         'pick_place_pipeline = safe_servo_visualization.pick_place_pipeline_node:main',
         'random_stable_loading = safe_servo_visualization.random_stable_loading_node:main',
         'planning_scene_obstacles = safe_servo_visualization.planning_scene_obstacles_node:main',
+        'staging_slots = safe_servo_visualization.staging_slots_node:main',
     ]},
 )

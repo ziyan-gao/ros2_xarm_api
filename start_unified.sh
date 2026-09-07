@@ -30,6 +30,7 @@ set -u
 : "${RANDOM_LOADING_SAMPLE_FRACTION:=0.30}"
 : "${RANDOM_LOADING_COM_BOUND_RATIO:=0.20}"
 : "${TRANSFER_CORNER_HEIGHT_M:=0.47}"
+: "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M:=0.480}"
 : "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
 : "${RANDOM_LOADING_VISUALIZE:=true}"
 : "${RANDOM_LOADING_VISUAL_PORT:=8765}"
@@ -100,6 +101,9 @@ start_required "MoveIt motion coordinator" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}"
 start_required "MoveIt planning-scene obstacles" \
   ros2 run safe_servo_visualization planning_scene_obstacles
+start_required "six-slot unpacking staging coordinator" \
+  ros2 run safe_servo_visualization staging_slots --ros-args \
+    -p transfer_item_bottom_above_pallet_m:="${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M}"
 start_required "pickup pipeline orchestrator" \
   ros2 run safe_servo_visualization pickup_pipeline
 start_required "place pipeline orchestrator" \

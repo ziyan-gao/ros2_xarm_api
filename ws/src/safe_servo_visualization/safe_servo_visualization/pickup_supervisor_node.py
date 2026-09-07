@@ -108,6 +108,11 @@ class PickupSupervisor(Node):
         self.declare_parameter('workspace_z_min_mm', 50.0)
         self.declare_parameter('workspace_z_max_mm', 800.0)
         self.declare_parameter('place_workspace_z_min_mm', -100.0)
+        self.declare_parameter('staging_workspace_x_min_mm', -450.0)
+        self.declare_parameter('staging_workspace_x_max_mm', 450.0)
+        self.declare_parameter('staging_workspace_y_min_mm', 100.0)
+        self.declare_parameter('staging_workspace_y_max_mm', 750.0)
+        self.declare_parameter('staging_workspace_z_min_mm', -100.0)
         self.declare_parameter('pre_place_clearance_m', 0.03)
         self.declare_parameter('transfer_corner_height_m', 0.47)
         self.declare_parameter('joint6_name', 'joint6')
@@ -172,6 +177,14 @@ class PickupSupervisor(Node):
             float(p('workspace_z_min_mm')), float(p('workspace_z_max_mm')),
         )
         self.place_workspace_z_min_mm = float(p('place_workspace_z_min_mm'))
+        self.staging_bounds_mm = (
+            float(p('staging_workspace_x_min_mm')),
+            float(p('staging_workspace_x_max_mm')),
+            float(p('staging_workspace_y_min_mm')),
+            float(p('staging_workspace_y_max_mm')),
+            float(p('staging_workspace_z_min_mm')),
+            self.servo_bounds_mm[5],
+        )
         self.pre_place_clearance = float(p('pre_place_clearance_m'))
         self.transfer_corner_height = float(p('transfer_corner_height_m'))
         self.joint6_name = str(p('joint6_name'))
@@ -280,6 +293,9 @@ class PickupSupervisor(Node):
         self.direct_motion_generation = 0
         self.expected_enable_generation = None
         self.operation_kind = 'pickup'
+        self.staging_place_active = False
+        self.staging_place_config = None
+        self.staging_release_tcp_pose = None
         self.planning_scene_status = {}
         self.orchestrator_status = {}
         self.pallet_locked = False
@@ -304,6 +320,7 @@ class PickupSupervisor(Node):
         self.robot_error = None
         self.robot_state_time = None
         self.robot_tcp_xyz = None
+        self.robot_tcp_pose = None
         self._ft_settle_timer = None
         self._post_ft_state_timer = None
         self.pre_descent_wait_callback = None
@@ -349,6 +366,9 @@ class PickupSupervisor(Node):
             Float64MultiArray, '/motion_speed/config',
             self.motion_speed_config_callback, 10)
         self.create_subscription(
+            Float64MultiArray, '/staging_slots/place_config',
+            self.staging_place_config_callback, 10)
+        self.create_subscription(
             JointState, self.joint_state_topic, self.joint_state_callback, 10)
         self.create_subscription(
             RobotMsg, '/ufactory/robot_states', self.robot_state_callback, 10)
@@ -383,9 +403,16 @@ class PickupSupervisor(Node):
             '/controller_manager/set_hardware_component_state')
         self.detach_item_client = self.create_client(
             Trigger, '/planning_scene_obstacles/detach_item')
+        self.clear_picked_item_client = self.create_client(
+            Trigger, '/planning_scene_obstacles/clear_picked_item')
+        self.detach_staged_item_client = self.create_client(
+            Trigger, '/planning_scene_obstacles/detach_staged_item')
         self.create_service(Trigger, '/pickup_supervisor/start', self.start_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_place', self.start_place_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/start_staging_place',
+            self.start_staging_place_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_loading', self.start_loading_callback)
         self.create_service(
@@ -425,10 +452,32 @@ class PickupSupervisor(Node):
         self.robot_mode = int(message.mode)
         self.robot_error = int(message.err)
         self.robot_state_time = time.monotonic()
+        if len(message.pose) >= 6:
+            pose = tuple(float(value) for value in message.pose[:6])
+            if all(math.isfinite(value) for value in pose):
+                self.robot_tcp_pose = pose
         if len(message.pose) >= 3:
             xyz = tuple(float(value) / 1000.0 for value in message.pose[:3])
             if all(math.isfinite(value) for value in xyz):
                 self.robot_tcp_xyz = xyz
+
+    def staging_place_config_callback(self, message):
+        if len(message.data) < 3:
+            return
+        try:
+            slot = int(message.data[0])
+            contact_z = float(message.data[1])
+            transfer_z = float(message.data[2])
+        except (TypeError, ValueError):
+            return
+        if not all(math.isfinite(value) for value in (contact_z, transfer_z)):
+            return
+        self.staging_place_config = {
+            'slot': slot,
+            'contact_tcp_z_m': contact_z,
+            'transfer_tcp_z_m': transfer_z,
+            'received_at': time.monotonic(),
+        }
 
     def force_callback(self, message):
         force_z = float(message.wrench.force.z)
@@ -644,30 +693,37 @@ class PickupSupervisor(Node):
         self.manual_gripper_state = 'closed' if close else 'open'
         self.get_logger().info(f'gripper manually {self.manual_gripper_state}')
         if not close and self.planning_scene_status.get('attached_item_id'):
-            if self.detach_item_client.service_is_ready():
-                future = self.detach_item_client.call_async(Trigger.Request())
-                future.add_done_callback(self._manual_detach_completed)
+            # A manual release means the operator is removing/discarding the
+            # carried item.  Do not use the normal placement detach service:
+            # it creates a world collision object at the current TCP pose and
+            # can leave the next motion starting in collision with the
+            # gripper.  Supervised pallet/staging placement continues to use
+            # the placement detach services elsewhere in this node.
+            if self.clear_picked_item_client.service_is_ready():
+                future = self.clear_picked_item_client.call_async(
+                    Trigger.Request())
+                future.add_done_callback(self._manual_clear_picked_completed)
             else:
                 self.manual_gripper_state = (
                     'open; warning: attached planning-scene item remains')
                 self.get_logger().error(self.manual_gripper_state)
         self.publish_status()
 
-    def _manual_detach_completed(self, future):
+    def _manual_clear_picked_completed(self, future):
         try:
             result = future.result()
         except Exception as exc:
-            self.manual_gripper_state = f'open; scene detach failed: {exc}'
+            self.manual_gripper_state = f'open; scene clear failed: {exc}'
             self.get_logger().error(self.manual_gripper_state)
             self.publish_status()
             return
         if result is None or not result.success:
             message = 'no response' if result is None else result.message
             self.manual_gripper_state = (
-                f'open; scene detach rejected: {message}')
+                f'open; scene clear rejected: {message}')
             self.get_logger().error(self.manual_gripper_state)
         else:
-            self.manual_gripper_state = 'open; scene item detached'
+            self.manual_gripper_state = 'open; picked scene item cleared'
         self.publish_status()
 
     def _validate_pregrasp_ready(self):
@@ -686,9 +742,14 @@ class PickupSupervisor(Node):
         if plan_age < -0.05 or plan_age > self.max_pregrasp_plan_age:
             raise ValueError(f'pre-grasp snapshot is stale ({plan_age:.1f} s)')
         x, y, z = self._tcp_xyz()
-        if abs(x - float(snapshot['x_m'])) > self.xy_tolerance or abs(
-                y - float(snapshot['y_m'])) > self.xy_tolerance:
-            raise ValueError('TCP is not aligned over the selected box')
+        x_error = x - float(snapshot['x_m'])
+        y_error = y - float(snapshot['y_m'])
+        if abs(x_error) > self.xy_tolerance or abs(y_error) > self.xy_tolerance:
+            raise ValueError(
+                'TCP is not aligned over the selected box: '
+                f'error XY=({x_error * 1000.0:+.1f}, '
+                f'{y_error * 1000.0:+.1f}) mm, '
+                f'tolerance={self.xy_tolerance * 1000.0:.1f} mm')
         expected_z = float(snapshot['pregrasp_z_m'])
         z_error = z - expected_z
         if abs(z_error) > self.pregrasp_z_tolerance:
@@ -770,14 +831,16 @@ class PickupSupervisor(Node):
                  self.force_threshold)
         speed_scale = (self.place_servo_speed_scale if is_place else
                        self.servo_speed_scale)
-        z_min = (self.place_workspace_z_min_mm if is_place else
-                 self.servo_bounds_mm[4])
+        staging_place = getattr(self, 'staging_place_active', False)
+        bounds = (self.staging_bounds_mm if staging_place else
+                  self.servo_bounds_mm)
+        z_min = (self.staging_bounds_mm[4] if staging_place else
+                 self.place_workspace_z_min_mm if is_place else bounds[4])
         message = Float64MultiArray()
         message.data = [
             speed_scale,
-            self.servo_bounds_mm[0], self.servo_bounds_mm[1],
-            self.servo_bounds_mm[2], self.servo_bounds_mm[3],
-            z_min, self.servo_bounds_mm[5],
+            bounds[0], bounds[1], bounds[2], bounds[3],
+            z_min, bounds[5],
             force,
             1.0 if touch_mode else 0.0,
             1.0 if bypass_force else 0.0,
@@ -819,6 +882,8 @@ class PickupSupervisor(Node):
             return response
         self.operation_id += 1
         self.operation_kind = 'pickup'
+        self.staging_place_active = False
+        self.staging_release_tcp_pose = None
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
@@ -917,6 +982,8 @@ class PickupSupervisor(Node):
             return response
         self.operation_id += 1
         self.operation_kind = 'place'
+        self.staging_place_active = False
+        self.staging_release_tcp_pose = None
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
@@ -959,6 +1026,75 @@ class PickupSupervisor(Node):
         response.message = (
             f'place contact descent is arming from Z {z:.3f} m; '
             f'maximum descent={self.max_descent:.3f} m')
+        return response
+
+    def start_staging_place_callback(self, _request, response):
+        if self.manual_gripper_pending:
+            response.message = 'wait for the pending gripper command'
+            return response
+        if self.state in self.ACTIVE:
+            response.message = f'supervisor already active in {self.state}'
+            return response
+        if not self.planning_scene_status.get('attached_item_id'):
+            response.message = 'no carried item is attached in the planning scene'
+            return response
+        if not self.enable_client.service_is_ready():
+            response.message = 'safe-servo enable service is unavailable'
+            return response
+        config = self.staging_place_config
+        if (not isinstance(config, dict) or
+                time.monotonic() - float(config.get('received_at', 0.0)) > 2.0):
+            response.message = 'fresh staging placement configuration is unavailable'
+            return response
+        try:
+            _, _, z = self._tcp_xyz()
+            contact_z = float(config['contact_tcp_z_m'])
+            transfer_z = float(config['transfer_tcp_z_m'])
+        except (KeyError, TypeError, ValueError) as exc:
+            response.message = f'invalid staging placement configuration: {exc}'
+            return response
+        if transfer_z < z - self.tolerance:
+            response.message = 'staging transfer retreat height is below TCP'
+            return response
+        floor_z = max(
+            contact_z - self.contact_search_margin,
+            self.staging_bounds_mm[4] / 1000.0)
+        if z - floor_z < self.minimum_contact_descent:
+            response.message = (
+                f'staging pre-place Z {z:.3f} m leaves less than '
+                f'{self.minimum_contact_descent:.3f} m guarded descent')
+            return response
+        self.operation_id += 1
+        # Reuse the mature placement contact, singularity fallback, release,
+        # controller-handoff, and vertical-retreat state machine.  The flag
+        # selects staging-specific bounds and detachment behavior.
+        self.operation_kind = 'place'
+        self.staging_place_active = True
+        self.staging_release_tcp_pose = None
+        self.fault = ''
+        self.post_retreat_fault = ''
+        self.direct_target_pose = None
+        self.direct_target_z = transfer_z
+        self.place_fallback_used = False
+        self.place_fallback_reason = ''
+        self.direct_place_recovery_active = False
+        self.direct_place_stepping = False
+        self.direct_place_deadline = None
+        self.direct_place_force_baseline_z = None
+        self.direct_place_step_count = 0
+        self.direct_place_step_completed_at = None
+        self.loading_stop_started = None
+        self.loading_stop_action = ''
+        self.contact_detected = False
+        self.pregrasp_z = z
+        self.floor_z = floor_z
+        self.virtual_z = z
+        self.state = self.ARMING_DESCENT
+        self._reset_servo_then_begin_place(z, floor_z)
+        response.success = True
+        response.message = (
+            f'staging slot {int(config["slot"])} safe-servo descent is '
+            f'arming from Z {z:.3f} m toward contact Z {contact_z:.3f} m')
         return response
 
     def start_transfer_fallback_callback(self, _request, response):
@@ -2698,6 +2834,16 @@ class PickupSupervisor(Node):
         self._proceed_to_retreat()
 
     def _turn_vacuum_off(self):
+        if self.staging_place_active:
+            pose_is_fresh = (
+                self.robot_tcp_pose is not None and
+                self.robot_state_time is not None and
+                time.monotonic() - self.robot_state_time <= self.status_timeout)
+            if not pose_is_fresh:
+                self._retreat_after_vacuum_fault(
+                    'cannot release staged item without a fresh full TCP pose')
+                return
+            self.staging_release_tcp_pose = tuple(self.robot_tcp_pose)
         self.state = self.VACUUM_OFF
         if not self.vacuum_client.service_is_ready():
             self._retreat_after_vacuum_fault(
@@ -2726,13 +2872,16 @@ class PickupSupervisor(Node):
                 f'vacuum release command rejected: ret={code}')
             return
         self.vacuum_verified = False
-        if not self.detach_item_client.service_is_ready():
+        detach_client = (
+            self.detach_staged_item_client
+            if self.staging_place_active else self.detach_item_client)
+        if not detach_client.service_is_ready():
             self._retreat_after_vacuum_fault(
                 'item released but planning-scene detach service is unavailable')
             return
         self.state = self.DETACHING
         self.detach_started = time.monotonic()
-        future = self.detach_item_client.call_async(Trigger.Request())
+        future = detach_client.call_async(Trigger.Request())
         future.add_done_callback(self._detach_completed)
 
     def _detach_completed(self, future):
@@ -2907,6 +3056,8 @@ class PickupSupervisor(Node):
         self.loading_transfer_z = None
         self.expected_enable_generation = None
         self.operation_kind = 'pickup'
+        self.staging_place_active = False
+        self.staging_release_tcp_pose = None
         self.detach_started = None
         self.retreat_started = None
         self.retreat_target_z = None
@@ -2936,6 +3087,8 @@ class PickupSupervisor(Node):
         message.data = json.dumps({
             'state': self.state,
             'operation_kind': self.operation_kind,
+            'staging_place_active': self.staging_place_active,
+            'release_tcp_pose_mm_rad': self.staging_release_tcp_pose,
             'fault': self.fault,
             'dry_run': self.dry_run,
             'pregrasp_z_m': self.pregrasp_z,

@@ -318,6 +318,24 @@ def test_latched_place_fault_does_not_reject_next_safe_pregrasp():
     assert math.isclose(floor_z, 0.18)
 
 
+def test_tcp_validation_uses_link_tcp_servo_pose_when_fresh():
+    supervisor = object.__new__(PickupSupervisor)
+    now = time.monotonic()
+    supervisor.status_timeout = 1.0
+    supervisor.robot_tcp_xyz = (-0.2682, 0.2677, 0.1492)
+    supervisor.robot_state_time = now
+    supervisor.servo_status_time = now
+    supervisor.last_joint_state_time = now
+    supervisor.servo_status = {
+        'tcp_x_m': 0.10,
+        'tcp_y_m': 0.20,
+        'tcp_z_m': 0.30,
+        'joint_state_age_sec': 0.0,
+    }
+
+    assert supervisor._tcp_xyz() == (0.10, 0.20, 0.30)
+
+
 def test_linear_loading_contact_requires_consecutive_delta_fz_samples():
     supervisor = object.__new__(PickupSupervisor)
     supervisor.operation_kind = 'loading'

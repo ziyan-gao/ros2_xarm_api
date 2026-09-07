@@ -2,10 +2,12 @@
 
 #include <QDoubleSpinBox>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QFormLayout>
 #include <QLabel>
 #include <QPainter>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QGroupBox>
 #include <QMessageBox>
@@ -192,9 +194,14 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   auto * open_gripper = new VisibleTextButton("Open gripper", this);
   auto * close_gripper = new VisibleTextButton("Close gripper", this);
   auto * clear_obstacles = new VisibleTextButton("Clear placed obstacles", this);
+  auto * clear_picked_item = new VisibleTextButton("Clear picked item", this);
+  clear_picked_item->setToolTip(
+    "Remove only the attached item from the MoveIt planning scene; "
+    "do not command or open the physical gripper");
   manual_layout->addWidget(open_gripper);
   manual_layout->addWidget(close_gripper);
   manual_layout->addWidget(clear_obstacles);
+  manual_layout->addWidget(clear_picked_item);
   manual_operations_label_ = new QLabel("Manual controls: ready", this);
   manual_operations_label_->setWordWrap(true);
   manual_layout->addWidget(manual_operations_label_);
@@ -205,6 +212,58 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
     this, &SafeServoPanel::closeGripper);
   connect(clear_obstacles, &QPushButton::clicked,
     this, &SafeServoPanel::clearPlacedObstacles);
+  connect(clear_picked_item, &QPushButton::clicked,
+    this, &SafeServoPanel::clearPickedItem);
+
+  auto * staging_group = new QGroupBox("Unpacking staging slots", this);
+  auto * staging_layout = new QVBoxLayout(staging_group);
+  auto * staging_form = new QFormLayout();
+  staging_form->setRowWrapPolicy(QFormLayout::WrapAllRows);
+  staging_store_slot_ = new QComboBox(this);
+  staging_retrieve_slot_ = new QComboBox(this);
+  const QStringList staging_corners = {
+    "0: (-375, 180, 0) mm", "1: (-125, 180, 0) mm",
+    "2: (125, 180, 0) mm", "3: (-375, 430, 0) mm",
+    "4: (-125, 430, 0) mm", "5: (125, 430, 0) mm"};
+  staging_store_slot_->addItems(staging_corners);
+  staging_retrieve_slot_->addItems(staging_corners);
+  staging_form->addRow("Store carried item in", staging_store_slot_);
+  staging_form->addRow("Retrieve item from", staging_retrieve_slot_);
+  staging_layout->addLayout(staging_form);
+  auto * store_staging = new VisibleTextButton("Store carried item", this);
+  auto * retrieve_staging = new VisibleTextButton("Retrieve staged item", this);
+  auto * reset_staging = new VisibleTextButton("Reset staging fault", this);
+  store_staging->setToolTip(
+    "Requires an attached carried item; aligns its FLB to the selected slot and yaw to 0 deg");
+  retrieve_staging->setToolTip(
+    "Uses the recorded release TCP pose; no item redetection is performed");
+  staging_layout->addWidget(store_staging);
+  staging_layout->addWidget(retrieve_staging);
+  staging_layout->addWidget(reset_staging);
+  staging_state_label_ = new QLabel("Staging slots: unavailable", this);
+  staging_state_label_->setWordWrap(true);
+  staging_layout->addWidget(staging_state_label_);
+  layout->addWidget(staging_group);
+  connect(store_staging, &QPushButton::clicked,
+    this, &SafeServoPanel::storeInStagingSlot);
+  connect(retrieve_staging, &QPushButton::clicked,
+    this, &SafeServoPanel::retrieveFromStagingSlot);
+  connect(reset_staging, &QPushButton::clicked,
+    this, &SafeServoPanel::resetStagingSlots);
+  connect(staging_store_slot_, qOverload<int>(&QComboBox::currentIndexChanged),
+    this, [this](int index) {
+      if (!staging_store_selection_pub_) {return;}
+      std_msgs::msg::Int32 message;
+      message.data = index;
+      staging_store_selection_pub_->publish(message);
+    });
+  connect(staging_retrieve_slot_, qOverload<int>(&QComboBox::currentIndexChanged),
+    this, [this](int index) {
+      if (!staging_retrieve_selection_pub_) {return;}
+      std_msgs::msg::Int32 message;
+      message.data = index;
+      staging_retrieve_selection_pub_->publish(message);
+    });
 
   auto * motion_group = new QGroupBox("MoveIt motion", this);
   auto * motion_layout = new QVBoxLayout(motion_group);
@@ -308,6 +367,10 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   auto * start_pickup = new VisibleTextButton("Start PickAndPlace", this);
   auto * abort_pickup = new VisibleTextButton("Abort", this);
   auto * reset_pickup = new VisibleTextButton("Reset", this);
+  pick_only_ = new QCheckBox("Pick only (skip placement)", this);
+  pick_only_->setToolTip(
+    "Run pickup and retreat only; leave the item attached to the TCP");
+  pickup_layout->addWidget(pick_only_);
   pickup_buttons->addWidget(start_pickup);
   pickup_buttons->addWidget(abort_pickup);
   pickup_buttons->addWidget(reset_pickup);
@@ -472,6 +535,8 @@ void SafeServoPanel::onInitialize()
     });
   clear_placed_obstacles_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/planning_scene_obstacles/clear_placed_items");
+  clear_picked_item_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/planning_scene_obstacles/clear_picked_item");
   set_gripper_client_ = node_->create_client<std_srvs::srv::SetBool>(
     "/pickup_supervisor/set_gripper");
   save_observation_client_ = node_->create_client<std_srvs::srv::Trigger>(
@@ -493,6 +558,8 @@ void SafeServoPanel::onInitialize()
     });
   start_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/pick_place_pipeline/start");
+  start_pick_only_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/pick_place_pipeline/start_pick_only");
   abort_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/pick_place_pipeline/abort");
   reset_pickup_client_ = node_->create_client<std_srvs::srv::Trigger>(
@@ -565,6 +632,46 @@ void SafeServoPanel::onInitialize()
     "/place_pipeline/status", 10,
     [this](const std_msgs::msg::String::SharedPtr msg) {
       place_state_label_->setText(QString::fromStdString(msg->data));
+    });
+  staging_store_selection_pub_ = node_->create_publisher<std_msgs::msg::Int32>(
+    "/staging_slots/select_store", 10);
+  staging_retrieve_selection_pub_ = node_->create_publisher<std_msgs::msg::Int32>(
+    "/staging_slots/select_retrieve", 10);
+  staging_store_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/staging_slots/store");
+  staging_retrieve_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/staging_slots/retrieve");
+  staging_reset_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/staging_slots/reset");
+  staging_status_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/staging_slots/status", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      const auto json = QJsonDocument::fromJson(
+        QByteArray::fromStdString(msg->data)).object();
+      QString text = QString("Staging slots: %1")
+        .arg(json.value("state").toString("UNKNOWN"));
+      const auto slot_array = json.value("slots").toArray();
+      QStringList occupied;
+      for (const auto & value : slot_array) {
+        const auto slot = value.toObject();
+        const int index = slot.value("slot").toInt();
+        const bool is_occupied = slot.value("occupied").toBool();
+        const QString base = staging_store_slot_->itemText(index)
+          .section(" [", 0, 0);
+        const QString suffix = is_occupied
+          ? QString(" [occupied: %1]").arg(slot.value("item_id").toString())
+          : QString(" [empty]");
+        staging_store_slot_->setItemText(index, base + suffix);
+        staging_retrieve_slot_->setItemText(index, base + suffix);
+        if (is_occupied) {occupied << QString::number(index);}
+      }
+      text += QString("\nOccupied: %1").arg(
+        occupied.isEmpty() ? "none" : occupied.join(", "));
+      const auto fault = json.value("fault").toString();
+      const auto result = json.value("last_result").toString();
+      if (!fault.isEmpty()) {text += "\n" + fault;}
+      else if (!result.isEmpty()) {text += "\n" + result;}
+      staging_state_label_->setText(text);
     });
 }
 
@@ -694,6 +801,19 @@ void SafeServoPanel::clearPlacedObstacles()
   });
 }
 
+void SafeServoPanel::clearPickedItem()
+{
+  if (!clear_picked_item_client_->service_is_ready()) {
+    manual_operations_label_->setText("Picked-item clear service unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  clear_picked_item_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+    manual_operations_label_->setText(QString::fromStdString(future.get()->message));
+  });
+}
+
 void SafeServoPanel::openGripper()
 {
   setGripper(false);
@@ -815,16 +935,18 @@ void SafeServoPanel::resetMotionCoordinator()
 
 void SafeServoPanel::startPickup()
 {
-  if (!start_pickup_client_->service_is_ready()) {
+  const auto client = pick_only_->isChecked()
+    ? start_pick_only_client_ : start_pickup_client_;
+  if (!client || !client->service_is_ready()) {
     pickup_state_label_->setText("Pickup pipeline unavailable");
     return;
   }
   publishConfig();
   publishMotionSpeed();
   applyPalletConfig();
-  QTimer::singleShot(100, this, [this]() {
+  QTimer::singleShot(100, this, [this, client]() {
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-    start_pickup_client_->async_send_request(request, [this](
+    client->async_send_request(request, [this](
       rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
       pickup_state_label_->setText(QString::fromStdString(future.get()->message));
     });
@@ -978,6 +1100,59 @@ void SafeServoPanel::resetRandomLoading()
     rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
     random_loading_state_label_->setText(
       QString::fromStdString(future.get()->message));
+  });
+}
+
+void SafeServoPanel::storeInStagingSlot()
+{
+  if (!staging_store_client_ || !staging_store_client_->service_is_ready()) {
+    staging_state_label_->setText("Staging store service unavailable");
+    return;
+  }
+  std_msgs::msg::Int32 selection;
+  selection.data = staging_store_slot_->currentIndex();
+  staging_store_selection_pub_->publish(selection);
+  publishConfig();
+  publishMotionSpeed();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    staging_store_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      staging_state_label_->setText(QString::fromStdString(future.get()->message));
+    });
+  });
+}
+
+void SafeServoPanel::retrieveFromStagingSlot()
+{
+  if (!staging_retrieve_client_ || !staging_retrieve_client_->service_is_ready()) {
+    staging_state_label_->setText("Staging retrieval service unavailable");
+    return;
+  }
+  std_msgs::msg::Int32 selection;
+  selection.data = staging_retrieve_slot_->currentIndex();
+  staging_retrieve_selection_pub_->publish(selection);
+  publishConfig();
+  publishMotionSpeed();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    staging_retrieve_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      staging_state_label_->setText(QString::fromStdString(future.get()->message));
+    });
+  });
+}
+
+void SafeServoPanel::resetStagingSlots()
+{
+  if (!staging_reset_client_ || !staging_reset_client_->service_is_ready()) {
+    staging_state_label_->setText("Staging reset service unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  staging_reset_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+    staging_state_label_->setText(QString::fromStdString(future.get()->message));
   });
 }
 

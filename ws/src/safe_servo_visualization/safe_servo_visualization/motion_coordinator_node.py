@@ -81,6 +81,7 @@ class MotionCoordinator(Node):
         self.keep_eef_perpendicular = True
         self.place_target_xyz = None
         self.planned_pregrasp = None
+        self.staging_retrieve_target = None
         self.last_joint_state_time = None
         self._restore_pregrasp_snapshot()
 
@@ -116,6 +117,9 @@ class MotionCoordinator(Node):
             self.planning_scene_status_callback, 10)
         self.create_subscription(
             JointState, self.joint_state_topic, self.joint_state_callback, 10)
+        self.create_subscription(
+            Float64MultiArray, '/staging_slots/retrieve_target',
+            self.staging_retrieve_target_callback, 10)
 
         self.create_service(
             Trigger, '/motion_coordinator/plan_observation',
@@ -134,6 +138,9 @@ class MotionCoordinator(Node):
         self.create_service(
             Trigger, '/motion_coordinator/plan_pregrasp',
             self.plan_pregrasp_callback)
+        self.create_service(
+            Trigger, '/motion_coordinator/plan_staging_pregrasp',
+            self.plan_staging_pregrasp_callback)
         self.create_service(
             Trigger, '/motion_coordinator/execute', self.execute_callback)
         self.create_service(
@@ -662,6 +669,74 @@ class MotionCoordinator(Node):
             'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
         }
         return self._start_pose_plan(pose, box.id, response)
+
+    def staging_retrieve_target_callback(self, message):
+        # [slot, contact-reference TCP xyz_m, release TCP rpy_rad,
+        #  unrotated_item_size_xyz_m, clearance_m]
+        if len(message.data) < 11:
+            self.get_logger().warning('ignored incomplete staging retrieve target')
+            return
+        values = tuple(map(float, message.data[:11]))
+        if not all(math.isfinite(value) for value in values):
+            self.get_logger().warning('ignored non-finite staging retrieve target')
+            return
+        slot = int(round(values[0]))
+        size = values[7:10]
+        clearance = values[10]
+        if not 0 <= slot < 6 or any(value <= 0.0 for value in size):
+            self.get_logger().warning('ignored invalid staging slot or item size')
+            return
+        if not 0.005 <= clearance <= 0.100:
+            self.get_logger().warning('ignored invalid staging pre-pick clearance')
+            return
+        self.staging_retrieve_target = {
+            'slot': slot,
+            'contact_tcp_pose': values[1:7],
+            'size': size,
+            'clearance': clearance,
+            'received_at': time.monotonic(),
+        }
+
+    def plan_staging_pregrasp_callback(self, _request, response):
+        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
+            return response
+        if not self._require_fresh_joint_state(response, 'plan staging pre-pick'):
+            return response
+        if not self.pose_plan_client.service_is_ready():
+            response.message = 'xArm pose planning service is unavailable'
+            return response
+        target = self.staging_retrieve_target
+        if target is None or time.monotonic() - target['received_at'] > 2.0:
+            response.message = 'fresh staging retrieve target is unavailable'
+            return response
+        slot = target['slot']
+        x, y, contact_z, roll, pitch, yaw = target['contact_tcp_pose']
+        size_x, size_y, size_z = target['size']
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = contact_z + target['clearance']
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = self._quaternion_from_rpy(
+            roll, pitch, yaw)
+        box_id = 1000 + slot
+        self.planned_pregrasp = {
+            'box_id': box_id,
+            'x_m': x,
+            'y_m': y,
+            'center_z_m': contact_z - size_z / 2.0,
+            'size_x_m': size_x,
+            'size_y_m': size_y,
+            'size_z_m': size_z,
+            'top_z_m': contact_z,
+            'pregrasp_z_m': pose.position.z,
+            # Staged items are always aligned to robot-base/grid yaw zero.
+            'yaw_rad': 0.0,
+            'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
+            'staging_slot': slot,
+        }
+        return self._start_pose_plan(pose, box_id, response)
 
     def _load_waypoint(self, name):
         try:

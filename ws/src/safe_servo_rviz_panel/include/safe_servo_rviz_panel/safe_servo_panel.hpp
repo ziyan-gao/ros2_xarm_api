@@ -5,6 +5,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/panel.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -16,6 +17,7 @@ class QSpinBox;
 class QPushButton;
 class QTimer;
 class QCheckBox;
+class QComboBox;
 
 namespace safe_servo_rviz_panel
 {
@@ -36,6 +38,7 @@ private Q_SLOTS:
   void lockPallet();
   void clearPallet();
   void clearPlacedObstacles();
+  void clearPickedItem();
   void openGripper();
   void closeGripper();
   void setObservationPose();
@@ -54,6 +57,9 @@ private Q_SLOTS:
   void abortRandomLoading();
   void resetRandomLoading();
   void setContinuousRandomLoading(bool enabled);
+  void storeInStagingSlot();
+  void retrieveFromStagingSlot();
+  void resetStagingSlots();
 private:
   void setGripper(bool close);
   QDoubleSpinBox * force_threshold_;
@@ -74,6 +80,7 @@ private:
   QLabel * manual_operations_label_;
   QLabel * motion_state_label_;
   QLabel * pickup_state_label_;
+  QCheckBox * pick_only_;
   QLabel * place_state_label_;
   QLabel * random_loading_state_label_;
   QSlider * com_bound_ratio_;
@@ -81,6 +88,9 @@ private:
   QCheckBox * continuous_random_loading_;
   QCheckBox * random_add_placed_item_obstacle_;
   QLabel * placed_obstacles_label_;
+  QComboBox * staging_store_slot_;
+  QComboBox * staging_retrieve_slot_;
+  QLabel * staging_state_label_;
   rclcpp::Node::SharedPtr node_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr config_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr motion_speed_config_pub_;
@@ -94,6 +104,7 @@ private:
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr pallet_use_config_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr pallet_clear_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr clear_placed_obstacles_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr clear_picked_item_client_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr set_gripper_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr save_observation_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr plan_observation_client_;
@@ -103,6 +114,7 @@ private:
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr reset_motion_client_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr motion_status_sub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_pickup_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_pick_only_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr abort_pickup_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr reset_pickup_client_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr pickup_status_sub_;
@@ -117,5 +129,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr random_loading_config_pub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr random_loading_status_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr planning_scene_status_sub_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr staging_store_selection_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr staging_retrieve_selection_pub_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr staging_store_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr staging_retrieve_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr staging_reset_client_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr staging_status_sub_;
 };
 }

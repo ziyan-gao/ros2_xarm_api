@@ -186,3 +186,11 @@ def test_place_servo_uses_its_lower_z_bound_without_changing_pickup_bound():
     supervisor.operation_kind = 'pickup'
     supervisor._publish_servo_config(touch_mode=True)
     assert supervisor.config_pub.messages[-1].data[5] == 50.0
+
+    supervisor.operation_kind = 'place'
+    supervisor.staging_place_active = True
+    supervisor.staging_bounds_mm = (
+        -450.0, 450.0, 100.0, 750.0, -100.0, 800.0)
+    supervisor._publish_servo_config(touch_mode=True)
+    assert supervisor.config_pub.messages[-1].data[1:7] == pytest.approx(
+        [-450.0, 450.0, 100.0, 750.0, -100.0, 800.0])

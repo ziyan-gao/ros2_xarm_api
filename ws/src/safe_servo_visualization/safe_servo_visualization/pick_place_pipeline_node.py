@@ -15,6 +15,7 @@ class PickPlacePipeline(Node):
         self.declare_parameter('cycle_timeout_sec', 300.0)
         self.timeout = float(self.get_parameter('cycle_timeout_sec').value)
         self.state, self.fault, self.operation_id = 'IDLE', '', 0
+        self.pick_only = False
         self.started = None
         self.pickup_status, self.place_status = {}, {}
         self.expected_pickup_id = self.expected_place_id = None
@@ -30,6 +31,9 @@ class PickPlacePipeline(Node):
         self.abort_place = self.create_client(Trigger, '/place_pipeline/abort')
         self.reset_place = self.create_client(Trigger, '/place_pipeline/reset')
         self.create_service(Trigger, '/pick_place_pipeline/start', self.start)
+        self.create_service(
+            Trigger, '/pick_place_pipeline/start_pick_only',
+            self.start_pick_only)
         self.create_service(Trigger, '/pick_place_pipeline/abort', self.abort)
         self.create_service(Trigger, '/pick_place_pipeline/reset', self.reset)
         self.create_timer(0.1, self.tick)
@@ -46,6 +50,12 @@ class PickPlacePipeline(Node):
             self.place_status = value
 
     def start(self, _request, response):
+        return self._start(response, pick_only=False)
+
+    def start_pick_only(self, _request, response):
+        return self._start(response, pick_only=True)
+
+    def _start(self, response, pick_only):
         if self.state in self.ACTIVE:
             response.message = f'PickAndPlace already active in {self.state}'
             return response
@@ -53,13 +63,17 @@ class PickPlacePipeline(Node):
             response.message = 'pickup pipeline is unavailable'
             return response
         self.operation_id += 1
+        self.pick_only = bool(pick_only)
         self.state, self.fault = 'PICKING', ''
         self.started = time.monotonic()
         self.expected_pickup_id = int(self.pickup_status.get('operation_id', 0)) + 1
         self.expected_place_id = None
         future = self.start_pickup.call_async(Trigger.Request())
         future.add_done_callback(lambda done: self._start_done(done, 'pickup'))
-        response.success, response.message = True, 'PickAndPlace started'
+        response.success = True
+        response.message = (
+            'Pick-only cycle started' if self.pick_only else
+            'PickAndPlace started')
         return response
 
     def _start_done(self, future, label):
@@ -85,6 +99,9 @@ class PickPlacePipeline(Node):
         if status.get('state') == 'FAULT':
             self._fault(status.get('fault', f'{self.state.lower()} failed'))
         elif status.get('state') == 'SUCCEEDED' and self.state == 'PICKING':
+            if self.pick_only:
+                self.state = 'SUCCEEDED'
+                return
             if not self.start_place.service_is_ready():
                 self._fault('place pipeline is unavailable')
                 return
@@ -115,6 +132,7 @@ class PickPlacePipeline(Node):
             if client.service_is_ready():
                 client.call_async(Trigger.Request())
         self.state, self.fault = 'IDLE', ''
+        self.pick_only = False
         self.expected_pickup_id = self.expected_place_id = None
         response.success, response.message = True, 'PickAndPlace reset to IDLE'
         return response
@@ -128,6 +146,7 @@ class PickPlacePipeline(Node):
         message.data = json.dumps({
             'state': self.state, 'fault': self.fault,
             'operation_id': self.operation_id,
+            'pick_only': self.pick_only,
             'pickup_state': self.pickup_status.get('state'),
             'place_state': self.place_status.get('state'),
         }, separators=(',', ':'))
