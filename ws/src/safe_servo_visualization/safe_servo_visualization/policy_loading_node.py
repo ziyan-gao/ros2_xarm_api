@@ -81,6 +81,8 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.declare_parameter(
             'k_placement', int(config.get('k_placement', 80)))
         self.declare_parameter(
+            'height_tolerance', float(config.get('height_tolerance', 0.0)))
+        self.declare_parameter(
             'remove_inscribed_ems',
             bool(config.get('remove_inscribed_ems', False)))
         self.declare_parameter(
@@ -98,6 +100,8 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             device=str(self.get_parameter('policy_device').value),
             container_size=container_size,
             clearance_mm=int(self.get_parameter('clearance_mm').value),
+            height_tolerance=float(
+                self.get_parameter('height_tolerance').value),
             seed=int(self.get_parameter('seed').value),
             k_placement=int(self.get_parameter('k_placement').value),
             remove_inscribed_ems=bool(
@@ -113,9 +117,11 @@ class PolicyLoadingNode(RandomStableLoadingNode):
     def _log_ready(self, container_size):
         self.get_logger().info(
             'policy loading ready (MCTS/A*=disabled): container=%s mm, '
-            'clearance=%d mm, checkpoint=%s, device=%s' % (
+            'clearance=%d mm, height_tolerance=%.1f mm, checkpoint=%s, '
+            'device=%s' % (
                 container_size,
                 self.loader.clearance_mm,
+                self.loader.height_tolerance,
                 self.loader.checkpoint_path,
                 getattr(self.loader.agent, 'device', self.loader.device),
             ))
