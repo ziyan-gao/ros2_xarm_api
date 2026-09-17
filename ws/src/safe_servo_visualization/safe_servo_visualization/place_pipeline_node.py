@@ -51,6 +51,8 @@ class PlacePipeline(Node):
             String, '/pallet_localization/status', self._pallet_status, 10)
         self.plan_transfer = self.create_client(
             Trigger, '/motion_coordinator/plan_transfer')
+        self.prepare_transfer = self.create_client(
+            Trigger, '/motion_coordinator/prepare_transfer')
         self.plan_observation = self.create_client(
             Trigger, '/motion_coordinator/plan_observation')
         self.execute_motion = self.create_client(
@@ -61,8 +63,8 @@ class PlacePipeline(Node):
             Trigger, '/pickup_supervisor/start_place')
         self.start_loading = self.create_client(
             Trigger, '/pickup_supervisor/start_loading')
-        self.start_transfer_fallback = self.create_client(
-            Trigger, '/pickup_supervisor/start_transfer_fallback')
+        self.start_joint_transfer = self.create_client(
+            Trigger, '/pickup_supervisor/start_joint_transfer')
         self.accept_direct_transfer = self.create_client(
             Trigger, '/motion_coordinator/accept_direct_transfer')
         self.abort_supervisor = self.create_client(
@@ -101,24 +103,26 @@ class PlacePipeline(Node):
                 response, 'no carried item is attached; complete pickup first')
         if self.pallet_status != 'LOCKED':
             return self._reject_start(response, 'pallet pose is not LOCKED')
-        if not self.plan_transfer.service_is_ready():
+        if not self.prepare_transfer.service_is_ready():
             return self._reject_start(
-                response, 'transfer planning service is unavailable')
+                response, 'transfer target preparation service is unavailable')
         self.operation_id += 1
         self.fault = ''
         self.transfer_fallback_used = False
         self.transfer_fallback_reason = ''
         self.state = self.MOVE_TRANSFER
-        self.pending_motion = 'transfer'
+        self.pending_motion = 'transfer_preparing'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.expected_supervisor_operation_id = None
         self.phase_started = time.monotonic()
-        future = self.plan_transfer.call_async(Trigger.Request())
+        future = self.prepare_transfer.call_async(Trigger.Request())
         future.add_done_callback(
-            lambda done: self._plan_completed(done, 'transfer'))
+            lambda done: self._plan_completed(done, 'transfer preparation'))
         response.success = True
-        response.message = 'place pipeline started: planning nominal transfer'
+        response.message = (
+            'place pipeline started: preparing deterministic MoveIt/KDL '
+            'joint transfer')
         self.publish_status()
         return response
 
@@ -171,19 +175,8 @@ class PlacePipeline(Node):
             self.expected_motion_operation_id)
         if motion_fault_matches and self.state != self.CONTACT_PLACE:
             reason = self.motion_status.get('fault', 'MoveIt motion failed')
-            if (self.state == self.MOVE_TRANSFER and
-                    self.pending_motion == 'transfer'):
-                self._begin_transfer_fallback(reason)
-                return
-            if not (self.state == self.MOVE_TRANSFER and
-                    self.pending_motion in (
-                        'transfer_fallback_starting',
-                        'transfer_fallback_executing',
-                        'transfer_fallback_accepting')) and not (
-                            self.transfer_fallback_used and
-                            self.state == self.LOAD_PRE_PLACE):
-                self._fault(reason)
-                return
+            self._fault(reason)
+            return
         if self.state == self.MOVE_TRANSFER:
             self._tick_transfer()
         elif self.state == self.LOAD_PRE_PLACE:
@@ -195,8 +188,7 @@ class PlacePipeline(Node):
 
     def _tick_transfer(self):
         if self.pending_motion in (
-                'transfer_fallback_starting',
-                'transfer_fallback_executing'):
+                'direct_joint_starting', 'direct_joint_executing'):
             if self.supervisor_status.get('operation_kind') != 'transfer':
                 return
             if (self.expected_supervisor_operation_id is None or
@@ -205,14 +197,17 @@ class PlacePipeline(Node):
                 return
             state = self.supervisor_status.get('state')
             if state == 'FAULT':
-                self._fault(self.supervisor_status.get(
-                    'fault', 'direct transfer fallback failed'))
+                reason = self.supervisor_status.get(
+                    'fault', 'MoveIt/KDL joint transfer failed')
+                if self.supervisor_status.get(
+                        'direct_transfer_motion_started', False):
+                    self._fault(
+                        f'{reason}; direct motion had already started, so '
+                        'automatic MoveIt fallback is unsafe')
+                else:
+                    self._begin_moveit_transfer_fallback(reason)
             elif (state == 'SUCCEEDED' and
                   self.supervisor_status.get('direct_transfer_succeeded')):
-                self.transfer_fallback_used = True
-                self.get_logger().warning(
-                    'direct xArm transfer fallback reached the transfer pose; '
-                    'normalizing the MoveIt coordinator state')
                 self._accept_direct_transfer()
             return
         operation_matches = (
@@ -222,56 +217,81 @@ class PlacePipeline(Node):
         if not operation_matches or self.motion_status.get('target') != 'transfer':
             return
         state = self.motion_status.get('state')
-        if state == 'PLANNED' and self.pending_motion == 'transfer':
+        if state == 'PREPARED' and self.pending_motion == 'transfer_preparing':
+            self._begin_direct_joint_transfer()
+        elif state == 'PLANNED' and self.pending_motion == 'transfer':
             self.pending_motion = 'transfer_executing'
             self._execute()
         elif state == 'SUCCEEDED' and self.pending_motion == 'transfer_executing':
             self.pending_motion = None
             self._begin_loading_motion()
 
-    def _begin_transfer_fallback(self, reason):
-        if not self.start_transfer_fallback.service_is_ready():
-            self._fault(
-                f'{reason}; direct transfer fallback service is unavailable')
+    def _begin_direct_joint_transfer(self):
+        if not self.start_joint_transfer.service_is_ready():
+            self._begin_moveit_transfer_fallback(
+                'deterministic joint-transfer service is unavailable')
             return
-        self.transfer_fallback_reason = str(reason)
-        self.pending_motion = 'transfer_fallback_starting'
+        self.pending_motion = 'direct_joint_starting'
         self.expected_supervisor_operation_id = int(
             self.supervisor_status.get('operation_id', 0)) + 1
         self.phase_started = time.monotonic()
-        self.get_logger().warning(
-            f'MoveIt transfer planning failed: {reason}; requesting direct '
-            'xArm service fallback without MoveIt collision checking')
-        future = self.start_transfer_fallback.call_async(Trigger.Request())
-        future.add_done_callback(self._start_transfer_fallback_completed)
-        self.publish_status()
+        future = self.start_joint_transfer.call_async(Trigger.Request())
+        future.add_done_callback(self._start_direct_joint_transfer_completed)
 
-    def _start_transfer_fallback_completed(self, future):
-        if self.pending_motion != 'transfer_fallback_starting':
+    def _start_direct_joint_transfer_completed(self, future):
+        if self.pending_motion != 'direct_joint_starting':
             return
+        elapsed = time.monotonic() - self.phase_started
         try:
             result = future.result()
         except Exception as exc:
-            self._fault(f'direct transfer fallback start failed: {exc}')
+            self._begin_moveit_transfer_fallback(
+                f'MoveIt/KDL transfer start failed after {elapsed:.3f} s: '
+                f'{exc}')
             return
         if result is None or not result.success:
             message = 'no response' if result is None else result.message
-            self._fault(f'direct transfer fallback rejected: {message}')
+            self._begin_moveit_transfer_fallback(
+                f'MoveIt/KDL transfer rejected after {elapsed:.3f} s: '
+                f'{message}')
             return
-        self.pending_motion = 'transfer_fallback_executing'
+        self.pending_motion = 'direct_joint_executing'
+        self.get_logger().info(
+            f'MoveIt/KDL transfer request accepted in {elapsed:.3f} s')
+
+    def _begin_moveit_transfer_fallback(self, reason):
+        if not self.plan_transfer.service_is_ready():
+            self._fault(f'{reason}; MoveIt transfer service is unavailable')
+            return
+        direct_elapsed = (
+            None if self.phase_started is None else
+            time.monotonic() - self.phase_started)
+        self.transfer_fallback_used = True
+        self.transfer_fallback_reason = str(reason)
+        self.pending_motion = 'transfer'
+        self.expected_motion_operation_id = int(
+            self.motion_status.get('operation_id', 0)) + 1
+        self.phase_started = time.monotonic()
+        self.get_logger().warning(
+            f'{reason}; direct transfer phase elapsed '
+            f'{direct_elapsed or 0.0:.3f} s; falling back to '
+            'collision-aware MoveIt planning')
+        future = self.plan_transfer.call_async(Trigger.Request())
+        future.add_done_callback(
+            lambda done: self._plan_completed(done, 'MoveIt transfer fallback'))
 
     def _accept_direct_transfer(self):
         if not self.accept_direct_transfer.service_is_ready():
             self._fault(
-                'direct transfer reached its target, but the motion '
-                'coordinator acknowledgement service is unavailable')
+                'direct transfer reached its target, but coordinator '
+                'acknowledgement is unavailable')
             return
-        self.pending_motion = 'transfer_fallback_accepting'
+        self.pending_motion = 'direct_joint_accepting'
         future = self.accept_direct_transfer.call_async(Trigger.Request())
         future.add_done_callback(self._accept_direct_transfer_completed)
 
     def _accept_direct_transfer_completed(self, future):
-        if self.pending_motion != 'transfer_fallback_accepting':
+        if self.pending_motion != 'direct_joint_accepting':
             return
         try:
             result = future.result()
@@ -283,9 +303,6 @@ class PlacePipeline(Node):
             self._fault(f'direct transfer acknowledgement rejected: {message}')
             return
         self.pending_motion = None
-        self.get_logger().warning(
-            'direct transfer accepted by the motion coordinator; continuing '
-            'with linear loading')
         self._begin_loading_motion()
 
     def _begin_loading_motion(self):

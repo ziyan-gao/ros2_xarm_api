@@ -16,33 +16,31 @@ from packing.threejs_visualization import ThreeLiveServer, ThreeVisualizationBui
 from packing_env.visualization.config import DEFAULT_VISUAL_CONFIG
 
 
+def round_up_to_increment(value, increment):
+    """Return a positive millimetre value rounded upward to a grid increment."""
+    value = float(value)
+    increment = int(increment)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError('dimension must be finite and positive')
+    if increment <= 0:
+        raise ValueError('rounding increment must be positive')
+    return float(int(math.ceil(value / increment)) * increment)
+
+
 class RandomStableLoadingNode(Node):
     """Bridge real item dimensions to stable pallet-frame loading targets."""
 
     ACTIVE_PIPELINE_STATES = {'PICKING', 'PLACING', 'ABORTING'}
+    NODE_NAME = 'random_stable_loading'
+    API_PREFIX = '/random_stable_loading'
+    DEFAULT_VISUALIZATION_PORT = 8765
+    DEFAULT_CLEARANCE_MM = 10
+    DEFAULT_SEED = 101
+    VISUALIZATION_DIRECTORY = '/tmp/random_stable_loading_visualization'
+    LOADING_LABEL = 'stable random loading'
 
-    def __init__(self):
-        super().__init__('random_stable_loading')
-        self.declare_parameter('container_size_mm', [450, 550, 450])
-        self.declare_parameter('clearance_mm', 10)
-        self.declare_parameter('seed', 101)
-        self.declare_parameter('scan_downscale', 2)
-        self.declare_parameter('candidate_sample_fraction', 0.3)
-        self.declare_parameter('com_bound_ratio', 0.2)
-        self.declare_parameter('auto_start_pick_place', False)
-        self.declare_parameter('continuous_loading_enabled', False)
-        self.declare_parameter('localization_timeout_sec', 30.0)
-        self.declare_parameter('target_republish_sec', 0.5)
-        self.declare_parameter('visualization_enabled', True)
-        self.declare_parameter('visualization_port', 8765)
-        self.declare_parameter('visualization_bind_host', '0.0.0.0')
-        self.declare_parameter('visualization_public_host', '127.0.0.1')
-        self.declare_parameter('visualization_poll_ms', 500)
-
-        container_size = tuple(
-            int(value) for value in
-            self.get_parameter('container_size_mm').value)
-        self.loader = RealPlatformRandomLoader(
+    def _build_loader(self, container_size):
+        return RealPlatformRandomLoader(
             container_size=container_size,
             clearance_mm=int(self.get_parameter('clearance_mm').value),
             seed=int(self.get_parameter('seed').value),
@@ -52,10 +50,40 @@ class RandomStableLoadingNode(Node):
             com_bound_ratio=float(
                 self.get_parameter('com_bound_ratio').value),
         )
+
+    def __init__(self):
+        super().__init__(self.NODE_NAME)
+        self.declare_parameter('container_size_mm', [450, 550, 450])
+        self.declare_parameter('clearance_mm', self.DEFAULT_CLEARANCE_MM)
+        self.declare_parameter('seed', self.DEFAULT_SEED)
+        self.declare_parameter('scan_downscale', 2)
+        self.declare_parameter('candidate_sample_fraction', 0.3)
+        self.declare_parameter('com_bound_ratio', 0.2)
+        self.declare_parameter('packing_height_resolution_mm', 5)
+        self.declare_parameter('auto_start_pick_place', False)
+        self.declare_parameter('continuous_loading_enabled', False)
+        self.declare_parameter('localization_timeout_sec', 180.0)
+        self.declare_parameter('target_republish_sec', 0.5)
+        self.declare_parameter('visualization_enabled', True)
+        self.declare_parameter(
+            'visualization_port', self.DEFAULT_VISUALIZATION_PORT)
+        self.declare_parameter('visualization_bind_host', '0.0.0.0')
+        self.declare_parameter('visualization_public_host', '127.0.0.1')
+        self.declare_parameter('visualization_poll_ms', 500)
+
+        container_size = tuple(
+            int(value) for value in
+            self.get_parameter('container_size_mm').value)
+        self.loader = self._build_loader(container_size)
+
         self.auto_start = bool(
             self.get_parameter('auto_start_pick_place').value)
         self.continuous_loading_enabled = bool(
             self.get_parameter('continuous_loading_enabled').value)
+        self.packing_height_resolution_mm = int(
+            self.get_parameter('packing_height_resolution_mm').value)
+        if self.packing_height_resolution_mm <= 0:
+            raise ValueError('packing_height_resolution_mm must be positive')
         self.continuous_run_active = False
         self.target_republish_sec = max(
             0.1, float(self.get_parameter('target_republish_sec').value))
@@ -68,6 +96,7 @@ class RandomStableLoadingNode(Node):
         self.target_acknowledged = False
         self.pallet_status = 'UNLOCALIZED'
         self.pipeline_status = {}
+        self.pickup_status = {}
         self.expected_pipeline_operation_id = None
         self.last_target_publish = 0.0
         self.localization_started = None
@@ -86,9 +115,9 @@ class RandomStableLoadingNode(Node):
         self.target_pub = self.create_publisher(
             Float64MultiArray, '/random_stable_loading/target', 10)
         self.status_pub = self.create_publisher(
-            String, '/random_stable_loading/status', 10)
+            String, f'{self.API_PREFIX}/status', 10)
         self.create_subscription(
-            Float64MultiArray, '/item_localization/result',
+            Float64MultiArray, '/object_info_estimation/result',
             self.item_result_callback, 10)
         self.create_subscription(
             Float64MultiArray, '/random_stable_loading/target_applied',
@@ -97,11 +126,15 @@ class RandomStableLoadingNode(Node):
             String, '/pick_place_pipeline/status',
             self.pipeline_status_callback, 10)
         self.create_subscription(
+            String, '/pickup_pipeline/status',
+            self.pickup_status_callback, 10)
+        self.create_subscription(
             String, '/pallet_localization/status',
             self.pallet_status_callback, 10)
-        self.create_subscription(
-            Float64MultiArray, '/random_stable_loading/config',
-            self.config_callback, 10)
+        if hasattr(self.loader, 'set_com_bound_ratio'):
+            self.create_subscription(
+                Float64MultiArray, f'{self.API_PREFIX}/config',
+                self.config_callback, 10)
 
         self.pick_place_client = self.create_client(
             Trigger, '/pick_place_pipeline/start')
@@ -109,33 +142,38 @@ class RandomStableLoadingNode(Node):
             Trigger, '/pick_place_pipeline/abort')
         self.pick_place_reset_client = self.create_client(
             Trigger, '/pick_place_pipeline/reset')
-        self.item_localization_start_client = self.create_client(
-            Trigger, '/item_localization/start')
-        self.item_localization_clear_client = self.create_client(
-            Trigger, '/item_localization/clear')
+        self.object_info_start_client = self.create_client(
+            Trigger, '/pickup_pipeline/estimate_object_info')
+        self.object_info_abort_client = self.create_client(
+            Trigger, '/pickup_pipeline/abort')
+        self.object_info_discard_client = self.create_client(
+            Trigger, '/pickup_pipeline/discard_object_info')
         self.create_service(
-            Trigger, '/random_stable_loading/start',
+            Trigger, f'{self.API_PREFIX}/start',
             self.start_loading_callback)
         self.create_service(
-            Trigger, '/random_stable_loading/abort',
+            Trigger, f'{self.API_PREFIX}/abort',
             self.abort_loading_callback)
         self.create_service(
-            Trigger, '/random_stable_loading/start_pick_place',
+            Trigger, f'{self.API_PREFIX}/start_pick_place',
             self.start_pick_place_callback)
         self.create_service(
-            Trigger, '/random_stable_loading/discard_pending',
+            Trigger, f'{self.API_PREFIX}/discard_pending',
             self.discard_pending_callback)
         self.create_service(
-            Trigger, '/random_stable_loading/reset_pallet',
+            Trigger, f'{self.API_PREFIX}/reset_pallet',
             self.reset_pallet_callback)
         self.create_service(
-            SetBool, '/random_stable_loading/set_continuous',
+            SetBool, f'{self.API_PREFIX}/set_continuous',
             self.set_continuous_callback)
 
         self.create_timer(0.1, self.tick)
         self.create_timer(0.5, self.publish_status)
         self._start_visualization()
         self._push_visualization('Real-platform loading: empty pallet')
+        self._log_ready(container_size)
+
+    def _log_ready(self, container_size):
         self.get_logger().info(
             'random stable loading ready: container=%s mm, clearance=%d mm, '
             'vertical_filter=true, sample_fraction=%.2f, '
@@ -153,7 +191,7 @@ class RandomStableLoadingNode(Node):
             self.visualization_builder = ThreeVisualizationBuilder(
                 DEFAULT_VISUAL_CONFIG)
             self.visualization_server = ThreeLiveServer(
-                plot_dir='/tmp/random_stable_loading_visualization',
+                plot_dir=self.VISUALIZATION_DIRECTORY,
                 port=int(self.get_parameter('visualization_port').value),
                 bind_host=str(
                     self.get_parameter('visualization_bind_host').value),
@@ -201,19 +239,29 @@ class RandomStableLoadingNode(Node):
     def item_result_callback(self, message):
         if len(message.data) < 11:
             self._set_fault(
-                'item localization result must contain id, pose, and XYZ dimensions')
+                'object-information result must contain id, pose, and XYZ dimensions')
             return
-        if (self.state not in ('IDLE', 'LOCALIZING', 'WAITING_NEXT_ITEM') or
+        if (self.state not in ('LOCALIZING', 'WAITING_NEXT_ITEM') or
                 self.loader.pending is not None):
             self.get_logger().warning(
                 f'ignored new item result while loading state is {self.state}')
             return
         item_id = int(round(message.data[0]))
-        dimensions_mm = tuple(float(value) * 1000.0 for value in message.data[8:11])
-        if not all(math.isfinite(value) and value > 0.0 for value in dimensions_mm):
-            self._set_fault(f'invalid item dimensions: {dimensions_mm}')
+        measured_dimensions_mm = tuple(
+            float(value) * 1000.0 for value in message.data[8:11])
+        if not all(
+                math.isfinite(value) and value > 0.0
+                for value in measured_dimensions_mm):
+            self._set_fault(
+                f'invalid item dimensions: {measured_dimensions_mm}')
             return
-
+        dimensions_mm = (
+            measured_dimensions_mm[0],
+            measured_dimensions_mm[1],
+            round_up_to_increment(
+                measured_dimensions_mm[2],
+                self.packing_height_resolution_mm),
+        )
         self.state = 'PLANNING'
         self.localization_started = None
         self.fault = ''
@@ -225,8 +273,10 @@ class RandomStableLoadingNode(Node):
             dimensions_mm=dimensions_mm,
         )
         self.get_logger().info(
-            'planning stable target for item %d, dimensions=(%d, %d, %d) mm' % (
-                item_id, *(int(round(value)) for value in dimensions_mm)))
+            'planning stable target for item %d, dimensions=(%d, %d, %d) mm; '
+            'measured Z %.1f mm rounded upward to %.1f mm on the ROS side' % (
+                item_id, *(int(round(value)) for value in dimensions_mm),
+                measured_dimensions_mm[2], dimensions_mm[2]))
         self.publish_status()
 
     def target_applied_callback(self, message):
@@ -255,6 +305,9 @@ class RandomStableLoadingNode(Node):
 
     def pipeline_status_callback(self, message):
         self.pipeline_status = self._decode_status(message)
+
+    def pickup_status_callback(self, message):
+        self.pickup_status = self._decode_status(message)
 
     def pallet_status_callback(self, message):
         self.pallet_status = message.data
@@ -290,11 +343,16 @@ class RandomStableLoadingNode(Node):
             return
 
         if self.state == 'LOCALIZING':
+            if self.pickup_status.get('state') == 'FAULT':
+                self._set_fault(
+                    self.pickup_status.get(
+                        'fault', 'object information estimation failed'))
+                return
             if (self.localization_started is not None and
-                    time.monotonic() - self.localization_started >=
+                time.monotonic() - self.localization_started >=
                     self.localization_timeout_sec):
                 self._clear_item_localization()
-                self._set_fault('incoming-item localization timed out')
+                self._set_fault('contact-corrected object estimation timed out')
             return
 
         if self.state == 'WAITING_NEXT_ITEM':
@@ -356,6 +414,7 @@ class RandomStableLoadingNode(Node):
             if self.abort_requested:
                 self._finish_abort()
                 return
+            self._discard_object_info_at_contact()
             self._set_fault(str(exc))
             return
         if self.abort_requested:
@@ -363,6 +422,12 @@ class RandomStableLoadingNode(Node):
             return
         self.state = 'WAITING_TARGET_ACK'
         self._publish_target(pending)
+        self._log_pending(pending)
+        self._push_visualization(
+            f'Pending item {pending.item_id}: target {pending.sequence_id}')
+        self.publish_status()
+
+    def _log_pending(self, pending):
         self.get_logger().info(
             'selected target %d: stable=%d, vertical=%d, sampled=%d, '
             'corner=(%d, %d, %d) mm, rotate_90=%s, '
@@ -379,9 +444,29 @@ class RandomStableLoadingNode(Node):
                 pending.virtual_dim.dy,
                 pending.virtual_dim.dz,
             ))
-        self._push_visualization(
-            f'Pending item {pending.item_id}: target {pending.sequence_id}')
-        self.publish_status()
+
+    def _discard_object_info_at_contact(self):
+        """Retreat without grasping when planning cannot accept the item."""
+        if self.object_info_discard_client.service_is_ready():
+            future = self.object_info_discard_client.call_async(
+                Trigger.Request())
+            future.add_done_callback(self._discard_object_info_completed)
+            return
+        self.get_logger().error(
+            'cannot retreat after rejected loading target: '
+            'pickup discard service is unavailable')
+
+    def _discard_object_info_completed(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f'failed to request retreat after rejected target: {exc}')
+            return
+        if result is None or not result.success:
+            reason = 'no response' if result is None else result.message
+            self.get_logger().error(
+                f'retreat after rejected target was rejected: {reason}')
 
     def _publish_target(self, pending):
         message = Float64MultiArray()
@@ -414,8 +499,8 @@ class RandomStableLoadingNode(Node):
         if pipeline_state in self.ACTIVE_PIPELINE_STATES:
             response.message = f'PickAndPlace is already active in {pipeline_state}'
             return response
-        if not self.item_localization_start_client.service_is_ready():
-            response.message = 'incoming-item localization service is unavailable'
+        if not self.object_info_start_client.service_is_ready():
+            response.message = 'object-information estimation service is unavailable'
             return response
 
         self.state = 'LOCALIZING'
@@ -425,10 +510,12 @@ class RandomStableLoadingNode(Node):
         self.cycle_auto_start = True
         self.continuous_run_active = self.continuous_loading_enabled
         self.abort_requested = False
-        future = self.item_localization_start_client.call_async(Trigger.Request())
+        future = self.object_info_start_client.call_async(Trigger.Request())
         future.add_done_callback(self._localization_start_completed)
         response.success = True
-        response.message = 'stable random loading started; measuring incoming item'
+        response.message = (
+            'stable random loading started; estimating contact-corrected '
+            'object information')
         self.publish_status()
         return response
 
@@ -438,12 +525,12 @@ class RandomStableLoadingNode(Node):
         try:
             result = future.result()
         except Exception as exc:
-            self._set_fault(f'incoming-item localization start failed: {exc}')
+            self._set_fault(f'object-information estimation start failed: {exc}')
             return
         if result is None or not result.success:
             reason = 'no response' if result is None else result.message
             self._set_fault(
-                f'incoming-item localization start rejected: {reason}')
+                f'object-information estimation start rejected: {reason}')
 
     def abort_loading_callback(self, _request, response):
         if self.state == 'IDLE' and self.loader.pending is None:
@@ -485,8 +572,15 @@ class RandomStableLoadingNode(Node):
         return response
 
     def _clear_item_localization(self):
-        if self.item_localization_clear_client.service_is_ready():
-            self.item_localization_clear_client.call_async(Trigger.Request())
+        pickup_state = self.pickup_status.get('state')
+        if (pickup_state == 'OBJECT_INFO_READY' and
+                self.object_info_discard_client.service_is_ready()):
+            self.object_info_discard_client.call_async(Trigger.Request())
+        elif (pickup_state in (
+                'MOVE_OBSERVATION', 'WAIT_DETECTION', 'MOVE_PREGRASP',
+                'SERVO_PICKUP', 'ABORTING') and
+                self.object_info_abort_client.service_is_ready()):
+            self.object_info_abort_client.call_async(Trigger.Request())
 
     def _finish_abort(self):
         pending = self.loader.pending
@@ -543,21 +637,21 @@ class RandomStableLoadingNode(Node):
             self._set_fault(
                 'continuous loading stopped: pallet pose is not LOCKED')
             return
-        if not self.item_localization_start_client.service_is_ready():
+        if not self.object_info_start_client.service_is_ready():
             self._set_fault(
-                'continuous loading stopped: incoming-item localization '
+                'continuous loading stopped: object-information estimation '
                 'service is unavailable')
             return
-        self.state = 'WAITING_NEXT_ITEM'
+        self.state = 'LOCALIZING'
         self.fault = ''
-        self.localization_started = None
+        self.localization_started = time.monotonic()
         self.cycle_auto_start = True
         self.abort_requested = False
-        future = self.item_localization_start_client.call_async(
+        future = self.object_info_start_client.call_async(
             Trigger.Request())
         future.add_done_callback(self._localization_start_completed)
         self.get_logger().info(
-            'observation pose reached; waiting for the next stable refined item')
+            'observation pose reached; estimating the next item before planning')
         self.publish_status()
 
     def set_continuous_callback(self, request, response):
@@ -716,11 +810,6 @@ class RandomStableLoadingNode(Node):
             'auto_start_pick_place': self.auto_start,
             'continuous_loading_enabled': self.continuous_loading_enabled,
             'continuous_run_active': self.continuous_run_active,
-            'selection_pipeline': (
-                'stable_then_vertical_then_random_subset_then_min_xyz_sum'),
-            'candidate_sample_fraction': (
-                self.loader.candidate_sample_fraction),
-            'com_bound_ratio': self.loader.com_bound_ratio,
             'placed_items': len(self.loader.env.container.placed_items),
             'utilization': self.loader.env.container.utilization,
             'visualization_url': self.visualization_url or None,
@@ -730,6 +819,18 @@ class RandomStableLoadingNode(Node):
             'pending_item_id': None if pending is None else pending.item_id,
             'target_acknowledged': self.target_acknowledged,
         }
+        self._extend_status(payload, pending)
+        message = String()
+        message.data = json.dumps(payload, separators=(',', ':'))
+        self.status_pub.publish(message)
+
+    def _extend_status(self, payload, pending):
+        payload.update({
+            'selection_pipeline': (
+                'stable_then_vertical_then_random_subset_then_min_xyz_sum'),
+            'candidate_sample_fraction': self.loader.candidate_sample_fraction,
+            'com_bound_ratio': self.loader.com_bound_ratio,
+        })
         if pending is not None:
             payload['target_corner_mm'] = [
                 pending.placement.flb.x,
@@ -746,9 +847,6 @@ class RandomStableLoadingNode(Node):
                 pending.vertical_candidate_count)
             payload['sampled_candidate_count'] = (
                 pending.sampled_candidate_count)
-        message = String()
-        message.data = json.dumps(payload, separators=(',', ':'))
-        self.status_pub.publish(message)
 
     def destroy_node(self):
         self.planning_worker.shutdown(wait=False, cancel_futures=True)

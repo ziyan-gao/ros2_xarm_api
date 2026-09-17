@@ -2,13 +2,15 @@ import math
 import time
 from types import SimpleNamespace
 
-import pytest
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose
-from std_srvs.srv import Trigger
+import pytest
 
 from safe_servo_visualization.motion_coordinator_node import MotionCoordinator
 from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
 from safe_servo_visualization.place_pipeline_node import PlacePipeline
+from std_srvs.srv import Trigger
 
 
 class FakeFuture:
@@ -38,6 +40,55 @@ class FakeClient:
         future = FakeFuture(self.result)
         self.futures.append(future)
         return future
+
+
+class FakeGoalHandle:
+    def __init__(self, result=None, accepted=True):
+        self.accepted = accepted
+        self.result_future = FakeFuture(result)
+        self.cancelled = False
+
+    def get_result_async(self):
+        return self.result_future
+
+    def cancel_goal_async(self):
+        self.cancelled = True
+        return FakeFuture()
+
+
+class FakeActionClient:
+    def __init__(self, goal_handle=None):
+        self.ready = True
+        self.goal_handle = goal_handle or FakeGoalHandle()
+        self.goals = []
+        self.futures = []
+
+    def server_is_ready(self):
+        return self.ready
+
+    def wait_for_server(self, timeout_sec):
+        return self.ready
+
+    def send_goal_async(self, goal):
+        self.goals.append(goal)
+        future = FakeFuture(self.goal_handle)
+        self.futures.append(future)
+        return future
+
+
+def test_moveit_service_discovery_wait_is_bounded():
+    class DiscoveringClient:
+        def __init__(self):
+            self.timeout = None
+
+        def wait_for_service(self, timeout_sec):
+            self.timeout = timeout_sec
+            return True
+
+    client = DiscoveringClient()
+
+    assert PickupSupervisor._wait_for_service(client, 2.0) is True
+    assert client.timeout == pytest.approx(2.0)
 
 
 class FakeLogger:
@@ -105,6 +156,142 @@ def test_direct_transfer_requires_tcp_to_reach_the_requested_xyz():
 
     assert supervisor.direct_transfer_succeeded is False
     assert 'target error is too large' in supervisor.fault
+
+
+def test_periodic_ik_joint_is_normalized_to_nearest_hardware_equivalent():
+    normalized = PickupSupervisor._nearest_periodic_equivalent(
+        3.8, -0.3, -2.0 * math.pi, 2.0 * math.pi)
+
+    assert normalized == pytest.approx(3.8 - 2.0 * math.pi)
+    assert abs(normalized + 0.3) < abs(3.8 + 0.3)
+
+
+def test_moveit_kdl_ik_solution_starts_sampled_collision_validation():
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.state = PickupSupervisor.SOLVING_TRANSFER_IK
+    supervisor.latest_joint_positions = (0.0,) * 6
+    supervisor.arm_joint_names = tuple(f'joint{i}' for i in range(1, 7))
+    supervisor.planning_group = 'uf850'
+    supervisor.direct_transfer_periodic_joint_names = frozenset(
+        ('joint1', 'joint4', 'joint6'))
+    supervisor.direct_transfer_periodic_limits = (
+        -2.0 * math.pi, 2.0 * math.pi)
+    supervisor.direct_transfer_max_joint_delta = 2.6
+    supervisor.direct_transfer_sample_step = 0.05
+    supervisor.direct_target_joints = None
+    supervisor.direct_transfer_validation_samples = []
+    supervisor.direct_transfer_validation_index = 0
+    supervisor.state_validity_client = FakeClient()
+    supervisor.get_logger = lambda: FakeLogger()
+    supervisor._fault = pytest.fail
+
+    supervisor._direct_transfer_ik_completed(FakeFuture(SimpleNamespace(
+        error_code=SimpleNamespace(val=1, message=''),
+        solution=SimpleNamespace(joint_state=SimpleNamespace(
+            name=list(supervisor.arm_joint_names),
+            position=[0.10, 0.0, 0.0, 0.0, 0.0, 0.0])))))
+
+    assert supervisor.state == PickupSupervisor.VALIDATING_TRANSFER
+    assert supervisor.direct_target_joints == pytest.approx(
+        (0.10, 0.0, 0.0, 0.0, 0.0, 0.0))
+    assert len(supervisor.direct_transfer_validation_samples) == 2
+    request = supervisor.state_validity_client.requests[-1]
+    assert request.group_name == 'uf850'
+    assert request.robot_state.joint_state.position == pytest.approx(
+        [0.05, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+def test_validated_joint_line_executes_through_trajectory_controller():
+    successful_result = SimpleNamespace(
+        status=GoalStatus.STATUS_SUCCEEDED,
+        result=SimpleNamespace(
+            error_code=FollowJointTrajectory.Result.SUCCESSFUL,
+            error_string=''))
+    goal_handle = FakeGoalHandle(successful_result)
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.state = PickupSupervisor.VALIDATING_TRANSFER
+    supervisor.latest_joint_positions = (0.0,) * 6
+    supervisor.arm_joint_names = tuple(f'joint{i}' for i in range(1, 7))
+    supervisor.direct_target_joints = (0.10, 0.0, 0.0, 0.0, 0.0, 0.0)
+    supervisor.direct_transfer_validation_samples = [
+        (0.05, 0.0, 0.0, 0.0, 0.0, 0.0),
+        supervisor.direct_target_joints,
+    ]
+    supervisor.direct_transfer_ik_timeout = 2.0
+    supervisor.direct_transfer_joint_acc = 0.7
+    supervisor.retreat_speed = 75.0
+    supervisor.trajectory_controller = 'uf850_traj_controller'
+    supervisor.transfer_trajectory_client = FakeActionClient(goal_handle)
+    supervisor.direct_transfer_motion_started = False
+    supervisor.transfer_goal_handle = None
+    supervisor.get_logger = lambda: FakeLogger()
+    supervisor.publish_status = lambda: None
+    supervisor._fault = pytest.fail
+    completed = []
+    supervisor._finish_retreat = lambda: completed.append(True)
+
+    supervisor._send_joint_trajectory_transfer()
+
+    assert supervisor.state == PickupSupervisor.EXECUTING_TRANSFER
+    assert len(supervisor.transfer_trajectory_client.goals) == 1
+    goal = supervisor.transfer_trajectory_client.goals[0]
+    assert goal.trajectory.joint_names == list(supervisor.arm_joint_names)
+    assert len(goal.trajectory.points) == 2
+    assert goal.trajectory.points[-1].positions == pytest.approx(
+        supervisor.direct_target_joints)
+    assert goal.trajectory.points[-1].velocities == pytest.approx([0.0] * 6)
+    assert goal.trajectory.points[-1].accelerations == pytest.approx([0.0] * 6)
+
+    send_future = supervisor.transfer_trajectory_client.futures[-1]
+    send_future.callback(send_future)
+    assert supervisor.direct_transfer_motion_started is True
+    goal_handle.result_future.callback(goal_handle.result_future)
+    assert completed == [True]
+
+
+def _completed_direct_joint_transfer(actual_joints):
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.operation_kind = 'transfer'
+    supervisor.direct_target_pose = (
+        410.0, -275.0, 620.0, math.pi, 0.0, 0.0)
+    supervisor.direct_target_joints = (0.0,) * 6
+    supervisor.latest_joint_positions = tuple(actual_joints)
+    supervisor.arm_joint_names = tuple(f'joint{i}' for i in range(1, 7))
+    supervisor.direct_transfer_periodic_joint_names = frozenset(
+        ('joint1', 'joint4', 'joint6'))
+    supervisor.direct_transfer_joint_tolerance = 0.03
+    supervisor.direct_transfer_succeeded = False
+    supervisor.dry_run = False
+    supervisor.post_retreat_fault = ''
+    supervisor.joint6_name = 'joint6'
+    supervisor._joint6_is_moveit_safe = lambda: True
+    supervisor._direct_mode_tcp_xyz = lambda: pytest.fail(
+        'joint transfer must not compare incompatible SDK and MoveIt TCP frames')
+    supervisor.publish_status = lambda: None
+    supervisor.fault = ''
+    supervisor._fault = lambda reason: setattr(supervisor, 'fault', reason)
+    return supervisor
+
+
+def test_direct_joint_transfer_uses_fresh_joint_feedback_not_sdk_tcp():
+    supervisor = _completed_direct_joint_transfer(
+        (2.0 * math.pi, 0.01, 0.0, 0.0, 0.0, 0.0))
+
+    supervisor._finish_retreat()
+
+    assert supervisor.state == PickupSupervisor.SUCCEEDED
+    assert supervisor.direct_transfer_succeeded is True
+    assert supervisor.fault == ''
+
+
+def test_direct_joint_transfer_rejects_large_joint_feedback_error():
+    supervisor = _completed_direct_joint_transfer(
+        (0.0, 0.05, 0.0, 0.0, 0.0, 0.0))
+
+    supervisor._finish_retreat()
+
+    assert supervisor.direct_transfer_succeeded is False
+    assert 'joint2 feedback error is 0.050 rad' in supervisor.fault
 
 
 def _direct_loading_supervisor():
@@ -227,15 +414,13 @@ def _failed_transfer_pipeline(pending_motion):
     return pipeline
 
 
-def test_moveit_transfer_planning_failure_starts_direct_fallback():
+def test_moveit_transfer_planning_failure_faults_without_direct_fallback():
     pipeline = _failed_transfer_pipeline('transfer')
 
     pipeline.tick()
 
-    assert len(pipeline.start_transfer_fallback.requests) == 1
-    assert pipeline.pending_motion == 'transfer_fallback_starting'
-    assert pipeline.expected_supervisor_operation_id == 10
-    assert pipeline.fault == ''
+    assert pipeline.start_transfer_fallback.requests == []
+    assert pipeline.fault == 'MoveIt could not find a plan'
 
 
 def test_moveit_transfer_execution_failure_does_not_start_direct_fallback():
@@ -247,41 +432,63 @@ def test_moveit_transfer_execution_failure_does_not_start_direct_fallback():
     assert pipeline.fault == 'MoveIt could not find a plan'
 
 
-def test_latched_planning_fault_is_ignored_during_fallback_loading():
-    pipeline = _failed_transfer_pipeline(None)
-    pipeline.state = PlacePipeline.LOAD_PRE_PLACE
-    pipeline.transfer_fallback_used = True
-    loading_ticks = []
-    pipeline._tick_loading = lambda: loading_ticks.append(True)
-
-    pipeline.tick()
-
-    assert loading_ticks == [True]
-    assert pipeline.fault == ''
-
-
-def test_successful_direct_transfer_is_acknowledged_before_loading():
-    pipeline = _failed_transfer_pipeline('transfer_fallback_executing')
-    pipeline.supervisor_status.update({
-        'state': 'SUCCEEDED',
+def _direct_joint_failure_pipeline(motion_started):
+    pipeline = object.__new__(PlacePipeline)
+    pipeline.pending_motion = 'direct_joint_executing'
+    pipeline.expected_supervisor_operation_id = 8
+    pipeline.supervisor_status = {
+        'state': 'FAULT',
         'operation_kind': 'transfer',
-        'operation_id': 10,
-        'direct_transfer_succeeded': True,
-    })
-    pipeline.expected_supervisor_operation_id = 10
-    loading = []
-    pipeline._begin_loading_motion = lambda: loading.append(True)
+        'operation_id': 8,
+        'fault': 'MoveIt/KDL transfer IK failed',
+        'direct_transfer_motion_started': motion_started,
+    }
+    pipeline.motion_status = {
+        'state': 'PREPARED', 'target': 'transfer', 'operation_id': 4}
+    pipeline.plan_transfer = FakeClient(
+        SimpleNamespace(success=True, message='planning'))
+    pipeline.transfer_fallback_used = False
+    pipeline.transfer_fallback_reason = ''
+    pipeline.phase_started = time.monotonic()
+    pipeline.get_logger = lambda: FakeLogger()
+    pipeline.fault = ''
+    pipeline._fault = lambda reason: setattr(pipeline, 'fault', reason)
+    return pipeline
+
+
+def test_moveit_kdl_ik_failure_before_motion_falls_back_to_rrtconnect():
+    pipeline = _direct_joint_failure_pipeline(False)
 
     pipeline._tick_transfer()
 
-    assert pipeline.pending_motion == 'transfer_fallback_accepting'
-    assert len(pipeline.accept_direct_transfer.requests) == 1
-    assert loading == []
+    assert pipeline.pending_motion == 'transfer'
+    assert pipeline.transfer_fallback_used is True
+    assert len(pipeline.plan_transfer.requests) == 1
+    assert pipeline.fault == ''
 
-    future = pipeline.accept_direct_transfer.futures[-1]
-    future.callback(future)
-    assert pipeline.pending_motion is None
-    assert loading == [True]
+
+def test_direct_joint_execution_failure_does_not_auto_fallback():
+    pipeline = _direct_joint_failure_pipeline(True)
+
+    pipeline._tick_transfer()
+
+    assert pipeline.plan_transfer.requests == []
+    assert 'direct motion had already started' in pipeline.fault
+
+
+def test_invalid_direct_interpolation_sample_faults_before_robot_motion():
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.state = PickupSupervisor.VALIDATING_TRANSFER
+    supervisor.direct_transfer_validation_index = 1
+    supervisor.direct_transfer_validation_samples = [(0.0,) * 6] * 5
+    faults = []
+    supervisor._fault = faults.append
+
+    supervisor._direct_transfer_sample_validated(
+        FakeFuture(SimpleNamespace(valid=False)))
+
+    assert faults == [
+        'direct transfer interpolation is in collision at sample 2/5']
 
 
 def _failed_transfer_coordinator():

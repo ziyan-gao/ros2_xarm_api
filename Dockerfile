@@ -26,7 +26,10 @@ RUN apt-get update && apt-get install -y \
 # 安装基础 Python 包
 RUN python3 -m pip install --break-system-packages build pyproject_hooks && \
     python3 -m pip install --break-system-packages --no-deps opencv-python-headless && \
-    python3 -m pip install --break-system-packages gymnasium==1.0.0
+    python3 -m pip install --break-system-packages gymnasium==1.0.0 \
+      omegaconf==2.3.0 einops==0.8.1 && \
+    python3 -m pip install --break-system-packages \
+      --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
 
 # 安装 xArm Python SDK（按官方 source code 方式）
 RUN git clone https://github.com/xArm-Developer/xArm-Python-SDK.git /opt/xArm-Python-SDK && \

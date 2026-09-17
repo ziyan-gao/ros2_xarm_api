@@ -61,6 +61,24 @@ def test_rotated_fallback_obstacle_uses_predicted_pallet_corner_and_z():
     assert pose.orientation.w == pytest.approx(2.0 ** -0.5)
 
 
+def test_visual_marker_matches_moveit_box_geometry_and_color():
+    node = object.__new__(PlanningSceneObstacles)
+    node.base_frame = 'link_base'
+    obstacle = node._box(
+        'placed_item_4', (0.22, 0.17, 0.12),
+        (0.41, -0.32, 0.06), (0.0, 0.0, -2.0 ** -0.5, 2.0 ** -0.5))
+
+    marker = node._marker_from_box(obstacle, 4)
+
+    assert marker.header.frame_id == obstacle.header.frame_id
+    assert marker.pose == obstacle.primitive_poses[0]
+    assert (marker.scale.x, marker.scale.y, marker.scale.z) == pytest.approx(
+        obstacle.primitives[0].dimensions)
+    assert (marker.color.r, marker.color.g, marker.color.b, marker.color.a) == (
+        pytest.approx(0.95), pytest.approx(0.65),
+        pytest.approx(0.10), pytest.approx(0.90))
+
+
 def test_predicted_pose_requires_matching_active_random_target():
     node = object.__new__(PlanningSceneObstacles)
     target = {'sequence_id': 8, 'item_id': 9}

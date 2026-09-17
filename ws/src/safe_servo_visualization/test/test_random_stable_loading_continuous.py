@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
+
 from safe_servo_visualization.random_stable_loading_node import (
     RandomStableLoadingNode,
+    round_up_to_increment,
 )
 
 
@@ -18,6 +21,69 @@ class FakeLoader:
 class FakeLogger:
     def info(self, _message):
         pass
+
+    def warning(self, _message):
+        pass
+
+
+class FakePlanningWorker:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, function, **kwargs):
+        self.calls.append((function, kwargs))
+        return SimpleNamespace(done=lambda: False)
+
+
+@pytest.mark.parametrize(
+    ('measured', 'expected'),
+    [(140.0, 140.0), (141.0, 145.0), (149.0, 150.0), (150.0, 150.0)],
+)
+def test_packing_height_is_rounded_up_to_five_millimetres(measured, expected):
+    assert round_up_to_increment(measured, 5) == expected
+
+
+def test_corrected_object_result_plans_only_during_requested_estimation():
+    node = object.__new__(RandomStableLoadingNode)
+    node.state = 'LOCALIZING'
+    node.loader = SimpleNamespace(pending=None, plan=lambda **_kwargs: None)
+    node.packing_height_resolution_mm = 5
+    node.planning_worker = FakePlanningWorker()
+    node.planning_future = None
+    node.localization_started = 1.0
+    node.fault = 'old'
+    node.last_result = 'old'
+    node.target_acknowledged = True
+    node.get_logger = lambda: FakeLogger()
+    node.publish_status = lambda: None
+    message = SimpleNamespace(
+        data=[4.0, 0.1, 0.2, 0.075, 0.0, 0.0, 0.0, 1.0,
+              0.141, 0.149, 0.147])
+
+    node.item_result_callback(message)
+
+    assert node.state == 'PLANNING'
+    assert len(node.planning_worker.calls) == 1
+    assert node.planning_worker.calls[0][1] == {
+        'item_id': 4,
+        'dimensions_mm': (141.0, 149.0, 150.0),
+    }
+
+
+def test_unsolicited_corrected_object_result_is_ignored_while_idle():
+    node = object.__new__(RandomStableLoadingNode)
+    node.state = 'IDLE'
+    node.loader = SimpleNamespace(pending=None)
+    node.planning_worker = FakePlanningWorker()
+    node.get_logger = lambda: FakeLogger()
+    message = SimpleNamespace(
+        data=[4.0, 0.1, 0.2, 0.075, 0.0, 0.0, 0.0, 1.0,
+              0.141, 0.149, 0.147])
+
+    node.item_result_callback(message)
+
+    assert node.state == 'IDLE'
+    assert node.planning_worker.calls == []
 
 
 def test_success_at_observation_starts_next_stability_measurement():

@@ -1,7 +1,7 @@
 import json
 import math
-import time
 from pathlib import Path
+import time
 
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Point, Pose, PoseStamped
@@ -20,6 +20,7 @@ class MotionCoordinator(Node):
 
     IDLE = 'IDLE'
     PLANNING = 'PLANNING'
+    PREPARED = 'PREPARED'
     PLANNED = 'PLANNED'
     EXECUTING = 'EXECUTING'
     CANCELING = 'CANCELING'
@@ -40,6 +41,7 @@ class MotionCoordinator(Node):
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('joint_state_timeout_sec', 0.5)
+        self.declare_parameter('observation_joint_tolerance_rad', 0.02)
         self.declare_parameter('pre_place_clearance_m', 0.03)
         self.declare_parameter('transfer_corner_height_m', 0.47)
         self.waypoint_file = Path(
@@ -54,6 +56,8 @@ class MotionCoordinator(Node):
         self.max_detection_age = float(p('max_detection_age_sec'))
         self.joint_state_topic = str(p('joint_state_topic'))
         self.joint_state_timeout = float(p('joint_state_timeout_sec'))
+        self.observation_joint_tolerance = float(
+            p('observation_joint_tolerance_rad'))
         self.pre_place_clearance = float(p('pre_place_clearance_m'))
         self.transfer_corner_height = float(p('transfer_corner_height_m'))
         if self.pregrasp_clearance <= 0.0:
@@ -83,6 +87,7 @@ class MotionCoordinator(Node):
         self.planned_pregrasp = None
         self.staging_retrieve_target = None
         self.last_joint_state_time = None
+        self.latest_joint_positions = {}
         self._restore_pregrasp_snapshot()
 
         self.plan_client = self.create_client(
@@ -129,6 +134,9 @@ class MotionCoordinator(Node):
             Trigger, '/motion_coordinator/plan_intermediate',
             lambda request, response: self.plan_waypoint(
                 'intermediate', response))
+        self.create_service(
+            Trigger, '/motion_coordinator/prepare_transfer',
+            self.prepare_transfer_callback)
         self.create_service(
             Trigger, '/motion_coordinator/plan_transfer',
             self.plan_transfer_callback)
@@ -223,8 +231,12 @@ class MotionCoordinator(Node):
         if fault:
             self.get_logger().error(fault)
 
-    def joint_state_callback(self, _message):
+    def joint_state_callback(self, message):
         self.last_joint_state_time = time.monotonic()
+        self.latest_joint_positions = {
+            str(name): float(position)
+            for name, position in zip(message.name, message.position)
+        }
 
     def _require_fresh_joint_state(self, response, action):
         if self.last_joint_state_time is None:
@@ -420,6 +432,45 @@ class MotionCoordinator(Node):
 
     def plan_transfer_callback(self, _request, response):
         return self._plan_place_pose(response, transfer=True)
+
+    def prepare_transfer_callback(self, _request, response):
+        """Cache a validated transfer target without invoking a planner."""
+        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
+            return response
+        if not self._require_fresh_joint_state(response, 'prepare transfer'):
+            return response
+        if not self.pallet_locked:
+            response.message = 'pallet pose is not LOCKED'
+            return response
+        if (self.pre_place_pose is None or self.pre_place_pose_time is None or
+                time.monotonic() - self.pre_place_pose_time > 1.0):
+            response.message = 'fresh pallet-relative pre-place pose is unavailable'
+            return response
+        try:
+            self._calculate_place_poses()
+            pose = self.transfer_tcp_pose
+        except (TypeError, ValueError) as exc:
+            response.message = str(exc)
+            return response
+        values = (
+            pose.position.x, pose.position.y, pose.position.z,
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w)
+        if not all(math.isfinite(float(value)) for value in values):
+            response.message = 'pallet-relative transfer pose is invalid'
+            return response
+        self.operation_id += 1
+        self.target = 'transfer'
+        self.fault = ''
+        self.cancel_requested = self.pause_requested = False
+        self._set_state(self.PREPARED)
+        response.success = True
+        response.message = (
+            'Prepared direct-joint transfer target at '
+            f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
+            f'{pose.position.z:.3f}] m; operation_id={self.operation_id}')
+        return response
 
     def _calculate_place_poses(self):
         corner_pose = Pose()
@@ -779,6 +830,25 @@ class MotionCoordinator(Node):
             response.message = str(exc)
             return response
 
+        if name == 'observation':
+            joint_names = [f'joint{i}' for i in range(1, len(positions) + 1)]
+            if all(joint in self.latest_joint_positions for joint in joint_names):
+                error = max(abs(self.latest_joint_positions[joint] - target)
+                            for joint, target in zip(joint_names, positions))
+                if error <= self.observation_joint_tolerance:
+                    self.operation_id += 1
+                    self.target = name
+                    self.planned_pregrasp = None
+                    self._clear_pregrasp_snapshot()
+                    self.cancel_requested = False
+                    self.pause_requested = False
+                    self._set_state(self.SUCCEEDED)
+                    response.success = True
+                    response.message = (
+                        'Robot is already at observation pose '
+                        f'(max joint error {error:.4f} rad)')
+                    return response
+
         self.operation_id += 1
         request_id = self.operation_id
         self.target = name
@@ -938,9 +1008,10 @@ class MotionCoordinator(Node):
     def accept_direct_transfer_callback(self, request, response):
         """Acknowledge a verified direct-service replacement for MoveIt transfer."""
         del request
-        if self.state != self.FAULT or self.target != 'transfer':
+        if self.state not in (self.FAULT, self.PREPARED) or self.target != 'transfer':
             response.message = (
-                'Direct transfer acknowledgement requires a failed transfer; '
+                'Direct transfer acknowledgement requires a failed transfer '
+                'or prepared target; '
                 f'got state={self.state}, target={self.target}')
             return response
         if self.pre_place_tcp_pose is None or self.transfer_tcp_pose is None:

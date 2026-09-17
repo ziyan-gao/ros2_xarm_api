@@ -8,6 +8,9 @@ from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
 
 
 class FakeLogger:
+    def info(self, _message):
+        pass
+
     def warning(self, _message):
         pass
 
@@ -107,7 +110,8 @@ def test_singularity_recovery_records_fallback_and_disables_servo_first():
     assert supervisor.place_fallback_reason == 'singularity test'
     assert supervisor.direct_place_recovery_active is True
     assert supervisor.direct_place_force_baseline_z == -8.0
-    assert supervisor.direct_place_deadline > time.monotonic() + 19.0
+    # The recovery budget must not be consumed by controller/mode handoff.
+    assert supervisor.direct_place_deadline is None
     assert supervisor.state == PickupSupervisor.DISABLING_SERVO
     assert len(supervisor.enable_client.requests) == 1
     assert supervisor.enable_client.requests[0].data is False
@@ -280,6 +284,56 @@ def test_place_timeout_without_singularity_releases_and_retreats():
     assert 'timed out' in fallbacks[0][0]
     assert fallbacks[0][1] == 'timeout'
     assert faults == []
+
+
+def test_persistent_singularity_deceleration_falls_back_before_place_timeout():
+    supervisor = _timed_out_soft_singularity_supervisor(
+        'place', ServoStatus.DECELERATE_FOR_APPROACHING_SINGULARITY)
+    supervisor.descent_started = time.monotonic()
+    supervisor.singularity_deceleration_started = None
+    supervisor.singularity_progress_started = None
+    supervisor.singularity_progress_reference_z = None
+    supervisor.singularity_deceleration_grace = 0.75
+    supervisor.singularity_no_progress = 1.0
+    supervisor.singularity_min_progress = 0.001
+    fallbacks = []
+    supervisor._begin_place_singularity_fallback = fallbacks.append
+    supervisor._fault = lambda _reason: None
+
+    supervisor.control_tick()
+    assert fallbacks == []
+
+    supervisor.singularity_deceleration_started -= 0.8
+    supervisor.control_tick()
+    assert len(fallbacks) == 1
+    assert '0.80 s' in fallbacks[0]
+
+
+def test_step_recovery_budget_starts_after_controller_handoff():
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.state = PickupSupervisor.PREPARING_RETREAT
+    supervisor.retreat_controller_wait_deadline = time.monotonic() + 2.0
+    supervisor.retreat_controller_query_pending = True
+    supervisor.joint_state_broadcaster = 'joint_state_broadcaster'
+    supervisor.trajectory_controller = 'uf850_traj_controller'
+    supervisor.direct_place_stepping = True
+    supervisor.direct_place_deadline = None
+    supervisor.singularity_place_recovery_timeout = 20.0
+    supervisor.get_logger = lambda: FakeLogger()
+    sent = []
+    supervisor._send_direct_place_step = lambda: sent.append(True)
+    supervisor._fault = lambda reason: (_ for _ in ()).throw(AssertionError(reason))
+
+    class ResultFuture:
+        def result(self):
+            class Result:
+                controller = []
+            return Result()
+
+    supervisor._retreat_controller_list_completed(ResultFuture())
+
+    assert sent == [True]
+    assert supervisor.direct_place_deadline > time.monotonic() + 19.0
 
 
 def test_latched_place_fault_does_not_reject_next_safe_pregrasp():

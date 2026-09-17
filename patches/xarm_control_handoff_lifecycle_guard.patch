@@ -22,13 +22,23 @@ diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_co
 index d654894..91cf0b2 100644
 --- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
 +++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
-@@ -250,6 +250,9 @@ namespace uf_robot_hardware
+@@ -250,6 +250,19 @@ namespace uf_robot_hardware
  
      CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
      {
 +        // Keep the real-time read/write callbacks inert until activation has
 +        // established a fresh report snapshot and initialized all commands.
 +        ros_control_active_.store(false, std::memory_order_release);
++        // SERVICE_CALL_FAILED is also used as a synthetic latency-watchdog
++        // latch. It must not survive a successful lifecycle reactivation.
++        if (latency_watchdog_latched_) {
++            RCLCPP_WARN(LOGGER,
++                "[%s] clearing recovered Servo-J latency watchdog latch",
++                robot_ip_.c_str());
++            write_code_ = 0;
++        }
++        late_write_streak_ = 0;
++        latency_watchdog_latched_ = false;
          xarm_driver_.arm->clean_error();
          xarm_driver_.arm->clean_warn();
          xarm_driver_.arm->motion_enable(true);

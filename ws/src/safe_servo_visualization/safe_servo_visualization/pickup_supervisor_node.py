@@ -5,15 +5,20 @@ import time
 from controller_manager_msgs.srv import (
     ListControllers, ListHardwareComponents, SetHardwareComponentState,
     SwitchController)
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from lifecycle_msgs.msg import State
-from moveit_msgs.msg import ServoStatus
+from moveit_msgs.msg import RobotState, ServoStatus
+from moveit_msgs.srv import GetPositionIK, GetStateValidity
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool, Trigger
+from trajectory_msgs.msg import JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 from xarm_msgs.msg import RobotMsg
 from xarm_msgs.srv import (
@@ -27,24 +32,33 @@ class PickupSupervisor(Node):
     ARMING_DESCENT = 'ARMING_DESCENT'
     DESCENDING = 'DESCENDING'
     DISABLING_DESCENT = 'DISABLING_DESCENT'
+    AWAITING_GRASP = 'AWAITING_GRASP'
     VACUUM_ON = 'VACUUM_ON'
     VACUUM_OFF = 'VACUUM_OFF'
     DETACHING = 'DETACHING'
     VERIFYING_VACUUM = 'VERIFYING_VACUUM'
     DISABLING_SERVO = 'DISABLING_SERVO'
     STOPPING_LOADING = 'STOPPING_LOADING'
+    SOLVING_TRANSFER_IK = 'SOLVING_TRANSFER_IK'
+    VALIDATING_TRANSFER = 'VALIDATING_TRANSFER'
+    EXECUTING_TRANSFER = 'EXECUTING_TRANSFER'
     PREPARING_RETREAT = 'PREPARING_RETREAT'
     RETREATING = 'RETREATING'
     WAITING_PLACE_STEP_FEEDBACK = 'WAITING_PLACE_STEP_FEEDBACK'
     RESTORING_CONTROL = 'RESTORING_CONTROL'
+    C52_STOPPING = 'C52_STOPPING'
+    RECOVERING_FT = 'RECOVERING_FT'
     SUCCEEDED = 'SUCCEEDED'
     FAULT = 'FAULT'
 
     ACTIVE = {
-        ARMING_DESCENT, DESCENDING, DISABLING_DESCENT, DISABLING_SERVO,
+        ARMING_DESCENT, DESCENDING, DISABLING_DESCENT, AWAITING_GRASP,
+        DISABLING_SERVO,
         VACUUM_ON, VACUUM_OFF, DETACHING, VERIFYING_VACUUM,
         STOPPING_LOADING, PREPARING_RETREAT, RETREATING,
         WAITING_PLACE_STEP_FEEDBACK, RESTORING_CONTROL,
+        SOLVING_TRANSFER_IK, VALIDATING_TRANSFER, EXECUTING_TRANSFER,
+        C52_STOPPING, RECOVERING_FT,
     }
 
     def __init__(self):
@@ -54,6 +68,9 @@ class PickupSupervisor(Node):
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('max_pregrasp_plan_age_sec', 1800.0)
         self.declare_parameter('grasp_offset_m', 0.0)
+        self.declare_parameter('contact_reference_z_m', 0.0)
+        self.declare_parameter('minimum_measured_object_height_m', 0.02)
+        self.declare_parameter('maximum_measured_object_height_m', 0.45)
         self.declare_parameter('contact_search_margin_m', 0.015)
         self.declare_parameter('max_descent_m', 0.15)
         self.declare_parameter('position_tolerance_m', 0.001)
@@ -65,6 +82,9 @@ class PickupSupervisor(Node):
         self.declare_parameter('singularity_place_recovery_timeout_sec', 20.0)
         self.declare_parameter('singularity_place_step_m', 0.003)
         self.declare_parameter('singularity_place_step_speed_mm_s', 10.0)
+        self.declare_parameter('singularity_deceleration_grace_sec', 0.75)
+        self.declare_parameter('singularity_no_progress_sec', 1.0)
+        self.declare_parameter('singularity_min_progress_m', 0.001)
         self.declare_parameter('retreat_timeout_sec', 120.0)
         self.declare_parameter('retreat_speed_mm_s', 30.0)
         self.declare_parameter('retreat_acc_mm_s2', 200.0)
@@ -77,11 +97,15 @@ class PickupSupervisor(Node):
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('joint_state_ready_timeout_sec', 5.0)
         self.declare_parameter('joint_state_ready_samples', 3)
+        self.declare_parameter('post_restore_settle_sec', 0.75)
+        self.declare_parameter('post_restore_ready_samples', 5)
         self.declare_parameter('mode_transition_timeout_sec', 5.0)
         self.declare_parameter('mode_retry_interval_sec', 0.25)
         self.declare_parameter('mode_ready_samples', 3)
         self.declare_parameter('ft_zero_settle_sec', 0.25)
         self.declare_parameter('post_ft_state_settle_sec', 1.25)
+        self.declare_parameter('ft_recovery_settle_sec', 0.5)
+        self.declare_parameter('ft_recovery_max_attempts', 2)
         self.declare_parameter('status_timeout_sec', 1.0)
         self.declare_parameter('vacuum_timeout_sec', 5.0)
         self.declare_parameter('vacuum_hardware_version', 1)
@@ -119,6 +143,22 @@ class PickupSupervisor(Node):
         self.declare_parameter('joint6_moveit_lower_rad', -2.0 * math.pi)
         self.declare_parameter('joint6_moveit_upper_rad', 2.0 * math.pi)
         self.declare_parameter('joint6_limit_margin_rad', 0.02)
+        self.declare_parameter('planning_group', 'uf850')
+        self.declare_parameter('ik_link_name', 'link_tcp')
+        self.declare_parameter(
+            'arm_joint_names', [f'joint{i}' for i in range(1, 7)])
+        self.declare_parameter('direct_transfer_ik_timeout_sec', 2.0)
+        self.declare_parameter('direct_transfer_sample_step_rad', 0.05)
+        self.declare_parameter('direct_transfer_max_joint_delta_rad', 2.6)
+        self.declare_parameter('direct_transfer_joint_acc_rad_s2', 0.7)
+        self.declare_parameter(
+            'direct_transfer_periodic_joint_names',
+            ['joint1', 'joint4', 'joint6'])
+        self.declare_parameter(
+            'direct_transfer_periodic_lower_rad', -2.0 * math.pi)
+        self.declare_parameter(
+            'direct_transfer_periodic_upper_rad', 2.0 * math.pi)
+        self.declare_parameter('direct_transfer_joint_tolerance_rad', 0.03)
 
         def p(name):
             return self.get_parameter(name).value
@@ -126,6 +166,11 @@ class PickupSupervisor(Node):
         self.max_detection_age = float(p('max_detection_age_sec'))
         self.max_pregrasp_plan_age = float(p('max_pregrasp_plan_age_sec'))
         self.grasp_offset = float(p('grasp_offset_m'))
+        self.contact_reference_z = float(p('contact_reference_z_m'))
+        self.minimum_measured_object_height = float(
+            p('minimum_measured_object_height_m'))
+        self.maximum_measured_object_height = float(
+            p('maximum_measured_object_height_m'))
         self.contact_search_margin = float(p('contact_search_margin_m'))
         self.max_descent = float(p('max_descent_m'))
         self.tolerance = float(p('position_tolerance_m'))
@@ -139,6 +184,10 @@ class PickupSupervisor(Node):
         self.singularity_place_step = float(p('singularity_place_step_m'))
         self.singularity_place_step_speed = float(
             p('singularity_place_step_speed_mm_s'))
+        self.singularity_deceleration_grace = float(
+            p('singularity_deceleration_grace_sec'))
+        self.singularity_no_progress = float(p('singularity_no_progress_sec'))
+        self.singularity_min_progress = float(p('singularity_min_progress_m'))
         self.retreat_timeout = float(p('retreat_timeout_sec'))
         self.retreat_speed = float(p('retreat_speed_mm_s'))
         self.retreat_acc = float(p('retreat_acc_mm_s2'))
@@ -149,11 +198,16 @@ class PickupSupervisor(Node):
         self.joint_state_topic = str(p('joint_state_topic'))
         self.joint_state_ready_timeout = float(p('joint_state_ready_timeout_sec'))
         self.joint_state_ready_samples = int(p('joint_state_ready_samples'))
+        self.post_restore_settle = float(p('post_restore_settle_sec'))
+        self.post_restore_ready_samples = int(
+            p('post_restore_ready_samples'))
         self.mode_transition_timeout = float(p('mode_transition_timeout_sec'))
         self.mode_retry_interval = float(p('mode_retry_interval_sec'))
         self.mode_ready_samples = int(p('mode_ready_samples'))
         self.ft_zero_settle = float(p('ft_zero_settle_sec'))
         self.post_ft_state_settle = float(p('post_ft_state_settle_sec'))
+        self.ft_recovery_settle = float(p('ft_recovery_settle_sec'))
+        self.ft_recovery_max_attempts = int(p('ft_recovery_max_attempts'))
         self.status_timeout = float(p('status_timeout_sec'))
         self.vacuum_timeout = float(p('vacuum_timeout_sec'))
         self.vacuum_hardware_version = int(p('vacuum_hardware_version'))
@@ -192,12 +246,33 @@ class PickupSupervisor(Node):
             float(p('joint6_moveit_lower_rad')),
             float(p('joint6_moveit_upper_rad')))
         self.joint6_limit_margin = float(p('joint6_limit_margin_rad'))
+        self.planning_group = str(p('planning_group'))
+        self.ik_link_name = str(p('ik_link_name'))
+        self.arm_joint_names = tuple(map(str, p('arm_joint_names')))
+        self.direct_transfer_ik_timeout = float(
+            p('direct_transfer_ik_timeout_sec'))
+        self.direct_transfer_sample_step = float(
+            p('direct_transfer_sample_step_rad'))
+        self.direct_transfer_max_joint_delta = float(
+            p('direct_transfer_max_joint_delta_rad'))
+        self.direct_transfer_joint_acc = float(
+            p('direct_transfer_joint_acc_rad_s2'))
+        self.direct_transfer_periodic_joint_names = frozenset(
+            map(str, p('direct_transfer_periodic_joint_names')))
+        self.direct_transfer_periodic_limits = (
+            float(p('direct_transfer_periodic_lower_rad')),
+            float(p('direct_transfer_periodic_upper_rad')))
+        self.direct_transfer_joint_tolerance = float(
+            p('direct_transfer_joint_tolerance_rad'))
         if not 0.0 <= self.contact_search_margin <= self.max_descent:
             raise ValueError(
                 'contact_search_margin_m must be within '
                 f'[0, max_descent_m={self.max_descent:.3f}]')
         if self.force_threshold <= 0.0:
             raise ValueError('force_contact_threshold_n must be positive')
+        if not (0.0 < self.minimum_measured_object_height <
+                self.maximum_measured_object_height):
+            raise ValueError('measured object height bounds are invalid')
         if self.place_force_threshold <= 0.0:
             raise ValueError('place_force_contact_threshold_n must be positive')
         if self.force_timeout <= 0.0:
@@ -211,6 +286,10 @@ class PickupSupervisor(Node):
             raise ValueError('joint_state_ready_timeout_sec must be positive')
         if self.joint_state_ready_samples < 1:
             raise ValueError('joint_state_ready_samples must be at least 1')
+        if self.post_restore_settle < 0.5:
+            raise ValueError('post_restore_settle_sec must be at least 0.5')
+        if self.post_restore_ready_samples < 3:
+            raise ValueError('post_restore_ready_samples must be at least 3')
         if self.mode_transition_timeout <= 0.0:
             raise ValueError('mode_transition_timeout_sec must be positive')
         if self.mode_retry_interval <= 0.0:
@@ -227,6 +306,27 @@ class PickupSupervisor(Node):
         if self.singularity_place_step_speed <= 0.0:
             raise ValueError(
                 'singularity_place_step_speed_mm_s must be positive')
+        if (self.singularity_deceleration_grace <= 0.0 or
+                self.singularity_no_progress <= 0.0 or
+                self.singularity_min_progress <= 0.0):
+            raise ValueError('singularity early-detection parameters must be positive')
+        if (len(self.arm_joint_names) != 6 or
+                len(set(self.arm_joint_names)) != 6):
+            raise ValueError('arm_joint_names must contain six unique joints')
+        if (self.direct_transfer_ik_timeout <= 0.0 or
+                self.direct_transfer_sample_step <= 0.0 or
+                self.direct_transfer_max_joint_delta <= 0.0 or
+                self.direct_transfer_joint_acc <= 0.0 or
+                self.direct_transfer_joint_tolerance <= 0.0):
+            raise ValueError('direct-transfer parameters must be positive')
+        if not self.direct_transfer_periodic_joint_names.issubset(
+                self.arm_joint_names):
+            raise ValueError(
+                'direct_transfer_periodic_joint_names must be arm joints')
+        if not (self.direct_transfer_periodic_limits[0] <
+                self.direct_transfer_periodic_limits[1]):
+            raise ValueError(
+                'direct-transfer periodic lower limit must be below upper limit')
         if not self.joint6_limits[0] < self.joint6_limits[1]:
             raise ValueError('joint6 MoveIt lower limit must be below upper limit')
         if not 0.0 <= self.joint6_limit_margin < (
@@ -236,6 +336,10 @@ class PickupSupervisor(Node):
             raise ValueError('ft_zero_settle_sec must be at least 0.2')
         if self.post_ft_state_settle <= 0.0:
             raise ValueError('post_ft_state_settle_sec must be positive')
+        if self.ft_recovery_settle < 0.5:
+            raise ValueError('ft_recovery_settle_sec must be at least 0.5')
+        if self.ft_recovery_max_attempts < 1:
+            raise ValueError('ft_recovery_max_attempts must be at least 1')
         if self.place_workspace_z_min_mm >= self.servo_bounds_mm[5]:
             raise ValueError(
                 'place_workspace_z_min_mm must be below workspace_z_max_mm')
@@ -258,7 +362,16 @@ class PickupSupervisor(Node):
         self.retreat_start_xyz = None
         self.direct_target_z = None
         self.direct_target_pose = None
+        self.direct_target_quaternion = None
+        self.direct_target_joints = None
+        self.direct_transfer_validation_samples = []
+        self.direct_transfer_validation_index = 0
         self.direct_transfer_succeeded = False
+        self.direct_transfer_motion_started = False
+        self.direct_transfer_ik_started = None
+        self.direct_transfer_validation_started = None
+        self.direct_transfer_execution_started = None
+        self.transfer_goal_handle = None
         self.transfer_fallback_reason = ''
         self.place_target_z = None
         self.place_target_xyz = None
@@ -274,6 +387,12 @@ class PickupSupervisor(Node):
         self._vacuum_settle_timer = None
         self.operation_id = 0
         self.contact_detected = False
+        self.probe_only = False
+        self.object_info_obtained = False
+        self.contact_tcp_z = None
+        self.contact_tcp_xyz = None
+        self.corrected_object = None
+        self.active_pickup_snapshot = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.latest_force_z = None
@@ -290,6 +409,9 @@ class PickupSupervisor(Node):
         self.direct_place_force_baseline_z = None
         self.direct_place_step_count = 0
         self.direct_place_step_completed_at = None
+        self.singularity_deceleration_started = None
+        self.singularity_progress_started = None
+        self.singularity_progress_reference_z = None
         self.direct_motion_generation = 0
         self.expected_enable_generation = None
         self.operation_kind = 'pickup'
@@ -303,8 +425,11 @@ class PickupSupervisor(Node):
         self.last_joint_state_time = None
         self.joint_state_sequence = 0
         self.joint6_position = None
+        self.latest_joint_positions = None
         self.restore_wait_sequence = None
         self.restore_wait_deadline = None
+        self.restore_settle_started = None
+        self.restore_settle_ready_count = 0
         self.retreat_controller_wait_deadline = None
         self.retreat_controller_query_pending = False
         self.mode_wait_target = None
@@ -321,6 +446,16 @@ class PickupSupervisor(Node):
         self.robot_state_time = None
         self.robot_tcp_xyz = None
         self.robot_tcp_pose = None
+        self.ft_recovery_required = False
+        self.ft_recovery_reason = ''
+        self.ft_recovery_attempt = 0
+        self.ft_recovery_started = None
+        self.ft_recovery_zeroed_at = None
+        self.ft_recovery_restore_active = False
+        self.ft_recovery_timer = None
+        self.c52_retreat_active = False
+        self.c52_clear_attempts = 0
+        self.c52_tcp_snapshot = None
         self._ft_settle_timer = None
         self._post_ft_state_timer = None
         self.pre_descent_wait_callback = None
@@ -366,6 +501,9 @@ class PickupSupervisor(Node):
             Float64MultiArray, '/motion_speed/config',
             self.motion_speed_config_callback, 10)
         self.create_subscription(
+            Float64MultiArray, '/object_info_estimation/config',
+            self.object_info_config_callback, 10)
+        self.create_subscription(
             Float64MultiArray, '/staging_slots/place_config',
             self.staging_place_config_callback, 10)
         self.create_subscription(
@@ -389,8 +527,19 @@ class PickupSupervisor(Node):
         self.set_state_client = self.create_client(SetInt16, '/ufactory/set_state')
         self.clean_error_client = self.create_client(
             Call, '/ufactory/clean_error')
+        self.clean_warn_client = self.create_client(
+            Call, '/ufactory/clean_warn')
+        self.ft_enable_client = self.create_client(
+            SetInt16, '/ufactory/set_ft_sensor_enable')
         self.retreat_client = self.create_client(
             MoveCartesian, '/ufactory/set_position')
+        self.compute_ik_client = self.create_client(
+            GetPositionIK, '/compute_ik')
+        self.state_validity_client = self.create_client(
+            GetStateValidity, '/check_state_validity')
+        self.transfer_trajectory_client = ActionClient(
+            self, FollowJointTrajectory,
+            f'/{self.trajectory_controller}/follow_joint_trajectory')
         self.controller_switch_client = self.create_client(
             SwitchController, '/controller_manager/switch_controller')
         self.controller_list_client = self.create_client(
@@ -409,12 +558,23 @@ class PickupSupervisor(Node):
             Trigger, '/planning_scene_obstacles/detach_staged_item')
         self.create_service(Trigger, '/pickup_supervisor/start', self.start_callback)
         self.create_service(
+            Trigger, '/pickup_supervisor/start_probe', self.start_probe_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/grasp_at_contact',
+            self.grasp_at_contact_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/clear_object_info',
+            self.clear_object_info_callback)
+        self.create_service(
             Trigger, '/pickup_supervisor/start_place', self.start_place_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_staging_place',
             self.start_staging_place_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_loading', self.start_loading_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/start_joint_transfer',
+            self.start_joint_transfer_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_transfer_fallback',
             self.start_transfer_fallback_callback)
@@ -425,6 +585,9 @@ class PickupSupervisor(Node):
             Trigger, '/pickup_supervisor/retreat', self.retreat_callback)
         self.create_service(Trigger, '/pickup_supervisor/abort', self.abort_callback)
         self.create_service(Trigger, '/pickup_supervisor/reset', self.reset_callback)
+        self.create_service(
+            Trigger, '/pickup_supervisor/recover_ft_sensor',
+            self.recover_ft_sensor_callback)
         self.create_timer(0.05, self.control_tick)
         self.create_timer(0.1, self.retreat_tick)
         self.create_timer(0.5, self.publish_status)
@@ -436,9 +599,33 @@ class PickupSupervisor(Node):
             marker.action == Marker.ADD and marker.header.frame_id == 'link_base'
         }
 
+    def object_info_config_callback(self, message):
+        if not message.data:
+            return
+        value = float(message.data[0])
+        if not math.isfinite(value) or not -0.5 <= value <= 0.5:
+            self.get_logger().warning(
+                'ignored contact-reference Z outside [-0.5, 0.5] m')
+            return
+        if self.state in self.ACTIVE:
+            self.get_logger().warning(
+                'ignored contact-reference Z change during active motion')
+            return
+        self.contact_reference_z = value
+        self.get_logger().info(
+            f'empty-table contact TCP Z set to {value * 1000.0:.1f} mm')
+
     def joint_state_callback(self, message):
         self.last_joint_state_time = time.monotonic()
         self.joint_state_sequence += 1
+        positions = {
+            str(name): float(position)
+            for name, position in zip(message.name, message.position)
+            if math.isfinite(float(position))
+        }
+        if all(name in positions for name in self.arm_joint_names):
+            self.latest_joint_positions = tuple(
+                positions[name] for name in self.arm_joint_names)
         try:
             index = message.name.index(self.joint6_name)
             position = float(message.position[index])
@@ -448,6 +635,7 @@ class PickupSupervisor(Node):
             self.joint6_position = position
 
     def robot_state_callback(self, message):
+        previous_error = self.robot_error
         self.robot_state = int(message.state)
         self.robot_mode = int(message.mode)
         self.robot_error = int(message.err)
@@ -460,6 +648,153 @@ class PickupSupervisor(Node):
             xyz = tuple(float(value) / 1000.0 for value in message.pose[:3])
             if all(math.isfinite(value) for value in xyz):
                 self.robot_tcp_xyz = xyz
+        if self.robot_error == 52 and previous_error != 52:
+            force_age = (
+                None if self.last_force_time is None else
+                time.monotonic() - self.last_force_time)
+            self.get_logger().error(
+                'C52 first reported by xArm telemetry: '
+                f'supervisor_state={self.state}, '
+                f'operation={self.operation_kind}, mode={self.robot_mode}, '
+                f'robot_state={self.robot_state}, tcp_m={self.robot_tcp_xyz}, '
+                f'force_age_sec={force_age}')
+            if self.state in (
+                    self.ARMING_DESCENT, self.DESCENDING,
+                    self.DISABLING_DESCENT):
+                self._begin_c52_interruption()
+            elif self.state not in (
+                    self.RECOVERING_FT, self.C52_STOPPING,
+                    self.PREPARING_RETREAT, self.RETREATING,
+                    self.RESTORING_CONTROL):
+                self.ft_recovery_required = True
+                self.ft_recovery_reason = (
+                    'xArm C52: six-axis force/torque sensor '
+                    'zero-setting error')
+                self._fault(
+                    f'{self.ft_recovery_reason}; automatic motion is blocked '
+                    'until unloaded FT recovery succeeds')
+
+    def _begin_c52_interruption(self):
+        """Stop contact motion and preserve a carried item after xArm C52."""
+        if self.c52_retreat_active or self.state == self.C52_STOPPING:
+            return
+        self.ft_recovery_required = True
+        self.ft_recovery_reason = (
+            'xArm C52: six-axis force/torque sensor zero-setting error')
+        held_item = str(
+            self.planning_scene_status.get('attached_item_id') or '')
+        if not held_item:
+            self._fault(
+                f'{self.ft_recovery_reason}; guarded descent stopped. '
+                'Recover the unloaded FT sensor before another cycle')
+            return
+        if self.direct_target_z is None:
+            self._fault(
+                f'{self.ft_recovery_reason}; the item remains held, but no '
+                'recorded recovery waypoint is available')
+            return
+        self.c52_retreat_active = True
+        self.c52_clear_attempts = 0
+        self.c52_tcp_snapshot = self.robot_tcp_xyz
+        self.state = self.C52_STOPPING
+        self.get_logger().error(
+            f'{self.ft_recovery_reason}; stopping Servo, preserving vacuum, '
+            'and retreating with the item')
+        if not self.enable_client.service_is_ready():
+            self._fault(
+                f'{self.ft_recovery_reason}; safe-servo disable service is '
+                'unavailable and automatic retreat was blocked')
+            return
+        request = SetBool.Request()
+        request.data = False
+        future = self.enable_client.call_async(request)
+        future.add_done_callback(self._c52_servo_stopped)
+        self.publish_status()
+
+    def _c52_servo_stopped(self, future):
+        if self.state != self.C52_STOPPING:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(
+                f'{self.ft_recovery_reason}; failed to stop Servo: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(
+                f'{self.ft_recovery_reason}; Servo stop was not confirmed: '
+                f'{message}')
+            return
+        self._disable_ft_for_c52_retreat()
+
+    def _disable_ft_for_c52_retreat(self):
+        """Clear C52 without zeroing a sensor carrying an attached load."""
+        required_clients = (
+            ('FT enable', self.ft_enable_client),
+            ('clear error', self.clean_error_client),
+            ('clear warning', self.clean_warn_client),
+        )
+        unavailable = [
+            label for label, client in required_clients
+            if not client.service_is_ready()
+        ]
+        if unavailable:
+            self._fault(
+                f'{self.ft_recovery_reason}; emergency retreat services '
+                f'unavailable: {", ".join(unavailable)}. The item remains '
+                'held and automatic motion is blocked')
+            return
+        self.get_logger().warning(
+            'disabling the FT sensor before clearing C52; it will remain '
+            'disabled until unloaded FT recovery is completed')
+        request = SetInt16.Request()
+        request.data = 0
+        future = self.ft_enable_client.call_async(request)
+        future.add_done_callback(self._c52_ft_disabled)
+
+    def _c52_emergency_result(self, future, label):
+        if self.state != self.C52_STOPPING:
+            return False
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(
+                f'{self.ft_recovery_reason}; {label} failed during emergency '
+                f'retreat preparation: {exc}. The item remains held')
+            return False
+        if result is None or result.ret != 0:
+            code = None if result is None else result.ret
+            self._fault(
+                f'{self.ft_recovery_reason}; {label} was rejected during '
+                f'emergency retreat preparation: ret={code}. The item '
+                'remains held')
+            return False
+        return True
+
+    def _c52_ft_disabled(self, future):
+        if not self._c52_emergency_result(future, 'disable FT sensor'):
+            return
+        future = self.clean_error_client.call_async(Call.Request())
+        future.add_done_callback(self._c52_error_cleared)
+
+    def _c52_error_cleared(self, future):
+        if not self._c52_emergency_result(future, 'clear xArm error'):
+            return
+        future = self.clean_warn_client.call_async(Call.Request())
+        future.add_done_callback(self._c52_warning_cleared)
+
+    def _c52_warning_cleared(self, future):
+        if not self._c52_emergency_result(future, 'clear xArm warning'):
+            return
+        # The FT sensor intentionally stays disabled. Re-enabling and zeroing
+        # it while an item is attached would absorb the payload/contact force
+        # into the bias and make subsequent contact detection unsafe.
+        self.c52_clear_attempts = 1
+        self.get_logger().warning(
+            'C52 cleared with the FT sensor disabled; beginning loaded '
+            'retreat and preserving vacuum')
+        self._begin_direct_retreat()
 
     def staging_place_config_callback(self, message):
         if len(message.data) < 3:
@@ -825,6 +1160,33 @@ class PickupSupervisor(Node):
         lower, upper = self._joint6_safe_bounds()
         return lower <= self.joint6_position <= upper
 
+    @staticmethod
+    def _nearest_periodic_equivalent(target, current, lower, upper):
+        """Return the in-range 2*pi equivalent nearest the current joint."""
+        candidates = [
+            target + 2.0 * math.pi * turns
+            for turns in range(-2, 3)
+            if lower <= target + 2.0 * math.pi * turns <= upper
+        ]
+        if not candidates:
+            return target
+        return min(candidates, key=lambda candidate: abs(candidate - current))
+
+    @staticmethod
+    def _wait_for_service(client, timeout_sec):
+        """Wait a bounded time for discovery, including after driver startup."""
+        wait = getattr(client, 'wait_for_service', None)
+        if wait is None:
+            return False
+        try:
+            return bool(wait(timeout_sec=float(timeout_sec)))
+        except (TypeError, RuntimeError):
+            return False
+
+    @staticmethod
+    def _periodic_joint_error(actual, target):
+        return abs((actual - target + math.pi) % (2.0 * math.pi) - math.pi)
+
     def _publish_servo_config(self, touch_mode, bypass_force=False):
         is_place = self.operation_kind == 'place'
         force = (self.place_force_threshold if is_place else
@@ -848,7 +1210,29 @@ class PickupSupervisor(Node):
         ]
         self.config_pub.publish(message)
 
+    def _ft_recovery_blocks_start(self, response):
+        if (getattr(self, 'ft_recovery_required', False) or
+                getattr(self, 'robot_error', None) == 52):
+            self.ft_recovery_required = True
+            if not getattr(self, 'ft_recovery_reason', ''):
+                self.ft_recovery_reason = (
+                    'xArm C52: six-axis force/torque sensor '
+                    'zero-setting error')
+            response.message = (
+                'automatic motion is blocked until unloaded FT sensor '
+                'recovery succeeds')
+            return True
+        return False
+
     def start_callback(self, _request, response):
+        return self._start_pickup_descent(response, probe_only=False)
+
+    def start_probe_callback(self, _request, response):
+        return self._start_pickup_descent(response, probe_only=True)
+
+    def _start_pickup_descent(self, response, probe_only):
+        if self._ft_recovery_blocks_start(response):
+            return response
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
@@ -882,11 +1266,20 @@ class PickupSupervisor(Node):
             return response
         self.operation_id += 1
         self.operation_kind = 'pickup'
+        self.probe_only = bool(probe_only)
+        self.object_info_obtained = False
+        self.contact_tcp_z = None
+        self.contact_tcp_xyz = None
+        self.corrected_object = None
+        self.active_pickup_snapshot = dict(snapshot)
         self.staging_place_active = False
         self.staging_release_tcp_pose = None
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
+        self.direct_target_joints = None
+        self.direct_transfer_validation_samples = []
+        self.direct_transfer_validation_index = 0
         self.direct_transfer_succeeded = False
         self.transfer_fallback_reason = ''
         self.place_fallback_used = False
@@ -897,6 +1290,9 @@ class PickupSupervisor(Node):
         self.direct_place_force_baseline_z = None
         self.direct_place_step_count = 0
         self.direct_place_step_completed_at = None
+        self.singularity_deceleration_started = None
+        self.singularity_progress_started = None
+        self.singularity_progress_reference_z = None
         self.loading_contact_fallback = False
         self.loading_stop_started = None
         self.loading_stop_action = ''
@@ -918,9 +1314,80 @@ class PickupSupervisor(Node):
         self._reset_servo_then_zero_and_descend(snapshot, z, floor_z)
         response.success = True
         response.message = (
-            f"pickup started for box {int(snapshot['box_id'])}: "
+            f"{'object-height probe' if self.probe_only else 'pickup'} "
+            f"started for box {int(snapshot['box_id'])}: "
             f'zeroing FT sensor, then contact descent from Z {z:.3f} m; '
             f'dry_run={self.dry_run}')
+        return response
+
+    def _finalize_contact_object_info(self):
+        if self.active_pickup_snapshot is None:
+            raise ValueError('pre-grasp object snapshot is unavailable')
+        contact_xyz = tuple(map(float, self._tcp_xyz()))
+        contact_z = contact_xyz[2]
+        height = contact_z - self.contact_reference_z
+        if not (self.minimum_measured_object_height <= height <=
+                self.maximum_measured_object_height):
+            raise ValueError(
+                f'contact-derived object height {height * 1000.0:.1f} mm is '
+                f'outside [{self.minimum_measured_object_height * 1000.0:.1f}, '
+                f'{self.maximum_measured_object_height * 1000.0:.1f}] mm')
+        corrected = dict(self.active_pickup_snapshot)
+        corrected['size_z_m'] = height
+        corrected['center_z_m'] = self.contact_reference_z + height / 2.0
+        corrected['top_z_m'] = contact_z
+        corrected['contact_tcp_z_m'] = contact_z
+        corrected['contact_reference_z_m'] = self.contact_reference_z
+        self.active_pickup_snapshot = corrected
+        self.corrected_object = corrected
+        self.contact_tcp_z = contact_z
+        self.contact_tcp_xyz = contact_xyz
+        self.object_info_obtained = True
+        return corrected
+
+    def grasp_at_contact_callback(self, _request, response):
+        if self.state != self.AWAITING_GRASP or not self.object_info_obtained:
+            response.message = (
+                f'object information is not ready at contact; state={self.state}')
+            return response
+        try:
+            current_xyz = tuple(map(float, self._tcp_xyz()))
+            displacement = math.sqrt(sum(
+                (current - measured) ** 2
+                for current, measured in zip(
+                    current_xyz, self.contact_tcp_xyz)))
+            if displacement > self.pregrasp_z_tolerance:
+                raise ValueError(
+                    'TCP moved away from the measured contact pose; estimate '
+                    'object information again')
+            self.direct_target_z = self._pickup_retreat_target_tcp_z(
+                float(self.corrected_object['size_z_m']),
+                float(self.corrected_object['size_x_m']))
+        except ValueError as exc:
+            self.object_info_obtained = False
+            response.message = str(exc)
+            self.publish_status()
+            return response
+        self.probe_only = False
+        self._turn_vacuum_on()
+        response.success = True
+        response.message = 'object information accepted; vacuum pickup started'
+        return response
+
+    def clear_object_info_callback(self, _request, response):
+        if self.state == self.AWAITING_GRASP:
+            response.message = (
+                'cannot clear object information while TCP is at contact; '
+                'abort or pick the object first')
+            return response
+        self.object_info_obtained = False
+        self.contact_tcp_z = None
+        self.contact_tcp_xyz = None
+        self.corrected_object = None
+        self.active_pickup_snapshot = None
+        response.success = True
+        response.message = 'latched object information cleared'
+        self.publish_status()
         return response
 
     def _reset_servo_then_zero_and_descend(self, snapshot, z, floor_z):
@@ -955,6 +1422,8 @@ class PickupSupervisor(Node):
         self._begin_descent(snapshot, z, floor_z)
 
     def start_place_callback(self, _request, response):
+        if self._ft_recovery_blocks_start(response):
+            return response
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
@@ -987,6 +1456,7 @@ class PickupSupervisor(Node):
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
+        self.direct_target_joints = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.direct_place_recovery_active = False
@@ -1029,6 +1499,8 @@ class PickupSupervisor(Node):
         return response
 
     def start_staging_place_callback(self, _request, response):
+        if self._ft_recovery_blocks_start(response):
+            return response
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
@@ -1074,6 +1546,7 @@ class PickupSupervisor(Node):
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
+        self.direct_target_joints = None
         self.direct_target_z = transfer_z
         self.place_fallback_used = False
         self.place_fallback_reason = ''
@@ -1097,7 +1570,345 @@ class PickupSupervisor(Node):
             f'arming from Z {z:.3f} m toward contact Z {contact_z:.3f} m')
         return response
 
+    def start_joint_transfer_callback(self, _request, response):
+        """Validate and execute a direct joint interpolation to transfer."""
+        if self._ft_recovery_blocks_start(response):
+            return response
+        if self.manual_gripper_pending:
+            response.message = 'wait for the pending gripper command'
+            return response
+        if self.state in self.ACTIVE:
+            response.message = f'supervisor already active in {self.state}'
+            return response
+        if (self.motion_status.get('state') != 'PREPARED' or
+                self.motion_status.get('target') != 'transfer'):
+            response.message = 'prepare the transfer target first'
+            return response
+        if not self.pallet_locked:
+            response.message = 'pallet pose is not LOCKED'
+            return response
+        if not self.planning_scene_status.get('attached_item_id'):
+            response.message = 'no carried item is attached in the planning scene'
+            return response
+        if (self.latest_joint_positions is None or
+                self.last_joint_state_time is None or
+                time.monotonic() - self.last_joint_state_time > self.status_timeout):
+            response.message = 'fresh six-axis joint state is unavailable'
+            return response
+        if (not self.compute_ik_client.service_is_ready() and
+                not self._wait_for_service(
+                    self.compute_ik_client,
+                    self.direct_transfer_ik_timeout)):
+            response.message = 'MoveIt compute_ik service is unavailable'
+            return response
+        if not self.state_validity_client.service_is_ready():
+            response.message = 'MoveIt state-validity service is unavailable'
+            return response
+        try:
+            xyz = tuple(map(float, self.motion_status['transfer_tcp_xyz_m']))
+            quaternion = tuple(map(
+                float, self.motion_status['transfer_tcp_quaternion_xyzw']))
+            if len(xyz) != 3 or len(quaternion) != 4:
+                raise ValueError('unexpected target vector length')
+            if not all(math.isfinite(value) for value in (*xyz, *quaternion)):
+                raise ValueError('non-finite target value')
+            rpy = self._rpy_from_quaternion(quaternion)
+        except (KeyError, TypeError, ValueError) as exc:
+            response.message = f'direct joint transfer target is unavailable: {exc}'
+            return response
+        self.operation_id += 1
+        self.operation_kind = 'transfer'
+        self.fault = ''
+        self.post_retreat_fault = ''
+        self.direct_transfer_succeeded = False
+        self.direct_transfer_motion_started = False
+        self.direct_transfer_ik_started = time.monotonic()
+        self.direct_transfer_validation_started = None
+        self.direct_transfer_execution_started = None
+        self.transfer_goal_handle = None
+        self.transfer_fallback_reason = ''
+        self.direct_target_z = xyz[2]
+        self.direct_target_pose = (
+            xyz[0] * 1000.0, xyz[1] * 1000.0, xyz[2] * 1000.0, *rpy)
+        self.direct_target_quaternion = quaternion
+        self.direct_target_joints = None
+        self.direct_transfer_validation_samples = []
+        self.direct_transfer_validation_index = 0
+        self.state = self.SOLVING_TRANSFER_IK
+
+        request = GetPositionIK.Request()
+        ik = request.ik_request
+        ik.group_name = self.planning_group
+        ik.robot_state.joint_state.name = list(self.arm_joint_names)
+        ik.robot_state.joint_state.position = list(map(
+            float, self.latest_joint_positions))
+        ik.robot_state.is_diff = True
+        # Ask MoveIt for a goal state that is already valid in the current
+        # planning scene. The complete interpolated path is checked separately
+        # below before any trajectory is submitted to the controller.
+        ik.avoid_collisions = True
+        ik.ik_link_name = self.ik_link_name
+        ik.pose_stamped = PoseStamped()
+        ik.pose_stamped.header.frame_id = 'link_base'
+        ik.pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        ik.pose_stamped.pose.position.x = xyz[0]
+        ik.pose_stamped.pose.position.y = xyz[1]
+        ik.pose_stamped.pose.position.z = xyz[2]
+        (ik.pose_stamped.pose.orientation.x,
+         ik.pose_stamped.pose.orientation.y,
+         ik.pose_stamped.pose.orientation.z,
+         ik.pose_stamped.pose.orientation.w) = quaternion
+        seconds = max(0.001, self.direct_transfer_ik_timeout)
+        ik.timeout.sec = int(seconds)
+        ik.timeout.nanosec = int((seconds - int(seconds)) * 1e9)
+        future = self.compute_ik_client.call_async(request)
+        future.add_done_callback(self._direct_transfer_ik_completed)
+        response.success = True
+        response.message = (
+            'MoveIt/KDL IK and sampled transfer collision validation started')
+        self.publish_status()
+        return response
+
+    def _direct_transfer_ik_completed(self, future):
+        if self.state != self.SOLVING_TRANSFER_IK:
+            return
+        ik_started = getattr(self, 'direct_transfer_ik_started', None)
+        elapsed = (
+            None if ik_started is None else time.monotonic() - ik_started)
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(
+                f'MoveIt/KDL transfer IK request failed after '
+                f'{elapsed or 0.0:.3f} s: {exc}')
+            return
+        if result is None or result.error_code.val != 1:
+            code = None if result is None else result.error_code.val
+            message = '' if result is None else result.error_code.message
+            suffix = f' ({message})' if message else ''
+            self._fault(
+                f'MoveIt/KDL transfer IK failed after '
+                f'{elapsed or 0.0:.3f} s: code={code}{suffix}')
+            return
+        self.get_logger().info(
+            f'MoveIt/KDL transfer IK solved in {elapsed or 0.0:.3f} s')
+        solution = {
+            str(name): float(position)
+            for name, position in zip(
+                result.solution.joint_state.name,
+                result.solution.joint_state.position)
+        }
+        if not all(name in solution for name in self.arm_joint_names):
+            self._fault('MoveIt/KDL transfer IK omitted one or more arm joints')
+            return
+        start = tuple(self.latest_joint_positions or ())
+        if len(start) != len(self.arm_joint_names):
+            self._fault('direct transfer lost its joint-state seed')
+            return
+        lower, upper = self.direct_transfer_periodic_limits
+        raw_target = tuple(solution[name] for name in self.arm_joint_names)
+        if not all(math.isfinite(value) for value in raw_target):
+            self._fault('MoveIt/KDL transfer IK returned non-finite joint values')
+            return
+        target = tuple(
+            self._nearest_periodic_equivalent(goal, current, lower, upper)
+            if name in self.direct_transfer_periodic_joint_names else goal
+            for name, current, goal in zip(
+                self.arm_joint_names, start, raw_target)
+        )
+        normalized = [
+            f'{name}: {raw:+.3f}->{goal:+.3f}'
+            for name, raw, goal in zip(
+                self.arm_joint_names, raw_target, target)
+            if abs(raw - goal) > 1e-9
+        ]
+        if normalized:
+            self.get_logger().info(
+                'normalized periodic IK joints to nearest equivalents: ' +
+                ', '.join(normalized))
+        max_delta = max(abs(goal - current) for current, goal in zip(start, target))
+        if max_delta > self.direct_transfer_max_joint_delta:
+            self._fault(
+                f'direct transfer joint jump {max_delta:.3f} rad exceeds '
+                f'{self.direct_transfer_max_joint_delta:.3f} rad')
+            return
+        sample_count = max(1, math.ceil(
+            max_delta / self.direct_transfer_sample_step))
+        self.direct_target_joints = target
+        self.direct_transfer_validation_samples = [
+            tuple(current + (goal - current) * index / sample_count
+                  for current, goal in zip(start, target))
+            for index in range(1, sample_count + 1)
+        ]
+        self.direct_transfer_validation_index = 0
+        self.direct_transfer_validation_started = time.monotonic()
+        self.state = self.VALIDATING_TRANSFER
+        self.get_logger().info(
+            f'validating {len(self.direct_transfer_validation_samples)} '
+            'joint-interpolation samples with MoveIt')
+        self._validate_next_direct_transfer_sample()
+
+    def _validate_next_direct_transfer_sample(self):
+        if self.state != self.VALIDATING_TRANSFER:
+            return
+        if (self.direct_transfer_validation_index >=
+                len(self.direct_transfer_validation_samples)):
+            validation_started = getattr(
+                self, 'direct_transfer_validation_started', None)
+            elapsed = (
+                time.monotonic() - validation_started
+                if validation_started is not None else 0.0)
+            self.get_logger().info(
+                'direct transfer interpolation passed '
+                f'{len(self.direct_transfer_validation_samples)} collision '
+                f'checks in {elapsed:.3f} s; sending the validated path to '
+                f'{self.trajectory_controller}')
+            self._send_joint_trajectory_transfer()
+            return
+        request = GetStateValidity.Request()
+        request.group_name = self.planning_group
+        request.robot_state = RobotState()
+        request.robot_state.is_diff = True
+        request.robot_state.joint_state.name = list(self.arm_joint_names)
+        request.robot_state.joint_state.position = list(
+            self.direct_transfer_validation_samples[
+                self.direct_transfer_validation_index])
+        future = self.state_validity_client.call_async(request)
+        future.add_done_callback(self._direct_transfer_sample_validated)
+
+    def _direct_transfer_sample_validated(self, future):
+        if self.state != self.VALIDATING_TRANSFER:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'direct transfer collision validation failed: {exc}')
+            return
+        if result is None or not result.valid:
+            sample = self.direct_transfer_validation_index + 1
+            total = len(self.direct_transfer_validation_samples)
+            self._fault(
+                f'direct transfer interpolation is in collision at sample '
+                f'{sample}/{total}')
+            return
+        self.direct_transfer_validation_index += 1
+        self._validate_next_direct_transfer_sample()
+
+    @staticmethod
+    def _smoothstep5(progress):
+        """Return position, first-, and second-derivative quintic scales."""
+        u = max(0.0, min(1.0, float(progress)))
+        position = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        velocity = 30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4
+        acceleration = 60.0 * u - 180.0 * u**2 + 120.0 * u**3
+        return position, velocity, acceleration
+
+    def _send_joint_trajectory_transfer(self):
+        """Execute the collision-checked joint line through ros2_control."""
+        if self.state != self.VALIDATING_TRANSFER:
+            return
+        if not self.transfer_trajectory_client.server_is_ready() and not (
+                self.transfer_trajectory_client.wait_for_server(
+                    timeout_sec=self.direct_transfer_ik_timeout)):
+            self._fault(
+                f'{self.trajectory_controller} trajectory action is unavailable')
+            return
+        start = tuple(self.latest_joint_positions or ())
+        target = tuple(self.direct_target_joints or ())
+        samples = len(self.direct_transfer_validation_samples)
+        if (len(start) != len(self.arm_joint_names) or
+                len(target) != len(self.arm_joint_names) or samples < 1):
+            self._fault('validated direct-transfer trajectory is unavailable')
+            return
+
+        deltas = tuple(goal - current for current, goal in zip(start, target))
+        max_delta = max(abs(delta) for delta in deltas)
+        max_speed = max(0.05, min(1.0, self.retreat_speed / 100.0))
+        # Quintic smoothstep has peak normalized velocity 1.875 and peak
+        # normalized acceleration about 5.774. Choose a duration that respects
+        # both shared speed-slider velocity and configured acceleration limits.
+        duration = max(
+            0.5,
+            1.875 * max_delta / max_speed,
+            math.sqrt(5.774 * max_delta / self.direct_transfer_joint_acc))
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(self.arm_joint_names)
+        for index in range(1, samples + 1):
+            progress = index / samples
+            position_scale, velocity_scale, acceleration_scale = (
+                self._smoothstep5(progress))
+            point = JointTrajectoryPoint()
+            point.positions = [
+                current + delta * position_scale
+                for current, delta in zip(start, deltas)
+            ]
+            point.velocities = [
+                delta * velocity_scale / duration for delta in deltas
+            ]
+            point.accelerations = [
+                delta * acceleration_scale / (duration * duration)
+                for delta in deltas
+            ]
+            point.time_from_start = Duration(
+                seconds=duration * progress).to_msg()
+            goal.trajectory.points.append(point)
+        goal.goal_time_tolerance = Duration(seconds=2.0).to_msg()
+
+        self.state = self.EXECUTING_TRANSFER
+        self.direct_transfer_execution_started = time.monotonic()
+        self.get_logger().info(
+            f'executing {samples}-point deterministic joint trajectory over '
+            f'{duration:.3f} s (limit {max_speed:.3f} rad/s)')
+        future = self.transfer_trajectory_client.send_goal_async(goal)
+        future.add_done_callback(self._joint_transfer_goal_response)
+        self.publish_status()
+
+    def _joint_transfer_goal_response(self, future):
+        if self.state != self.EXECUTING_TRANSFER:
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self._fault(f'transfer trajectory request failed: {exc}')
+            return
+        if goal_handle is None or not goal_handle.accepted:
+            self._fault(f'{self.trajectory_controller} rejected transfer trajectory')
+            return
+        self.transfer_goal_handle = goal_handle
+        self.direct_transfer_motion_started = True
+        future = goal_handle.get_result_async()
+        future.add_done_callback(self._joint_transfer_result)
+
+    def _joint_transfer_result(self, future):
+        if self.state != self.EXECUTING_TRANSFER:
+            return
+        self.transfer_goal_handle = None
+        try:
+            wrapped = future.result()
+        except Exception as exc:
+            self._fault(f'transfer trajectory execution failed: {exc}')
+            return
+        result = None if wrapped is None else wrapped.result
+        status = None if wrapped is None else wrapped.status
+        error_code = None if result is None else result.error_code
+        if (status != GoalStatus.STATUS_SUCCEEDED or
+                error_code != FollowJointTrajectory.Result.SUCCESSFUL):
+            error_string = '' if result is None else result.error_string
+            suffix = f' ({error_string})' if error_string else ''
+            self._fault(
+                f'transfer trajectory failed: status={status}, '
+                f'code={error_code}{suffix}')
+            return
+        started = self.direct_transfer_execution_started
+        elapsed = 0.0 if started is None else time.monotonic() - started
+        self.get_logger().info(
+            f'deterministic joint transfer completed in {elapsed:.3f} s')
+        self._finish_retreat()
+
     def start_transfer_fallback_callback(self, _request, response):
+        if self._ft_recovery_blocks_start(response):
+            return response
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
@@ -1128,6 +1939,7 @@ class PickupSupervisor(Node):
             self.direct_target_pose = (
                 xyz[0] * 1000.0, xyz[1] * 1000.0, xyz[2] * 1000.0,
                 *rpy)
+            self.direct_target_joints = None
         except (KeyError, TypeError, ValueError) as exc:
             response.message = f'direct transfer target is unavailable: {exc}'
             return response
@@ -1152,6 +1964,8 @@ class PickupSupervisor(Node):
         return response
 
     def start_loading_callback(self, _request, response):
+        if self._ft_recovery_blocks_start(response):
+            return response
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
@@ -1184,6 +1998,7 @@ class PickupSupervisor(Node):
         self.fault = ''
         self.post_retreat_fault = ''
         self.direct_target_pose = None
+        self.direct_target_joints = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.direct_place_recovery_active = False
@@ -1526,7 +2341,7 @@ class PickupSupervisor(Node):
         if self.manual_gripper_pending:
             response.message = 'wait for the pending gripper command'
             return response
-        if self.state in self.ACTIVE:
+        if self.state in self.ACTIVE and self.state != self.AWAITING_GRASP:
             response.message = f'pickup already active in {self.state}'
             return response
         try:
@@ -1534,6 +2349,18 @@ class PickupSupervisor(Node):
         except ValueError as exc:
             response.message = str(exc)
             return response
+        if self.state == self.AWAITING_GRASP:
+            # An estimation-only cycle may discover that Neuromeka has no
+            # stable target. Leave contact without actuating the gripper,
+            # first returning vertically to the recorded pre-grasp height.
+            if self.pregrasp_z is None:
+                response.message = 'recorded pre-grasp height is unavailable'
+                return response
+            self.direct_target_z = float(self.pregrasp_z)
+            self.object_info_obtained = False
+            self.contact_tcp_z = None
+            self.contact_tcp_xyz = None
+            self.corrected_object = None
         self.operation_id += 1
         self.fault = ''
         self.post_retreat_fault = ''
@@ -1564,6 +2391,9 @@ class PickupSupervisor(Node):
             return
         self.state = self.DESCENDING
         self.descent_started = time.monotonic()
+        self.singularity_deceleration_started = None
+        self.singularity_progress_started = None
+        self.singularity_progress_reference_z = None
         self._publish_descent_target()
 
     def _publish_descent_target(self):
@@ -1599,8 +2429,38 @@ class PickupSupervisor(Node):
     @staticmethod
     def _is_servo_singularity_fault(reason):
         normalized = str(reason).lower()
-        return ('moveit servo halted' in normalized and
-                'singular' in normalized)
+        return 'singular' in normalized
+
+    def _place_singularity_requires_fallback(self, current_z, now):
+        """Debounce Servo deceleration and detect lack of vertical progress."""
+        if not self._servo_is_singularity_decelerating():
+            self.singularity_deceleration_started = None
+            self.singularity_progress_started = None
+            self.singularity_progress_reference_z = None
+            return None
+        if getattr(self, 'singularity_deceleration_started', None) is None:
+            self.singularity_deceleration_started = now
+            self.singularity_progress_started = now
+            self.singularity_progress_reference_z = current_z
+            return None
+        reference = getattr(self, 'singularity_progress_reference_z', None)
+        if (reference is None or
+                abs(float(reference) - current_z) >= self.singularity_min_progress):
+            self.singularity_progress_started = now
+            self.singularity_progress_reference_z = current_z
+        deceleration_age = now - self.singularity_deceleration_started
+        progress_age = now - float(
+            getattr(self, 'singularity_progress_started', None) or now)
+        if deceleration_age >= self.singularity_deceleration_grace:
+            return (
+                'MoveIt Servo remained in singularity deceleration for '
+                f'{deceleration_age:.2f} s')
+        if progress_age >= self.singularity_no_progress:
+            return (
+                'MoveIt Servo made less than '
+                f'{self.singularity_min_progress * 1000.0:.1f} mm Z progress '
+                f'for {progress_age:.2f} s near a singularity')
+        return None
 
     def _servo_is_singularity_decelerating(self):
         try:
@@ -1621,11 +2481,10 @@ class PickupSupervisor(Node):
         self.direct_place_force_baseline_z = self.latest_force_z
         self.direct_place_step_count = 0
         self.direct_place_step_completed_at = None
-        # Servo can spend its full descent timeout decelerating near a
-        # singularity. Give the guarded 3 mm recovery its own bounded window
-        # so the first direct step is not already timed out.
-        self.direct_place_deadline = (
-            time.monotonic() + self.singularity_place_recovery_timeout)
+        # Do not start the step deadline until controller handoff is complete.
+        # Starting it here allowed a slow handoff to consume the entire
+        # recovery window and release the item without attempting one step.
+        self.direct_place_deadline = None
         self.get_logger().warning(
             'place Servo reached its singularity recovery condition; '
             'switching to '
@@ -1913,11 +2772,42 @@ class PickupSupervisor(Node):
             return
         if self.operation_kind == 'place':
             self._turn_vacuum_off()
+        elif self.probe_only:
+            try:
+                corrected = self._finalize_contact_object_info()
+            except ValueError as exc:
+                self._fault(f'object information estimation failed: {exc}')
+                return
+            self.state = self.AWAITING_GRASP
+            self.get_logger().info(
+                'object information ready at contact: box=%d, '
+                'size=(%.1f, %.1f, %.1f) mm, center_z=%.1f mm' % (
+                    int(corrected['box_id']),
+                    corrected['size_x_m'] * 1000.0,
+                    corrected['size_y_m'] * 1000.0,
+                    corrected['size_z_m'] * 1000.0,
+                    corrected['center_z_m'] * 1000.0))
+            self.publish_status()
         else:
             self._turn_vacuum_on()
 
     def control_tick(self):
         if self._tick_descent_config():
+            return
+        if self.state == self.AWAITING_GRASP:
+            try:
+                current = tuple(map(float, self._tcp_xyz()))
+                displacement = math.sqrt(sum(
+                    (value - measured) ** 2
+                    for value, measured in zip(
+                        current, self.contact_tcp_xyz)))
+            except (TypeError, ValueError):
+                return
+            if displacement > self.pregrasp_z_tolerance:
+                self.object_info_obtained = False
+                self._fault(
+                    'TCP moved away from the measured object contact pose; '
+                    'object information invalidated')
             return
         if self.state == self.DETACHING:
             if not self.planning_scene_status.get('attached_item_id'):
@@ -1931,6 +2821,9 @@ class PickupSupervisor(Node):
                     'timed out waiting for planning-scene detachment')
             return
         if self.state != self.DESCENDING:
+            return
+        if getattr(self, 'robot_error', None) == 52:
+            self._begin_c52_interruption()
             return
         if self.servo_status.get('state') == 'FAULT' or self.servo_status.get('fault'):
             reason = f"safe-servo fault: {self.servo_status.get('fault', 'unknown')}"
@@ -1962,6 +2855,12 @@ class PickupSupervisor(Node):
                 'stopping descent and triggering vacuum')
             self._handle_contact()
             return
+        if self.operation_kind == 'place':
+            singularity_reason = self._place_singularity_requires_fallback(
+                current_z, time.monotonic())
+            if singularity_reason:
+                self._begin_place_singularity_fallback(singularity_reason)
+                return
         if self.state == self.DESCENDING and current_z <= self.floor_z + self.tolerance:
             self._fault('reached descent floor without contact force')
             return
@@ -2067,10 +2966,16 @@ class PickupSupervisor(Node):
             return
         try:
             self.retreat_start_xyz = self._direct_mode_tcp_xyz()
-            self.retreat_start_z = self.retreat_start_xyz[2]
         except ValueError as exc:
-            self._fault(f'cannot start direct retreat: {exc}')
-            return
+            if (not self.c52_retreat_active or
+                    self.c52_tcp_snapshot is None):
+                self._fault(f'cannot start direct retreat: {exc}')
+                return
+            self.retreat_start_xyz = self.c52_tcp_snapshot
+            self.get_logger().warning(
+                'using the C52-time TCP snapshot because live TCP telemetry '
+                'became stale after the controller stop')
+        self.retreat_start_z = self.retreat_start_xyz[2]
         self.state = self.PREPARING_RETREAT
         self._deactivate_retreat_controllers()
 
@@ -2131,6 +3036,50 @@ class PickupSupervisor(Node):
         self._deactivate_retreat_hardware()
 
     def _deactivate_retreat_hardware(self):
+        if not self.hardware_list_client.service_is_ready():
+            self._fault(
+                'controller_manager hardware-list service is unavailable')
+            return
+        future = self.hardware_list_client.call_async(
+            ListHardwareComponents.Request())
+        future.add_done_callback(self._retreat_hardware_state_received)
+
+    def _retreat_hardware_state_received(self, future):
+        if self.state != self.PREPARING_RETREAT:
+            return
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._fault(
+                f'failed to inspect robot hardware before retreat: {exc}')
+            return
+        component = next((
+            item for item in (response.component if response else [])
+            if item.name == self.hardware_component), None)
+        if component is None:
+            self._fault('robot hardware component is unavailable before retreat')
+            return
+        state_id = int(component.state.id)
+        if state_id in (
+                State.PRIMARY_STATE_INACTIVE,
+                State.PRIMARY_STATE_UNCONFIGURED):
+            if state_id == State.PRIMARY_STATE_UNCONFIGURED:
+                self.get_logger().warning(
+                    'ros2_control hardware is already unconfigured; treating '
+                    'it as released ownership for fault recovery')
+            else:
+                self.get_logger().info(
+                    'ros2_control hardware is already inactive')
+            self._retreat_hardware_is_released()
+            return
+        if state_id != State.PRIMARY_STATE_ACTIVE:
+            self._fault(
+                'robot hardware is in unsupported lifecycle state before '
+                f'retreat: {component.state.label}')
+            return
+        self._request_retreat_hardware_inactive()
+
+    def _request_retreat_hardware_inactive(self):
         if not self.hardware_state_client.service_is_ready():
             self._fault(
                 'controller_manager hardware-state service is unavailable')
@@ -2160,6 +3109,9 @@ class PickupSupervisor(Node):
             return
         self.get_logger().info(
             'ros2_control hardware inactive; Servo-J writes are stopped')
+        self._retreat_hardware_is_released()
+
+    def _retreat_hardware_is_released(self):
         self._begin_mode_wait(
             0, 'direct retreat', self._begin_retreat_ownership_check)
 
@@ -2274,6 +3226,17 @@ class PickupSupervisor(Node):
             self._fault(
                 f'cannot clear xArm C52 before {label}: service unavailable')
             return
+        c52_retreat_active = getattr(self, 'c52_retreat_active', False)
+        if (c52_retreat_active and
+                getattr(self, 'c52_clear_attempts', 0) >= 1):
+            label = self.mode_wait_label
+            self._clear_mode_wait()
+            self._fault(
+                f'xArm C52 persisted after one clear attempt before {label}; '
+                'the item remains held and automatic motion is blocked')
+            return
+        if c52_retreat_active:
+            self.c52_clear_attempts += 1
         self.mode_wait_clear_pending = True
         self.mode_wait_last_command = now
         future = self.clean_error_client.call_async(Call.Request())
@@ -2390,6 +3353,10 @@ class PickupSupervisor(Node):
         self.get_logger().info(
             'ROS controllers inactive; direct xArm service owns the robot')
         if self.direct_place_stepping:
+            # Controller/mode handoff has its own timeout. The guarded-step
+            # budget begins only now, immediately before the first command.
+            self.direct_place_deadline = (
+                time.monotonic() + self.singularity_place_recovery_timeout)
             self._send_direct_place_step()
         else:
             self._send_direct_retreat()
@@ -2472,9 +3439,16 @@ class PickupSupervisor(Node):
                 'non-blocking linear loading command accepted; monitoring '
                 'TCP Z, force, and the 20 s place timeout')
             return
+        elapsed = (
+            0.0 if self.retreat_started is None else
+            time.monotonic() - self.retreat_started)
         self.retreat_started = None
+        motion_type = (
+            'joint motion' if self.operation_kind == 'transfer' and
+            self.direct_target_joints is not None else 'Cartesian motion')
         self.get_logger().info(
-            f'direct {self.operation_kind} Cartesian motion succeeded')
+            f'direct {self.operation_kind} {motion_type} succeeded in '
+            f'{elapsed:.3f} s')
         self._restore_ros2_control_mode()
 
     def _restore_ros2_control_mode(self):
@@ -2693,25 +3667,71 @@ class PickupSupervisor(Node):
         self.restore_wait_sequence = self.joint_state_sequence
         self.restore_wait_deadline = (
             time.monotonic() + self.joint_state_ready_timeout)
+        self.restore_settle_started = None
+        self.restore_settle_ready_count = 0
         self.get_logger().info(
             'controllers restored after retreat; waiting for a new '
             '/joint_states sample before completing the cycle')
 
     def _restore_readiness_tick(self):
+        now = time.monotonic()
+        if self.restore_settle_started is not None:
+            telemetry_fresh = (
+                self.robot_state_time is not None and
+                now - self.robot_state_time <= self.status_timeout)
+            joint_state_fresh = (
+                self.last_joint_state_time is not None and
+                now - self.last_joint_state_time <= 0.25)
+            ready = (
+                telemetry_fresh and joint_state_fresh and
+                self.robot_error == 0 and
+                self.robot_mode == self.ros2_control_mode and
+                self.robot_state is not None and self.robot_state <= 2)
+            if ready:
+                self.restore_settle_ready_count += 1
+            else:
+                self.restore_settle_ready_count = 0
+            if (now - self.restore_settle_started >=
+                    self.post_restore_settle and
+                    self.restore_settle_ready_count >=
+                    self.post_restore_ready_samples):
+                self.restore_settle_started = None
+                self.restore_settle_ready_count = 0
+                self.restore_wait_deadline = None
+                self.get_logger().info(
+                    'post-restore xArm mode, state, error, and joint-state '
+                    'telemetry remained stable; motion may resume')
+                self._finish_retreat()
+                return
+            if (self.restore_wait_deadline is not None and
+                    now >= self.restore_wait_deadline):
+                self.restore_settle_started = None
+                self.restore_settle_ready_count = 0
+                self.restore_wait_deadline = None
+                self._fault(
+                    'ros2_control restored but xArm telemetry did not remain '
+                    f'stable for {self.post_restore_settle:.2f} s; '
+                    f'state={self.robot_state}, mode={self.robot_mode}, '
+                    f'error={self.robot_error}')
+            return
         if self.restore_wait_sequence is None:
             return
         if (self.joint_state_sequence >= (
                 self.restore_wait_sequence + self.joint_state_ready_samples) and
                 self.last_joint_state_time is not None and
-                time.monotonic() - self.last_joint_state_time <= 0.25):
+                now - self.last_joint_state_time <= 0.25):
             self.restore_wait_sequence = None
-            self.restore_wait_deadline = None
+            self.restore_settle_started = now
+            self.restore_settle_ready_count = 0
+            self.restore_wait_deadline = (
+                now + self.post_restore_settle +
+                self.joint_state_ready_timeout)
             self.get_logger().info(
-                'fresh post-retreat /joint_states confirmed')
-            self._finish_retreat()
+                'fresh post-retreat /joint_states confirmed; beginning '
+                f'{self.post_restore_settle:.2f} s stable-state gate')
             return
         if (self.restore_wait_deadline is not None and
-                time.monotonic() >= self.restore_wait_deadline):
+                now >= self.restore_wait_deadline):
             self.restore_wait_sequence = None
             self.restore_wait_deadline = None
             self._fault(
@@ -2723,6 +3743,32 @@ class PickupSupervisor(Node):
             reason = self.post_retreat_fault
             self.post_retreat_fault = ''
             self._fault(reason)
+            return
+        if getattr(self, 'c52_retreat_active', False):
+            self.c52_retreat_active = False
+            self.c52_tcp_snapshot = None
+            self.fault = (
+                f'{self.ft_recovery_reason}; automatic descent was stopped '
+                'and the item was preserved at the recovery waypoint. Remove '
+                'the item, clear its planning-scene attachment, then run '
+                'Recover FT sensor')
+            self.state = self.FAULT
+            self.get_logger().error(self.fault)
+            self.publish_status()
+            return
+        if getattr(self, 'ft_recovery_restore_active', False):
+            self.ft_recovery_restore_active = False
+            self.ft_recovery_required = False
+            self.ft_recovery_reason = ''
+            self.ft_recovery_started = None
+            self.ft_recovery_zeroed_at = None
+            self.ft_recovery_attempt = 0
+            self.state = self.IDLE
+            self.fault = ''
+            self.get_logger().info(
+                'unloaded FT sensor recovery completed; automatic motion is '
+                'available again')
+            self.publish_status()
             return
         if not self.dry_run and not self._joint6_is_moveit_safe():
             lower, upper = self._joint6_safe_bounds()
@@ -2736,25 +3782,59 @@ class PickupSupervisor(Node):
             return
         if self.operation_kind == 'transfer':
             if not self.dry_run:
-                try:
-                    current_xyz = self._direct_mode_tcp_xyz()
-                except ValueError as exc:
-                    self._fault(
-                        f'cannot verify direct transfer target: {exc}')
-                    return
-                target_xyz = tuple(
-                    value / 1000.0 for value in self.direct_target_pose[:3])
-                xy_error = math.hypot(
-                    current_xyz[0] - target_xyz[0],
-                    current_xyz[1] - target_xyz[1])
-                z_error = abs(current_xyz[2] - target_xyz[2])
-                if (xy_error > self.xy_tolerance or
-                        z_error > self.pregrasp_z_tolerance):
-                    self._fault(
-                        'direct transfer service returned success but TCP '
-                        f'target error is too large: xy={xy_error * 1000.0:.1f} '
-                        f'mm, z={z_error * 1000.0:.1f} mm')
-                    return
+                direct_target_joints = getattr(
+                    self, 'direct_target_joints', None)
+                if direct_target_joints is not None:
+                    actual_joints = tuple(self.latest_joint_positions or ())
+                    if len(actual_joints) != len(direct_target_joints):
+                        self._fault(
+                            'cannot verify direct joint transfer: fresh arm '
+                            'joint feedback is unavailable')
+                        return
+                    periodic_names = getattr(
+                        self, 'direct_transfer_periodic_joint_names',
+                        frozenset())
+                    errors = tuple(
+                        self._periodic_joint_error(actual, target)
+                        if name in periodic_names else abs(actual - target)
+                        for name, actual, target in zip(
+                            self.arm_joint_names, actual_joints,
+                            direct_target_joints)
+                    )
+                    max_index = max(range(len(errors)), key=errors.__getitem__)
+                    tolerance = self.direct_transfer_joint_tolerance
+                    if errors[max_index] > tolerance:
+                        self._fault(
+                            'transfer trajectory returned success but '
+                            f'{self.arm_joint_names[max_index]} feedback error '
+                            f'is {errors[max_index]:.3f} rad (limit '
+                            f'{tolerance:.3f} rad)')
+                        return
+                else:
+                    # Retain Cartesian verification for the legacy direct
+                    # set_position fallback. xArm SDK TCP telemetry cannot be
+                    # compared to the MoveIt link_tcp IK target because their
+                    # tool references differ by a fixed offset.
+                    try:
+                        current_xyz = self._direct_mode_tcp_xyz()
+                    except ValueError as exc:
+                        self._fault(
+                            f'cannot verify direct transfer target: {exc}')
+                        return
+                    target_xyz = tuple(
+                        value / 1000.0 for value in self.direct_target_pose[:3])
+                    xy_error = math.hypot(
+                        current_xyz[0] - target_xyz[0],
+                        current_xyz[1] - target_xyz[1])
+                    z_error = abs(current_xyz[2] - target_xyz[2])
+                    if (xy_error > self.xy_tolerance or
+                            z_error > self.pregrasp_z_tolerance):
+                        self._fault(
+                            'direct transfer service returned success but TCP '
+                            f'target error is too large: '
+                            f'xy={xy_error * 1000.0:.1f} mm, '
+                            f'z={z_error * 1000.0:.1f} mm')
+                        return
             self.direct_transfer_succeeded = True
         if self.operation_kind == 'place':
             self.direct_place_recovery_active = False
@@ -2989,12 +4069,18 @@ class PickupSupervisor(Node):
     def _fault(self, reason):
         if self.state == self.FAULT:
             return
+        transfer_goal = getattr(self, 'transfer_goal_handle', None)
+        if transfer_goal is not None:
+            transfer_goal.cancel_goal_async()
+            self.transfer_goal_handle = None
         self.direct_motion_generation += 1
         self.direct_place_stepping = False
         self.fault = reason
         self.state = self.FAULT
         self.restore_wait_sequence = None
         self.restore_wait_deadline = None
+        self.restore_settle_started = None
+        self.restore_settle_ready_count = 0
         self.retreat_controller_wait_deadline = None
         self.retreat_controller_query_pending = False
         self._clear_mode_wait()
@@ -3007,6 +4093,9 @@ class PickupSupervisor(Node):
         if self._post_ft_state_timer is not None:
             self._post_ft_state_timer.cancel()
             self._post_ft_state_timer = None
+        if getattr(self, 'ft_recovery_timer', None) is not None:
+            self.ft_recovery_timer.cancel()
+            self.ft_recovery_timer = None
         request = SetBool.Request()
         request.data = False
         if self.enable_client.service_is_ready():
@@ -3023,16 +4112,200 @@ class PickupSupervisor(Node):
         response.message = 'pickup aborted; Servo disable requested'
         return response
 
+    def recover_ft_sensor_callback(self, _request, response):
+        """Recover and zero the FT sensor only with no attached item."""
+        if self.state in self.ACTIVE:
+            response.message = f'supervisor is active in {self.state}'
+            return response
+        attached_item = str(
+            self.planning_scene_status.get('attached_item_id') or '')
+        if attached_item:
+            response.message = (
+                f'cannot zero FT sensor while {attached_item} is attached; '
+                'remove the physical item and clear its scene attachment first')
+            return response
+        required_clients = (
+            ('FT enable', self.ft_enable_client),
+            ('FT zero', self.ft_zero_client),
+            ('clear error', self.clean_error_client),
+            ('clear warning', self.clean_warn_client),
+        )
+        unavailable = [
+            label for label, client in required_clients
+            if not client.service_is_ready()
+        ]
+        if unavailable:
+            response.message = (
+                'FT recovery services unavailable: ' + ', '.join(unavailable))
+            return response
+        self.ft_recovery_required = True
+        self.ft_recovery_reason = 'manual FT sensor recovery requested'
+        self.ft_recovery_attempt = 0
+        self.ft_recovery_started = time.monotonic()
+        self.ft_recovery_restore_active = False
+        self.post_retreat_fault = ''
+        self.c52_retreat_active = False
+        self.c52_clear_attempts = 0
+        self.c52_tcp_snapshot = None
+        self.state = self.RECOVERING_FT
+        self.fault = ''
+        self._start_ft_recovery_attempt()
+        response.success = True
+        response.message = (
+            'unloaded FT sensor recovery started; robot motion is blocked '
+            'until verification completes')
+        self.publish_status()
+        return response
+
+    def _start_ft_recovery_attempt(self):
+        if self.state != self.RECOVERING_FT:
+            return
+        self.ft_recovery_attempt += 1
+        self.get_logger().info(
+            f'FT recovery attempt {self.ft_recovery_attempt}/'
+            f'{self.ft_recovery_max_attempts}: disabling sensor')
+        request = SetInt16.Request()
+        request.data = 0
+        future = self.ft_enable_client.call_async(request)
+        future.add_done_callback(self._ft_recovery_sensor_disabled)
+
+    def _ft_recovery_result(self, future, label):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._retry_or_latch_ft_recovery(f'{label} failed: {exc}')
+            return False
+        if result is None or result.ret != 0:
+            code = None if result is None else result.ret
+            self._retry_or_latch_ft_recovery(
+                f'{label} rejected: ret={code}')
+            return False
+        return True
+
+    def _ft_recovery_sensor_disabled(self, future):
+        if self.state != self.RECOVERING_FT or not self._ft_recovery_result(
+                future, 'disable FT sensor'):
+            return
+        future = self.clean_error_client.call_async(Call.Request())
+        future.add_done_callback(self._ft_recovery_error_cleared)
+
+    def _ft_recovery_error_cleared(self, future):
+        if self.state != self.RECOVERING_FT or not self._ft_recovery_result(
+                future, 'clear xArm error'):
+            return
+        future = self.clean_warn_client.call_async(Call.Request())
+        future.add_done_callback(self._ft_recovery_warning_cleared)
+
+    def _ft_recovery_warning_cleared(self, future):
+        if self.state != self.RECOVERING_FT or not self._ft_recovery_result(
+                future, 'clear xArm warning'):
+            return
+        request = SetInt16.Request()
+        request.data = 1
+        future = self.ft_enable_client.call_async(request)
+        future.add_done_callback(self._ft_recovery_sensor_enabled)
+
+    def _ft_recovery_sensor_enabled(self, future):
+        if self.state != self.RECOVERING_FT or not self._ft_recovery_result(
+                future, 'enable FT sensor'):
+            return
+        self._schedule_ft_recovery_timer(self._ft_recovery_zero_sensor)
+
+    def _schedule_ft_recovery_timer(self, callback):
+        if self.ft_recovery_timer is not None:
+            self.ft_recovery_timer.cancel()
+        self.ft_recovery_timer = self.create_timer(
+            self.ft_recovery_settle, callback)
+
+    def _ft_recovery_zero_sensor(self):
+        if self.ft_recovery_timer is not None:
+            self.ft_recovery_timer.cancel()
+            self.ft_recovery_timer = None
+        if self.state != self.RECOVERING_FT:
+            return
+        future = self.ft_zero_client.call_async(Call.Request())
+        future.add_done_callback(self._ft_recovery_sensor_zeroed)
+
+    def _ft_recovery_sensor_zeroed(self, future):
+        if self.state != self.RECOVERING_FT or not self._ft_recovery_result(
+                future, 'zero FT sensor'):
+            return
+        self.ft_recovery_zeroed_at = time.monotonic()
+        self._schedule_ft_recovery_timer(self._verify_ft_recovery)
+
+    def _verify_ft_recovery(self):
+        if self.ft_recovery_timer is not None:
+            self.ft_recovery_timer.cancel()
+            self.ft_recovery_timer = None
+        if self.state != self.RECOVERING_FT:
+            return
+        now = time.monotonic()
+        robot_state_fresh = (
+            self.robot_state_time is not None and
+            now - self.robot_state_time <= self.status_timeout)
+        force_fresh = (
+            self.last_force_time is not None and
+            self.last_force_time >= self.ft_recovery_zeroed_at and
+            now - self.last_force_time <= self.force_timeout)
+        if not robot_state_fresh:
+            self._retry_or_latch_ft_recovery(
+                'robot telemetry remained stale after FT zero')
+            return
+        if self.robot_error not in (None, 0):
+            self._retry_or_latch_ft_recovery(
+                f'xArm error {self.robot_error} remained after FT zero')
+            return
+        if not force_fresh:
+            self._retry_or_latch_ft_recovery(
+                'no fresh force sample arrived after FT zero')
+            return
+        self.get_logger().info(
+            'FT sensor zero and fresh force data verified; restoring '
+            'ros2_control')
+        self.ft_recovery_restore_active = True
+        self._restore_ros2_control_mode()
+
+    def _retry_or_latch_ft_recovery(self, reason):
+        if self.state != self.RECOVERING_FT:
+            return
+        self.ft_recovery_reason = reason
+        if self.ft_recovery_attempt < self.ft_recovery_max_attempts:
+            self.get_logger().warning(
+                f'{reason}; retrying unloaded FT recovery')
+            self._schedule_ft_recovery_timer(self._restart_ft_recovery_attempt)
+            return
+        self.ft_recovery_restore_active = False
+        self._fault(
+            f'FT recovery failed after {self.ft_recovery_attempt} attempts: '
+            f'{reason}. Inspect sensor wiring and power before retrying')
+
+    def _restart_ft_recovery_attempt(self):
+        if self.ft_recovery_timer is not None:
+            self.ft_recovery_timer.cancel()
+            self.ft_recovery_timer = None
+        self._start_ft_recovery_attempt()
+
     def reset_callback(self, _request, response):
         if self.state in self.ACTIVE:
             response.message = f'cannot reset active pickup in {self.state}'
+            return response
+        if getattr(self, 'ft_recovery_required', False):
+            response.message = (
+                'FT recovery is required; remove any held item and run '
+                'Recover FT sensor before resetting')
             return response
         self.state = self.IDLE
         self.fault = ''
         self.pregrasp_z = None
         self.direct_target_z = None
         self.direct_target_pose = None
+        self.direct_target_joints = None
+        self.direct_transfer_validation_samples = []
+        self.direct_transfer_validation_index = 0
         self.direct_transfer_succeeded = False
+        self.direct_transfer_motion_started = False
+        self.direct_transfer_execution_started = None
+        self.transfer_goal_handle = None
         self.transfer_fallback_reason = ''
         self.floor_z = None
         self.virtual_z = None
@@ -3040,6 +4313,12 @@ class PickupSupervisor(Node):
         self.vacuum_verified = False
         self.vacuum_verify_count = 0
         self.contact_detected = False
+        self.probe_only = False
+        self.object_info_obtained = False
+        self.contact_tcp_z = None
+        self.contact_tcp_xyz = None
+        self.corrected_object = None
+        self.active_pickup_snapshot = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.direct_place_recovery_active = False
@@ -3048,6 +4327,9 @@ class PickupSupervisor(Node):
         self.direct_place_force_baseline_z = None
         self.direct_place_step_count = 0
         self.direct_place_step_completed_at = None
+        self.singularity_deceleration_started = None
+        self.singularity_progress_started = None
+        self.singularity_progress_reference_z = None
         self.loading_contact_fallback = False
         self.loading_stop_started = None
         self.loading_stop_action = ''
@@ -3064,8 +4346,14 @@ class PickupSupervisor(Node):
         self.retreat_start_z = None
         self.retreat_start_xyz = None
         self.post_retreat_fault = ''
+        self.c52_retreat_active = False
+        self.c52_clear_attempts = 0
+        self.c52_tcp_snapshot = None
+        self.ft_recovery_restore_active = False
         self.restore_wait_sequence = None
         self.restore_wait_deadline = None
+        self.restore_settle_started = None
+        self.restore_settle_ready_count = 0
         self.retreat_controller_wait_deadline = None
         self.retreat_controller_query_pending = False
         self._clear_mode_wait()
@@ -3078,6 +4366,9 @@ class PickupSupervisor(Node):
         if self._post_ft_state_timer is not None:
             self._post_ft_state_timer.cancel()
             self._post_ft_state_timer = None
+        if getattr(self, 'ft_recovery_timer', None) is not None:
+            self.ft_recovery_timer.cancel()
+            self.ft_recovery_timer = None
         response.success = True
         response.message = 'pickup supervisor reset to IDLE'
         return response
@@ -3100,7 +4391,15 @@ class PickupSupervisor(Node):
             'place_descent_timeout_sec': self.place_descent_timeout,
             'singularity_place_recovery_timeout_sec':
                 self.singularity_place_recovery_timeout,
+            'singularity_deceleration_grace_sec':
+                self.singularity_deceleration_grace,
             'contact_detected': self.contact_detected,
+            'probe_only': self.probe_only,
+            'object_info_obtained': self.object_info_obtained,
+            'contact_tcp_z_m': self.contact_tcp_z,
+            'contact_tcp_xyz_m': self.contact_tcp_xyz,
+            'contact_reference_z_m': self.contact_reference_z,
+            'corrected_object': self.corrected_object,
             'place_fallback_used': self.place_fallback_used,
             'place_fallback_reason': self.place_fallback_reason,
             'direct_place_recovery_active': self.direct_place_recovery_active,
@@ -3108,6 +4407,11 @@ class PickupSupervisor(Node):
             'singularity_place_step_mm':
                 self.singularity_place_step * 1000.0,
             'direct_transfer_succeeded': self.direct_transfer_succeeded,
+            'direct_transfer_motion_started': self.direct_transfer_motion_started,
+            'direct_transfer_validation_sample':
+                self.direct_transfer_validation_index,
+            'direct_transfer_validation_total':
+                len(self.direct_transfer_validation_samples),
             'transfer_fallback_reason': self.transfer_fallback_reason,
             'loading_contact_fallback': self.loading_contact_fallback,
             'loading_force_delta_z_n': (
@@ -3129,6 +4433,9 @@ class PickupSupervisor(Node):
             'robot_state': self.robot_state,
             'robot_mode': self.robot_mode,
             'robot_error': self.robot_error,
+            'ft_recovery_required': self.ft_recovery_required,
+            'ft_recovery_reason': self.ft_recovery_reason,
+            'ft_recovery_attempt': self.ft_recovery_attempt,
         }, separators=(',', ':'))
         self.status_pub.publish(message)
 

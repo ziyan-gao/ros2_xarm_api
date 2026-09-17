@@ -14,7 +14,8 @@ The intended cycle is:
 1. Move to the item observation configuration.
 2. Detect the item's pose and dimensions.
 3. Move above the item, descend, and pick it up.
-4. Use MoveIt to transfer the attached item above the pallet and place it.
+4. Use MoveIt to plan and execute the collision-aware transfer above the
+   pallet, then place the item.
 5. Reverse the vertical loading path, then use MoveIt to return to observation.
 
 ## Design principles
@@ -22,10 +23,12 @@ The intended cycle is:
 ### Separate transit and contact control
 
 Use safe servo only for short vertical contact searches near an item or placement
-surface. The automatic cycle uses the UFACTORY Cartesian service only for local
-vertical lift, loading, and retreat segments. Cross-table transfer and return to
-observation use collision-checked MoveIt plans so the planner selects a valid
-joint-space branch and checks the complete swept volume.
+surface. The automatic cycle uses the UFACTORY Cartesian service for local
+vertical lift, loading, and retreat segments. Elevated free-space transfer
+first uses MoveIt/KDL IK followed by collision-checked joint interpolation;
+RRTConnect remains the fallback. Return-to-observation uses normal MoveIt
+planning. The pipeline never executes an unchecked joint interpolation or a
+long Cartesian transfer.
 
 Only one command source may control the robot at a time. Switching between MoveIt trajectory execution and SDK servo mode must be explicit, and the previous motion must be stopped and confirmed complete first.
 
@@ -117,25 +120,18 @@ TCP Z using the pallet pose, measured item height, and configured grasp offset.
 It then retreats vertically to `pick_clearance`. The place-transfer target uses
 the same pallet-frame corner height above the configured pre-place X/Y, making
 the cross-table transfer nominally level.
-After the vertical pickup retreat reaches `pick_clearance`, MoveIt plans and
-executes the collision-checked cross-table motion to `place_transfer`. When
-**Keep EEF perpendicular to pallet** is enabled, the transfer plan also carries
-a path orientation constraint: TCP roll/pitch remain within 3 degrees of the
-downward target orientation while yaw is unrestricted. The downward direction
-is aligned with `link_base` Z: localized pallet yaw is retained, but measured
-pallet roll/pitch is deliberately removed so localization noise cannot make the
-post-pick vertical TCP an invalid constrained-planning start state. A direct
-linear service move then descends vertically to the 30 mm pre-place clearance.
-
-If MoveIt reports a planning failure before transfer execution begins, the
-place pipeline can use a degraded direct-transfer fallback. It hands control
-from `ros2_control` to the xArm driver and sends the already validated transfer
-TCP XYZ/RPY to `/ufactory/set_position` with `motion_type=1` (prefer linear
-motion, then use the controller's joint-space IK). This fallback deliberately
-bypasses MoveIt collision checking. It is never started for a failed or
-partially executed trajectory, and a rejected xArm motion remains a hard fault.
-After the target is reached, `ros2_control` and fresh joint-state feedback are
-restored before linear loading begins.
+After the vertical pickup retreat reaches `pick_clearance`, MoveIt's
+`/compute_ik` service runs the configured KDL solver for the desired
+`link_tcp` pose, seeded with the live joint state and checked against the
+current planning scene. The returned joints are normalized toward the current
+configuration, rejected if the jump is excessive, and sampled at no more than
+0.05 rad intervals using MoveIt's `/check_state_validity`. A valid joint line
+is time-scaled with a smooth quintic profile and sent to
+`/uf850_traj_controller/follow_joint_trajectory` without a controller-mode
+handoff. IK or collision-validation failure before motion falls back to normal
+MoveIt RRTConnect planning; failure after trajectory execution starts faults
+the cycle. The direct Cartesian service is reserved for the short vertical move
+from `place_transfer` to the 30 mm pre-place clearance.
 
 At `pre_place_pose`:
 
@@ -149,17 +145,24 @@ At `pre_place_pose`:
    to `place_transfer`.
 7. Switch back to trajectory control.
 
-If MoveIt Servo reports its specific singularity hard-stop during the guarded
-place descent, the supervisor honors that stop and disables Servo. It then
+After each direct-to-ROS controller handoff, fresh joint states alone are not
+treated as sufficient readiness. The supervisor additionally requires xArm
+mode 1, a motion-ready state, error code zero, and fresh joint telemetry to
+remain valid for `POST_RESTORE_SETTLE_SEC` (0.75 seconds by default) across at
+least five consecutive checks before the next MoveIt trajectory may start.
+
+If MoveIt Servo reports a singularity hard-stop, or remains in singularity
+deceleration for 0.75 seconds during the guarded place descent, the supervisor
+honors that condition and disables Servo. It then
 hands exclusive control to the direct xArm Cartesian service and continues
 downward in synchronous `PLACE_SINGULARITY_STEP_M` increments (3 mm by default,
 at 10 mm/s). After every completed step it reads fresh TCP and Fz telemetry.
 The next step is issued only while contact has not been detected, the configured
 place floor has not been reached, and the separate
 `PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC` recovery window (20 seconds by
-default) has not expired. The recovery window starts when the system changes
-from Servo to direct stepping, so a Servo deceleration timeout cannot consume
-it before the first step. Contact, floor/timeout exhaustion, or stale telemetry
+default) has not expired. Controller/mode handoff has its own timeout; the
+recovery window starts only after direct control is confirmed, immediately
+before the first step. Contact, floor/timeout exhaustion, or stale telemetry
 causes the item to be released and detached, followed by a vertical retreat to the
 recorded `place_transfer` height and a MoveIt return to observation. Thus any
 unobserved contact travel is bounded to one 3 mm step rather than one continuous
@@ -253,6 +256,36 @@ Every state must define:
 - Robot mode/controller ownership.
 
 Any uncertain outcome must transition to a safe stopped fault state rather than continuing the cycle.
+
+### Force/torque controller error C52
+
+The pickup supervisor monitors the xArm controller error field independently
+of Servo status. If C52 (six-axis force/torque sensor zero-setting error)
+appears during guarded descent, Servo is stopped immediately. Descent never
+continues without trustworthy force feedback. When an item is attached and a
+recorded elevated waypoint exists, vacuum remains enabled and the supervisor
+performs the normal exclusive-controller handoff and vertical retreat. The
+emergency path first disables the FT sensor, clears the controller error and
+warning, and leaves the sensor disabled while the loaded retreat runs; it
+never zeroes a sensor carrying an item. The handoff accepts active, inactive,
+or watchdog-unconfigured ros2_control hardware, restores the controllers, and
+then latches the cycle in `FAULT` with the item still attached.
+
+Automatic motion remains blocked while `ft_recovery_required` is true. After
+the operator removes the physical item and clears its planning-scene
+attachment, **Recover FT sensor** performs at most two unloaded recovery
+attempts: disable FT, clear controller error and warning, enable FT, wait 500
+ms, zero FT, wait 500 ms, require zero controller error plus a fresh post-zero
+force sample, and restore ros2_control. Failure remains latched and requires
+checking sensor wiring and power. The recovery service is
+`/pickup_supervisor/recover_ft_sensor`.
+
+The ros2_control Servo-J write watchdog warns above 30 ms. It stops the robot
+only after three consecutive late writes or one write of at least 250 ms. A
+watchdog-generated error 999 is explicitly cleared after a verified hardware
+lifecycle reactivation; genuine SDK return errors remain fatal. This prevents
+a recovered synthetic latency latch from immediately shutting down the
+controller manager.
 
 ## Implementation phases
 
@@ -369,6 +402,63 @@ Implementation and commissioning details:
 - Enable repeated cycles only after all single-cycle fault cases pass.
 
 Completion criterion: multiple supervised cycles finish successfully, and every injected fault produces a safe stop.
+
+## Optional depth-only box measurement
+
+The RViz panel's **Box dimension estimation** section can switch from the
+marker-seeded refinement to **Use depth only (no marker)**. In this mode the
+aligned depth image is projected into `link_base`, cropped to Z = 70--300 mm,
+and cropped in `link_tcp` to X = 50--400 mm and Y = -300--300 mm. A horizontal
+RANSAC plane supplies the top face. Its minimum-area XY rectangle gives the
+box X/Y dimensions, while `top_plane_z - support_z` gives its height. The
+estimated X/Y/Z values and fit percentage appear numerically in the panel and
+as a text marker in RViz.
+
+The bounds and support height are configured by `DEPTH_ONLY_*` values in
+`.env`. In particular, `DEPTH_ONLY_SUPPORT_Z_M` must be the physical table
+surface Z in `link_base`; an error in this value produces the same error in
+the raw box height. `DEPTH_ONLY_HEIGHT_OFFSET_M` is then added to that raw
+height; its default is `-0.02`, so a raw 170 mm estimate is published as
+150 mm. The panel exposes this correction from -30 to +30 mm. The six crop
+bounds can also be adjusted live, in
+millimetres, with sliders in the same RViz panel section. The orange
+**Depth-only Truncated Cloud** display shows exactly which points remain after
+the current crop; slider changes are runtime-only and reset to `.env` values
+when the stack restarts. Depth-only mode assumes one box with a visible,
+approximately horizontal top face inside the TCP-relative region of interest.
+It publishes the result through the existing refined-box topic, so downstream
+item localization uses it while the checkbox is selected.
+
+The panel's **Box stability** line mirrors `/item_localization/status`.
+`DETECTING` shows the number of accepted samples, `UNSTABLE` shows which pose,
+angle, or dimension spread exceeded its tolerance, and only `READY` means the
+configured stable-sample requirement has passed.
+
+### Contact-corrected object information
+
+**Estimate Object Info** uses the existing pickup motion path without enabling
+the vacuum. It first guarantees the saved observation pose (the motion
+coordinator skips execution when the measured joints are already within
+0.02 rad), waits for a stable refined box, moves to the 30 mm pre-grasp, and
+uses safe-servo to touch the top face. At confirmed contact it latches:
+
+```text
+height = contact_tcp_z - empty_table_contact_tcp_z
+center_z = empty_table_contact_tcp_z + height / 2
+```
+
+The depth-derived X/Y center, X/Y dimensions, and yaw are retained. The panel
+shows `OBTAINED` only while the TCP remains at that measured contact pose with
+the vacuum off. The corrected geometry is published on
+`/object_info_estimation/result` and visualized by the **Contact Corrected
+Object** RViz display.
+
+Starting PickAndPlace in this state activates the vacuum immediately and then
+retreats; it does not repeat observation, detection, or descent. Starting it
+without latched information runs this estimation sequence first and continues
+directly into pickup. After the supervised pickup succeeds, the latch and RViz
+estimation marker are cleared. `OBJECT_CONTACT_REFERENCE_Z_M` sets the startup
+reference, and **Empty-table contact Z** adjusts it live in the panel.
 
 ## Safety and validation checklist
 

@@ -1,9 +1,10 @@
 import json
+import math
 import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -16,12 +17,15 @@ class PickupPipeline(Node):
     WAIT_DETECTION = 'WAIT_DETECTION'
     MOVE_PREGRASP = 'MOVE_PREGRASP'
     SERVO_PICKUP = 'SERVO_PICKUP'
+    OBJECT_INFO_READY = 'OBJECT_INFO_READY'
+    RETURN_OBSERVATION = 'RETURN_OBSERVATION'
     SUCCEEDED = 'SUCCEEDED'
     FAULT = 'FAULT'
     ABORTING = 'ABORTING'
 
     ACTIVE = {
-        MOVE_OBSERVATION, WAIT_DETECTION, MOVE_PREGRASP, SERVO_PICKUP, ABORTING,
+        MOVE_OBSERVATION, WAIT_DETECTION, MOVE_PREGRASP, SERVO_PICKUP,
+        RETURN_OBSERVATION, ABORTING,
     }
 
     def __init__(self):
@@ -55,8 +59,15 @@ class PickupPipeline(Node):
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
         self.pregrasp_succeeded_at = None
+        self.estimation_only = False
+        self.grasp_requested = False
+        self.finalized_result_published = False
 
         self.status_pub = self.create_publisher(String, '/pickup_pipeline/status', 10)
+        self.object_info_pub = self.create_publisher(
+            Float64MultiArray, '/object_info_estimation/result', 10)
+        self.object_info_marker_pub = self.create_publisher(
+            MarkerArray, '/object_info_estimation/markers', 10)
         self.create_subscription(
             String, '/motion_coordinator/status', self.motion_status_callback, 10)
         self.create_subscription(
@@ -76,13 +87,25 @@ class PickupPipeline(Node):
         self.reset_motion_client = self.create_client(
             Trigger, '/motion_coordinator/reset')
         self.start_pickup_client = self.create_client(
-            Trigger, '/pickup_supervisor/start')
+            Trigger, '/pickup_supervisor/start_probe')
+        self.grasp_at_contact_client = self.create_client(
+            Trigger, '/pickup_supervisor/grasp_at_contact')
+        self.clear_object_info_client = self.create_client(
+            Trigger, '/pickup_supervisor/clear_object_info')
         self.abort_pickup_client = self.create_client(
             Trigger, '/pickup_supervisor/abort')
+        self.retreat_pickup_client = self.create_client(
+            Trigger, '/pickup_supervisor/retreat')
         self.reset_pickup_client = self.create_client(
             Trigger, '/pickup_supervisor/reset')
 
         self.create_service(Trigger, '/pickup_pipeline/start', self.start_callback)
+        self.create_service(
+            Trigger, '/pickup_pipeline/estimate_object_info',
+            self.estimate_object_info_callback)
+        self.create_service(
+            Trigger, '/pickup_pipeline/discard_object_info',
+            self.discard_object_info_callback)
         self.create_service(Trigger, '/pickup_pipeline/abort', self.abort_callback)
         self.create_service(Trigger, '/pickup_pipeline/reset', self.reset_callback)
         self.create_timer(0.1, self.tick)
@@ -143,10 +166,41 @@ class PickupPipeline(Node):
         return marker
 
     def start_callback(self, _request, response):
+        return self._start(response, estimation_only=False)
+
+    def estimate_object_info_callback(self, _request, response):
+        return self._start(response, estimation_only=True)
+
+    def discard_object_info_callback(self, _request, response):
+        if self.state != self.OBJECT_INFO_READY:
+            response.message = (
+                f'object information is not waiting at contact; state={self.state}')
+            return response
+        if not self.retreat_pickup_client.service_is_ready():
+            response.message = 'pickup retreat service is unavailable'
+            return response
+        self.state = self.RETURN_OBSERVATION
+        self.pending_motion = 'contact_retreat'
+        self.expected_pickup_operation_id = int(
+            self.pickup_status.get('operation_id', 0)) + 1
+        self.phase_started = time.monotonic()
+        future = self.retreat_pickup_client.call_async(Trigger.Request())
+        future.add_done_callback(self._discard_retreat_started)
+        response.success = True
+        response.message = (
+            'object rejected without grasp; retreating and returning to observation')
+        self.publish_status()
+        return response
+
+    def _start(self, response, estimation_only):
         if self.state in self.ACTIVE:
             response.message = f'pickup pipeline already active in {self.state}'
             return response
-        if self.pickup_status.get('state') not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+        supervisor_state = self.pickup_status.get('state')
+        ready_at_contact = (
+            supervisor_state == 'AWAITING_GRASP' and
+            bool(self.pickup_status.get('object_info_obtained')))
+        if supervisor_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT') and not ready_at_contact:
             response.message = (
                 f"pickup supervisor is busy in {self.pickup_status.get('state')}")
             return response
@@ -160,7 +214,34 @@ class PickupPipeline(Node):
 
         self.operation_id += 1
         self.fault = ''
+        self.estimation_only = bool(estimation_only)
+        self.grasp_requested = False
+        self.finalized_result_published = False
         self.stable_detection_count = 0
+        if ready_at_contact:
+            if self.estimation_only:
+                self.state = self.OBJECT_INFO_READY
+                self._publish_finalized_object_info()
+                response.success = True
+                response.message = 'object information is already ready at contact'
+                self.publish_status()
+                return response
+            if not self.grasp_at_contact_client.service_is_ready():
+                response.message = 'grasp-at-contact service is unavailable'
+                return response
+            self.pending_motion = None
+            self.expected_pickup_operation_id = int(
+                self.pickup_status.get('operation_id', 0))
+            self.phase_started = time.monotonic()
+            self.state = self.SERVO_PICKUP
+            self.grasp_requested = True
+            future = self.grasp_at_contact_client.call_async(Trigger.Request())
+            future.add_done_callback(self._grasp_at_contact_completed)
+            response.success = True
+            response.message = 'object information ready; pickup started at contact'
+            self.publish_status()
+            return response
+
         self.pending_motion = 'observation'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
@@ -171,11 +252,34 @@ class PickupPipeline(Node):
         future = self.plan_observation_client.call_async(Trigger.Request())
         future.add_done_callback(self._plan_observation_completed)
         response.success = True
-        response.message = 'pickup pipeline started: moving to observation'
+        response.message = (
+            'object information estimation started: moving to observation'
+            if self.estimation_only else
+            'pickup pipeline started: estimating object information first')
         return response
 
+    def _grasp_at_contact_completed(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._set_fault(f'grasp-at-contact failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._set_fault(f'grasp-at-contact rejected: {message}')
+
+    def _discard_retreat_started(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._set_fault(f'contact retreat start failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._set_fault(f'contact retreat was rejected: {message}')
+
     def _plan_observation_completed(self, future):
-        if self.state != self.MOVE_OBSERVATION:
+        if self.state not in (self.MOVE_OBSERVATION, self.RETURN_OBSERVATION):
             return
         try:
             result = future.result()
@@ -238,6 +342,9 @@ class PickupPipeline(Node):
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
         self.pregrasp_succeeded_at = None
+        self.estimation_only = False
+        self.grasp_requested = False
+        self.finalized_result_published = False
         response.success = True
         response.message = 'pickup pipeline reset to IDLE'
         self.publish_status()
@@ -252,6 +359,57 @@ class PickupPipeline(Node):
             self._tick_move_pregrasp()
         elif self.state == self.SERVO_PICKUP:
             self._tick_servo_pickup()
+        elif self.state == self.RETURN_OBSERVATION:
+            self._tick_return_observation()
+
+    def _tick_return_observation(self):
+        if self._phase_elapsed() > self.motion_timeout:
+            self._set_fault('timed out returning from object-information contact')
+            return
+        if self.pending_motion == 'contact_retreat':
+            pickup_state = self.pickup_status.get('state', 'UNKNOWN')
+            current_operation = int(
+                self.pickup_status.get('operation_id', -1))
+            if (self.expected_pickup_operation_id is None or
+                    current_operation < self.expected_pickup_operation_id):
+                return
+            if pickup_state == 'FAULT':
+                self._set_fault(
+                    self.pickup_status.get('fault', 'contact retreat failed'))
+                return
+            if pickup_state != 'SUCCEEDED':
+                return
+            if not self.plan_observation_client.service_is_ready():
+                self._set_fault('motion coordinator is unavailable')
+                return
+            self.pending_motion = 'discard_observation'
+            self.expected_motion_operation_id = int(
+                self.motion_status.get('operation_id', 0)) + 1
+            future = self.plan_observation_client.call_async(Trigger.Request())
+            future.add_done_callback(self._plan_observation_completed)
+            return
+
+        motion_state = self.motion_status.get('state', 'UNKNOWN')
+        current_operation = int(self.motion_status.get('operation_id', -1))
+        if (self.expected_motion_operation_id is None or
+                current_operation < self.expected_motion_operation_id):
+            return
+        if motion_state == 'FAULT':
+            self._set_fault(
+                self.motion_status.get('fault', 'observation motion failed'))
+            return
+        if (motion_state == 'PLANNED' and
+                self.pending_motion == 'discard_observation'):
+            self._begin_execute('discard_observation')
+            return
+        if (motion_state == 'SUCCEEDED' and
+                self.motion_status.get('target') == 'observation'):
+            self.pending_motion = None
+            if self.clear_object_info_client.service_is_ready():
+                self.clear_object_info_client.call_async(Trigger.Request())
+            self._clear_object_markers()
+            self.state = self.SUCCEEDED
+            self.publish_status()
 
     def _tick_move_observation(self):
         motion_state = self.motion_status.get('state')
@@ -380,10 +538,96 @@ class PickupPipeline(Node):
         if pickup_state == 'FAULT':
             self._set_fault(self.pickup_status.get('fault', 'pickup failed'))
             return
+        if (pickup_state == 'AWAITING_GRASP' and
+                self.pickup_status.get('object_info_obtained')):
+            self._publish_finalized_object_info()
+            if self.estimation_only:
+                self.state = self.OBJECT_INFO_READY
+                self.pending_motion = None
+                self.publish_status()
+                return
+            if not self.grasp_requested:
+                if not self.grasp_at_contact_client.service_is_ready():
+                    self._set_fault('grasp-at-contact service is unavailable')
+                    return
+                self.grasp_requested = True
+                future = self.grasp_at_contact_client.call_async(
+                    Trigger.Request())
+                future.add_done_callback(self._grasp_at_contact_completed)
+            return
         if pickup_state == 'SUCCEEDED':
             self.state = self.SUCCEEDED
             self.pending_motion = None
+            if self.clear_object_info_client.service_is_ready():
+                self.clear_object_info_client.call_async(Trigger.Request())
+            self._clear_object_markers()
             self.publish_status()
+
+    def _publish_finalized_object_info(self):
+        if self.finalized_result_published:
+            return
+        info = self.pickup_status.get('corrected_object')
+        if not isinstance(info, dict):
+            return
+        try:
+            # Dedicated result layout: id, position XYZ, quaternion XYZW,
+            # dimensions XYZ.  Yaw from the depth fit is converted here so
+            # consumers receive the same 11-value geometry layout used by
+            # item localization.
+            yaw = float(info['yaw_rad'])
+            result = Float64MultiArray()
+            result.data = [
+                float(info['box_id']),
+                float(info['x_m']), float(info['y_m']),
+                float(info['center_z_m']),
+                0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0),
+                float(info['size_x_m']), float(info['size_y_m']),
+                float(info['size_z_m']),
+            ]
+        except (KeyError, TypeError, ValueError):
+            self._set_fault('contact-corrected object information is incomplete')
+            return
+        self.object_info_pub.publish(result)
+        markers = MarkerArray()
+        cube = Marker()
+        cube.header.frame_id = 'link_base'
+        cube.header.stamp = self.get_clock().now().to_msg()
+        cube.ns, cube.id = 'contact_corrected_object', int(info['box_id'])
+        cube.type, cube.action = Marker.CUBE, Marker.ADD
+        cube.pose.position.x = float(info['x_m'])
+        cube.pose.position.y = float(info['y_m'])
+        cube.pose.position.z = float(info['center_z_m'])
+        cube.pose.orientation.z = math.sin(yaw / 2.0)
+        cube.pose.orientation.w = math.cos(yaw / 2.0)
+        cube.scale.x = float(info['size_x_m'])
+        cube.scale.y = float(info['size_y_m'])
+        cube.scale.z = float(info['size_z_m'])
+        cube.color.r, cube.color.g, cube.color.b, cube.color.a = (
+            0.15, 1.0, 0.25, 0.65)
+        label = Marker()
+        label.header = cube.header
+        label.ns, label.id = 'contact_corrected_object_label', int(info['box_id'])
+        label.type, label.action = Marker.TEXT_VIEW_FACING, Marker.ADD
+        label.pose.position.x = cube.pose.position.x
+        label.pose.position.y = cube.pose.position.y
+        label.pose.position.z = float(info['top_z_m']) + 0.05
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.035
+        label.color.r = label.color.g = label.color.b = label.color.a = 1.0
+        label.text = 'ID %d: %.0f x %.0f x %.0f mm' % (
+            int(info['box_id']), float(info['size_x_m']) * 1000.0,
+            float(info['size_y_m']) * 1000.0,
+            float(info['size_z_m']) * 1000.0)
+        markers.markers = [cube, label]
+        self.object_info_marker_pub.publish(markers)
+        self.finalized_result_published = True
+
+    def _clear_object_markers(self):
+        markers = MarkerArray()
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.markers = [clear]
+        self.object_info_marker_pub.publish(markers)
 
     def publish_status(self):
         marker = self._fresh_box()
@@ -412,6 +656,10 @@ class PickupPipeline(Node):
             'pregrasp_settling': (
                 self.state == self.MOVE_PREGRASP and
                 self.pregrasp_succeeded_at is not None),
+            'estimation_only': self.estimation_only,
+            'object_info_obtained': bool(
+                self.pickup_status.get('object_info_obtained')),
+            'corrected_object': self.pickup_status.get('corrected_object'),
             'detected_box': box_summary,
         }, separators=(',', ':'))
         self.status_pub.publish(message)

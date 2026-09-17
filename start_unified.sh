@@ -34,6 +34,19 @@ set -u
 : "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
 : "${RANDOM_LOADING_VISUALIZE:=true}"
 : "${RANDOM_LOADING_VISUAL_PORT:=8765}"
+: "${POLICY_LOADING_CHECKPOINT:=/opt/neuromeka_bin_packing/train_outputs/cardboard_xy_random_clearance20/policy_step.pth}"
+: "${POLICY_LOADING_DEVICE:=cpu}"
+: "${POLICY_LOADING_VISUALIZE:=true}"
+: "${POLICY_LOADING_VISUAL_PORT:=8766}"
+: "${DEPTH_ONLY_SUPPORT_Z_M:=0.0}"
+: "${DEPTH_ONLY_HEIGHT_OFFSET_M:=-0.02}"
+: "${OBJECT_CONTACT_REFERENCE_Z_M:=0.0}"
+: "${DEPTH_ONLY_BASE_Z_MIN_M:=0.07}"
+: "${DEPTH_ONLY_BASE_Z_MAX_M:=0.30}"
+: "${DEPTH_ONLY_TCP_X_MIN_M:=0.05}"
+: "${DEPTH_ONLY_TCP_X_MAX_M:=0.40}"
+: "${DEPTH_ONLY_TCP_Y_MIN_M:=-0.30}"
+: "${DEPTH_ONLY_TCP_Y_MAX_M:=0.30}"
 
 if [[ "${XARM_REPORT_TYPE}" != "dev" ]]; then
   echo "FATAL: XARM_REPORT_TYPE must be 'dev' for non-blocking 100 Hz joint feedback." >&2
@@ -118,7 +131,12 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p singularity_place_recovery_timeout_sec:="${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC}" \
     -p singularity_place_step_m:="${PLACE_SINGULARITY_STEP_M}" \
     -p singularity_place_step_speed_mm_s:="${PLACE_SINGULARITY_STEP_SPEED_MM_S}" \
+    -p singularity_deceleration_grace_sec:="${PLACE_SINGULARITY_DECELERATION_GRACE_SEC}" \
+    -p singularity_no_progress_sec:="${PLACE_SINGULARITY_NO_PROGRESS_SEC}" \
+    -p post_restore_settle_sec:="${POST_RESTORE_SETTLE_SEC}" \
+    -p direct_transfer_ik_timeout_sec:="${DIRECT_TRANSFER_IK_TIMEOUT_SEC}" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
+    -p contact_reference_z_m:="${OBJECT_CONTACT_REFERENCE_Z_M}" \
     -p place_workspace_z_min_mm:="${PLACE_WORKSPACE_Z_MIN_MM}"
 start_required "MoveIt Servo and guarded vertical bridge (dry_run=${MOVEIT_SERVO_DRY_RUN}, descent_speed=${SERVO_DESCENT_SPEED_M_S}m/s)" \
   ros2 launch safe_servo_package uf850_moveit_servo.launch.py \
@@ -128,20 +146,40 @@ start_required "MoveIt Servo and guarded vertical bridge (dry_run=${MOVEIT_SERVO
 start_required "ArUco box marker detector" \
   ros2 run box_marker_detection box_marker_detector
 start_required "aligned-depth box geometry refinement" \
-  ros2 run box_marker_detection depth_box_refinement
+  ros2 run box_marker_detection depth_box_refinement --ros-args \
+    -p depth_only_support_z_m:="${DEPTH_ONLY_SUPPORT_Z_M}" \
+    -p depth_only_height_offset_m:="${DEPTH_ONLY_HEIGHT_OFFSET_M}" \
+    -p depth_only_base_z_min_m:="${DEPTH_ONLY_BASE_Z_MIN_M}" \
+    -p depth_only_base_z_max_m:="${DEPTH_ONLY_BASE_Z_MAX_M}" \
+    -p depth_only_tcp_x_min_m:="${DEPTH_ONLY_TCP_X_MIN_M}" \
+    -p depth_only_tcp_x_max_m:="${DEPTH_ONLY_TCP_X_MAX_M}" \
+    -p depth_only_tcp_y_min_m:="${DEPTH_ONLY_TCP_Y_MIN_M}" \
+    -p depth_only_tcp_y_max_m:="${DEPTH_ONLY_TCP_Y_MAX_M}"
 start_required "pallet localization supervisor" \
-  ros2 run safe_servo_visualization pallet_localization
+  ros2 run safe_servo_visualization pallet_localization --ros-args \
+    -p auto_load_saved_pose:=true
 start_required "incoming-item localization supervisor" \
   ros2 run safe_servo_visualization item_localization
 start_required "real-platform random stable-loading coordinator" \
   ros2 run safe_servo_visualization random_stable_loading --ros-args \
     -p container_size_mm:="[450, 550, 450]" \
+    -p packing_height_resolution_mm:=5 \
     -p clearance_mm:="${RANDOM_LOADING_CLEARANCE_MM}" \
     -p candidate_sample_fraction:="${RANDOM_LOADING_SAMPLE_FRACTION}" \
     -p com_bound_ratio:="${RANDOM_LOADING_COM_BOUND_RATIO}" \
     -p auto_start_pick_place:="${RANDOM_LOADING_AUTO_START}" \
     -p visualization_enabled:="${RANDOM_LOADING_VISUALIZE}" \
     -p visualization_port:="${RANDOM_LOADING_VISUAL_PORT}"
+start_required "real-platform learned-policy coordinator (MCTS/A* disabled)" \
+  ros2 run safe_servo_visualization policy_loading --ros-args \
+    -p container_size_mm:="[450, 550, 450]" \
+    -p packing_height_resolution_mm:=5 \
+    -p clearance_mm:=20 \
+    -p checkpoint_path:="${POLICY_LOADING_CHECKPOINT}" \
+    -p policy_device:="${POLICY_LOADING_DEVICE}" \
+    -p auto_start_pick_place:=false \
+    -p visualization_enabled:="${POLICY_LOADING_VISUALIZE}" \
+    -p visualization_port:="${POLICY_LOADING_VISUAL_PORT}"
 
 echo "Unified stack is running; MoveIt is the sole motion owner."
 echo "Direct-SDK safe servo is disabled; guarded descent uses the real MoveIt Servo bridge."

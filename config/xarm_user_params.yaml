@@ -7,3 +7,4 @@ ufactory_driver:
       set_vacuum_gripper: true
       get_vacuum_gripper: true
       set_ft_sensor_zero: true
+      set_ft_sensor_enable: true

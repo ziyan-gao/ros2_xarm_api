@@ -10,8 +10,21 @@ index c2beb4e..55e7e84 100644
 
      joint_state_broadcaster:
        type: joint_state_broadcaster/JointStateBroadcaster
+diff --git a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+index f4817fd..e53dc1a 100644
+--- a/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
++++ b/xarm_controller/include/xarm_controller/hardware/uf_robot_system_hardware.h
+@@ -59,6 +59,8 @@ namespace uf_robot_hardware
+     private:
+         int read_code_;
+         int write_code_;
++        int late_write_streak_ = 0;
++        bool latency_watchdog_latched_ = false;
+
+         std::string robot_ip_;
+
 diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
-index b570b6e..b04ec22 100644
+index b570b6e..56ecda1 100644
 --- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
 +++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
 @@ -7,6 +7,8 @@
@@ -23,7 +36,7 @@ index b570b6e..b04ec22 100644
 
  #define SERVICE_CALL_FAILED 999
  #define SERVICE_IS_PERSISTENT_BUT_INVALID 998
-@@ -383,9 +385,29 @@ namespace uf_robot_hardware
+@@ -383,9 +385,46 @@ namespace uf_robot_hardware
              curr_write_time_ = node_->get_clock()->now();
              if (curr_write_time_.seconds() - prev_write_time_.seconds() > 1 || _check_cmds_is_change(prev_cmds_float_, cmds_float_)) {
                  // RCLCPP_INFO(LOGGER, "[%s] positon: %s", robot_ip_.c_str(), pos_str.c_str());
@@ -38,19 +51,36 @@ index b570b6e..b04ec22 100644
 +                        "[%s] set_servo_angle_j failed (ret=%d); robot STOP requested (ret=%d), aborting controllers",
 +                        robot_ip_.c_str(), cmd_ret, stop_ret);
 +                    write_code_ = cmd_ret;
-+                    return hardware_interface::return_type::ERROR;
-                 }
-+                // A late synchronous SDK write means the trajectory clock is now ahead of
-+                // the last command sent to the robot.  Returning OK would let the next
-+                // cycle jump directly to that future setpoint, producing the observed
-+                // abrupt acceleration.  Stop and latch a hardware error instead.
-+                if (write_latency_ms > 30) {
-+                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
-+                    RCLCPP_ERROR(LOGGER,
-+                        "[%s] Servo-J write latency %ld ms exceeded 30 ms; robot STOP requested (ret=%d), aborting controllers to prevent trajectory catch-up",
-+                        robot_ip_.c_str(), static_cast<long>(write_latency_ms), stop_ret);
-+                    write_code_ = SERVICE_CALL_FAILED;
++                    latency_watchdog_latched_ = false;
 +                    return hardware_interface::return_type::ERROR;
 +                }
++                constexpr long warning_latency_ms = 30;
++                constexpr long emergency_latency_ms = 250;
++                constexpr int consecutive_warning_limit = 3;
++                if (write_latency_ms > warning_latency_ms) {
++                    ++late_write_streak_;
++                    RCLCPP_WARN(LOGGER,
++                        "[%s] Servo-J write latency %ld ms exceeded %ld ms (consecutive late writes: %d/%d)",
++                        robot_ip_.c_str(), static_cast<long>(write_latency_ms),
++                        warning_latency_ms, late_write_streak_, consecutive_warning_limit);
++                } else {
++                    late_write_streak_ = 0;
++                }
++                // A moderate one-off delay is reported without poisoning the
++                // hardware lifecycle. Persistent latency, or one extreme delay,
++                // still stops execution before trajectory catch-up becomes unsafe.
++                if (write_latency_ms >= emergency_latency_ms ||
++                    late_write_streak_ >= consecutive_warning_limit) {
++                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
++                    RCLCPP_ERROR(LOGGER,
++                        "[%s] Servo-J latency watchdog tripped at %ld ms (streak=%d); robot STOP requested (ret=%d), aborting controllers",
++                        robot_ip_.c_str(), static_cast<long>(write_latency_ms),
++                        late_write_streak_, stop_ret);
++                    write_code_ = SERVICE_CALL_FAILED;
++                    latency_watchdog_latched_ = true;
++                    return hardware_interface::return_type::ERROR;
+                 }
                  if (cmd_ret == 0) {
++                    write_code_ = 0;
++                    latency_watchdog_latched_ = false;
                      prev_write_time_ = curr_write_time_;

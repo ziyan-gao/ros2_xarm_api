@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
@@ -18,6 +19,7 @@
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtMath>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/display_context.hpp>
@@ -98,6 +100,116 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   }
   layout->addWidget(tcp_group);
 
+  auto * box_estimation_group = new QGroupBox("Box dimension estimation", this);
+  auto * box_estimation_layout = new QVBoxLayout(box_estimation_group);
+  depth_only_estimation_ = new QCheckBox(
+    "Use depth only (no marker)", box_estimation_group);
+  depth_only_estimation_->setToolTip(
+    "Crop the aligned depth cloud by base height and TCP-relative bounds, "
+    "then fit the horizontal top plane");
+  box_dimensions_label_ = new QLabel(
+    "X: -- mm   Y: -- mm\nZ: -- mm", box_estimation_group);
+  box_dimensions_label_->setWordWrap(true);
+  box_dimensions_label_->setMinimumHeight(44);
+  box_estimation_status_label_ = new QLabel(
+    "Estimator: waiting for depth", box_estimation_group);
+  box_estimation_status_label_->setWordWrap(true);
+  box_estimation_status_label_->setMinimumHeight(44);
+  box_stability_label_ = new QLabel(
+    "Box stability: IDLE", box_estimation_group);
+  box_stability_label_->setWordWrap(true);
+  box_estimation_layout->addWidget(depth_only_estimation_);
+  const char * bound_names[] = {
+    "Base Z min", "Base Z max", "TCP X min",
+    "TCP X max", "TCP Y min", "TCP Y max"};
+  const auto env_millimeters = [](const char * name, int fallback) {
+      bool valid = false;
+      const double meters = QString::fromUtf8(qgetenv(name)).toDouble(&valid);
+      return valid ? qRound(meters * 1000.0) : fallback;
+    };
+  const int bound_defaults[] = {
+    env_millimeters("DEPTH_ONLY_BASE_Z_MIN_M", 70),
+    env_millimeters("DEPTH_ONLY_BASE_Z_MAX_M", 300),
+    env_millimeters("DEPTH_ONLY_TCP_X_MIN_M", 50),
+    env_millimeters("DEPTH_ONLY_TCP_X_MAX_M", 400),
+    env_millimeters("DEPTH_ONLY_TCP_Y_MIN_M", -300),
+    env_millimeters("DEPTH_ONLY_TCP_Y_MAX_M", 300)};
+  const int bound_minimums[] = {-200, -190, -1000, -990, -1000, -1000};
+  const int bound_maximums[] = {500, 700, 1000, 1500, 1000, 1000};
+  for (size_t i = 0; i < depth_only_bounds_.size(); ++i) {
+    auto * row = new QHBoxLayout();
+    auto * name = new QLabel(QString::fromLatin1(bound_names[i]), box_estimation_group);
+    name->setMinimumWidth(82);
+    depth_only_bounds_[i] = new QSlider(Qt::Horizontal, box_estimation_group);
+    depth_only_bounds_[i]->setRange(bound_minimums[i], bound_maximums[i]);
+    depth_only_bounds_[i]->setSingleStep(1);
+    depth_only_bounds_[i]->setPageStep(10);
+    depth_only_bounds_[i]->setValue(bound_defaults[i]);
+    depth_only_bound_labels_[i] = new QLabel(
+      QString("%1 mm").arg(bound_defaults[i]), box_estimation_group);
+    depth_only_bound_labels_[i]->setMinimumWidth(58);
+    row->addWidget(name);
+    row->addWidget(depth_only_bounds_[i], 1);
+    row->addWidget(depth_only_bound_labels_[i]);
+    box_estimation_layout->addLayout(row);
+    connect(depth_only_bounds_[i], &QSlider::valueChanged,
+      this, [this, i](int value) {
+        depth_only_bound_labels_[i]->setText(QString("%1 mm").arg(value));
+        publishDepthOnlyBounds();
+      });
+  }
+  depth_only_height_offset_ = new QSpinBox(box_estimation_group);
+  depth_only_height_offset_->setRange(-30, 30);
+  depth_only_height_offset_->setSingleStep(1);
+  depth_only_height_offset_->setSuffix(" mm");
+  depth_only_height_offset_->setValue(
+    env_millimeters("DEPTH_ONLY_HEIGHT_OFFSET_M", -20));
+  depth_only_height_offset_->setToolTip(
+    "Added to the raw depth height before publishing; "
+    "170 mm with -20 mm becomes 150 mm");
+  auto * height_offset_row = new QHBoxLayout();
+  auto * height_offset_name = new QLabel(
+    "Height dz offset", box_estimation_group);
+  height_offset_name->setMinimumWidth(82);
+  height_offset_row->addWidget(height_offset_name);
+  height_offset_row->addWidget(depth_only_height_offset_, 1);
+  box_estimation_layout->addLayout(height_offset_row);
+  connect(depth_only_height_offset_, qOverload<int>(&QSpinBox::valueChanged),
+    this, [this](int) {publishDepthOnlyBounds();});
+  contact_reference_z_ = new QSpinBox(box_estimation_group);
+  contact_reference_z_->setRange(-500, 500);
+  contact_reference_z_->setSingleStep(1);
+  contact_reference_z_->setSuffix(" mm");
+  contact_reference_z_->setValue(
+    env_millimeters("OBJECT_CONTACT_REFERENCE_Z_M", 0));
+  contact_reference_z_->setToolTip(
+    "TCP Z when the tool touches the empty support surface; measured box "
+    "height is contact TCP Z minus this value");
+  auto * contact_reference_row = new QHBoxLayout();
+  auto * contact_reference_name = new QLabel(
+    "Empty-table contact Z", box_estimation_group);
+  contact_reference_name->setMinimumWidth(82);
+  contact_reference_row->addWidget(contact_reference_name);
+  contact_reference_row->addWidget(contact_reference_z_, 1);
+  box_estimation_layout->addLayout(contact_reference_row);
+  connect(contact_reference_z_, qOverload<int>(&QSpinBox::valueChanged),
+    this, [this](int) {publishObjectInfoConfig();});
+  auto * estimate_object_info = new VisibleTextButton(
+    "Estimate Object Info", box_estimation_group);
+  object_info_state_label_ = new QLabel(
+    "Object info: NOT_OBTAINED", box_estimation_group);
+  object_info_state_label_->setWordWrap(true);
+  box_estimation_layout->addWidget(estimate_object_info);
+  box_estimation_layout->addWidget(object_info_state_label_);
+  connect(estimate_object_info, &QPushButton::clicked,
+    this, &SafeServoPanel::estimateObjectInfo);
+  box_estimation_layout->addWidget(box_dimensions_label_);
+  box_estimation_layout->addWidget(box_estimation_status_label_);
+  box_estimation_layout->addWidget(box_stability_label_);
+  layout->addWidget(box_estimation_group);
+  connect(depth_only_estimation_, &QCheckBox::toggled,
+    this, &SafeServoPanel::setDepthOnlyEstimation);
+
   auto * target_form = new QFormLayout();
   target_form->setRowWrapPolicy(QFormLayout::WrapAllRows);
   target_form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -111,7 +223,7 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   motion_speed_->setRange(5, 100);
   motion_speed_->setSingleStep(5);
   motion_speed_->setPageStep(10);
-  motion_speed_->setValue(30);
+  motion_speed_->setValue(80);
   motion_speed_->setToolTip(
     "Controls MoveIt and direct robot-service motion. Safe-servo speed is unchanged.");
   motion_speed_label_ = new QLabel("30% (30 mm/s service, 9% MoveIt)", this);
@@ -195,16 +307,24 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   auto * close_gripper = new VisibleTextButton("Close gripper", this);
   auto * clear_obstacles = new VisibleTextButton("Clear placed obstacles", this);
   auto * clear_picked_item = new VisibleTextButton("Clear picked item", this);
+  auto * recover_ft_sensor = new VisibleTextButton("Recover FT sensor", this);
   clear_picked_item->setToolTip(
     "Remove only the attached item from the MoveIt planning scene; "
     "do not command or open the physical gripper");
+  recover_ft_sensor->setToolTip(
+    "Disable, clear, enable, and zero the force/torque sensor. "
+    "Use only with no item held and no external tool contact.");
   manual_layout->addWidget(open_gripper);
   manual_layout->addWidget(close_gripper);
   manual_layout->addWidget(clear_obstacles);
   manual_layout->addWidget(clear_picked_item);
+  manual_layout->addWidget(recover_ft_sensor);
   manual_operations_label_ = new QLabel("Manual controls: ready", this);
   manual_operations_label_->setWordWrap(true);
   manual_layout->addWidget(manual_operations_label_);
+  ft_recovery_label_ = new QLabel("FT sensor: ready", this);
+  ft_recovery_label_->setWordWrap(true);
+  manual_layout->addWidget(ft_recovery_label_);
   layout->addWidget(manual_group);
   connect(open_gripper, &QPushButton::clicked,
     this, &SafeServoPanel::openGripper);
@@ -214,6 +334,8 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
     this, &SafeServoPanel::clearPlacedObstacles);
   connect(clear_picked_item, &QPushButton::clicked,
     this, &SafeServoPanel::clearPickedItem);
+  connect(recover_ft_sensor, &QPushButton::clicked,
+    this, &SafeServoPanel::recoverFtSensor);
 
   auto * staging_group = new QGroupBox("Unpacking staging slots", this);
   auto * staging_layout = new QVBoxLayout(staging_group);
@@ -307,7 +429,7 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   com_bound_ratio_->setRange(1, 100);
   com_bound_ratio_->setSingleStep(1);
   com_bound_ratio_->setPageStep(5);
-  com_bound_ratio_->setValue(20);
+  com_bound_ratio_->setValue(30);
   com_bound_ratio_->setToolTip(
     "Central fraction of the real item XY footprint that must be fully "
     "contained by the support hull. Larger values are more conservative.");
@@ -360,6 +482,57 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   });
   connect(continuous_random_loading_, &QCheckBox::toggled,
     this, &SafeServoPanel::setContinuousRandomLoading);
+
+  auto * policy_loading_group = new QGroupBox("Learned policy loading", this);
+  auto * policy_loading_layout = new QVBoxLayout(policy_loading_group);
+  continuous_policy_loading_ = new QCheckBox(
+    "Continue with the next detected item", this);
+  policy_repack_planning_ = new QCheckBox(
+    "Enable repack planning (backend not implemented)", this);
+  policy_add_placed_item_obstacle_ = new QCheckBox(
+    "Register placed items as static obstacles", this);
+  policy_add_placed_item_obstacle_->setChecked(true);
+  continuous_policy_loading_->setToolTip(
+    "After a successful policy PickAndPlace, estimate and load the next item");
+  policy_repack_planning_->setToolTip(
+    "UI placeholder only. Checking this does not enable MCTS, A*, unpacking, "
+    "or repacking in the current policy-only test stage.");
+  policy_add_placed_item_obstacle_->setToolTip(
+    "After release, register the placed item as a MoveIt collision object");
+  policy_loading_layout->addWidget(continuous_policy_loading_);
+  policy_loading_layout->addWidget(policy_repack_planning_);
+  policy_loading_layout->addWidget(policy_add_placed_item_obstacle_);
+  auto * start_policy_loading = new VisibleTextButton("Policy loading", this);
+  auto * plan_policy_loading = new VisibleTextButton("Plan target only", this);
+  auto * abort_policy_loading = new VisibleTextButton("Abort", this);
+  auto * reset_policy_loading = new VisibleTextButton("Reset", this);
+  start_policy_loading->setToolTip(
+    "Estimate object information, evaluate the learned policy, and run PickAndPlace");
+  plan_policy_loading->setToolTip(
+    "Estimate object information and publish the policy target without grasping");
+  abort_policy_loading->setToolTip(
+    "Stop the active policy cycle and discard its uncommitted target");
+  reset_policy_loading->setToolTip(
+    "Clear the policy virtual pallet and its Three.js scene");
+  policy_loading_layout->addWidget(start_policy_loading);
+  policy_loading_layout->addWidget(plan_policy_loading);
+  policy_loading_layout->addWidget(abort_policy_loading);
+  policy_loading_layout->addWidget(reset_policy_loading);
+  policy_loading_state_label_ = new QLabel(
+    "Learned policy loading: unavailable", this);
+  policy_loading_state_label_->setWordWrap(true);
+  policy_loading_layout->addWidget(policy_loading_state_label_);
+  layout->addWidget(policy_loading_group);
+  connect(start_policy_loading, &QPushButton::clicked,
+    this, &SafeServoPanel::startPolicyLoading);
+  connect(plan_policy_loading, &QPushButton::clicked,
+    this, &SafeServoPanel::planPolicyLoading);
+  connect(abort_policy_loading, &QPushButton::clicked,
+    this, &SafeServoPanel::abortPolicyLoading);
+  connect(reset_policy_loading, &QPushButton::clicked,
+    this, &SafeServoPanel::resetPolicyLoading);
+  connect(continuous_policy_loading_, &QCheckBox::toggled,
+    this, &SafeServoPanel::setContinuousPolicyLoading);
 
   auto * pickup_group = new QGroupBox("PickAndPlace cycle", this);
   auto * pickup_layout = new QVBoxLayout(pickup_group);
@@ -429,13 +602,25 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   connect(random_add_placed_item_obstacle_, &QCheckBox::toggled,
     this, [this](bool enabled) {
       const QSignalBlocker blocker(add_placed_item_obstacle_);
+      const QSignalBlocker policy_blocker(policy_add_placed_item_obstacle_);
       add_placed_item_obstacle_->setChecked(enabled);
+      policy_add_placed_item_obstacle_->setChecked(enabled);
+      applyPalletConfig();
+    });
+  connect(policy_add_placed_item_obstacle_, &QCheckBox::toggled,
+    this, [this](bool enabled) {
+      const QSignalBlocker place_blocker(add_placed_item_obstacle_);
+      const QSignalBlocker random_blocker(random_add_placed_item_obstacle_);
+      add_placed_item_obstacle_->setChecked(enabled);
+      random_add_placed_item_obstacle_->setChecked(enabled);
       applyPalletConfig();
     });
   connect(add_placed_item_obstacle_, &QCheckBox::toggled,
     this, [this](bool enabled) {
       const QSignalBlocker blocker(random_add_placed_item_obstacle_);
+      const QSignalBlocker policy_blocker(policy_add_placed_item_obstacle_);
       random_add_placed_item_obstacle_->setChecked(enabled);
+      policy_add_placed_item_obstacle_->setChecked(enabled);
       applyPalletConfig();
     });
 
@@ -475,6 +660,83 @@ void SafeServoPanel::onInitialize()
           QString::fromLatin1(names[i]) + QStringLiteral(": ") + text);
       }
     });
+  depth_only_estimation_client_ =
+    node_->create_client<std_srvs::srv::SetBool>(
+    "/pointcloud_detection/set_depth_only");
+  depth_only_bounds_pub_ =
+    node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/pointcloud_detection/depth_only_bounds", 10);
+  object_info_config_pub_ =
+    node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+    "/object_info_estimation/config", 10);
+  estimate_object_info_client_ =
+    node_->create_client<std_srvs::srv::Trigger>(
+    "/pickup_pipeline/estimate_object_info");
+  object_info_status_sub_ =
+    node_->create_subscription<std_msgs::msg::String>(
+    "/pickup_pipeline/status", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      const auto json = QJsonDocument::fromJson(
+        QByteArray::fromStdString(msg->data)).object();
+      const bool obtained = json.value("object_info_obtained").toBool(false);
+      QString text = QString("Object info: %1 (%2)")
+        .arg(obtained ? "OBTAINED" : "NOT_OBTAINED")
+        .arg(json.value("state").toString("UNKNOWN"));
+      const auto object = json.value("corrected_object").toObject();
+      if (!object.isEmpty()) {
+        text += QString("\nSize: %1 x %2 x %3 mm")
+          .arg(object.value("size_x_m").toDouble() * 1000.0, 0, 'f', 1)
+          .arg(object.value("size_y_m").toDouble() * 1000.0, 0, 'f', 1)
+          .arg(object.value("size_z_m").toDouble() * 1000.0, 0, 'f', 1);
+      }
+      object_info_state_label_->setText(text);
+    });
+  box_diagnostics_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/pointcloud_detection/diagnostics", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      const auto reports = QJsonDocument::fromJson(
+        QByteArray::fromStdString(msg->data)).array();
+      QJsonObject selected;
+      const QString requested_method = depth_only_estimation_->isChecked() ?
+        "depth_only" : "marker_seeded";
+      for (const auto & value : reports) {
+        const auto report = value.toObject();
+        if (report.value("method").toString() == requested_method) {
+          selected = report;
+          if (report.value("state").toString() == "READY") {break;}
+        }
+      }
+      if (selected.isEmpty() || selected.value("state").toString() != "READY") {
+        // Depth frames can briefly contain too few usable points. Retain the
+        // last valid status instead of alternating READY/NO_BOX every frame.
+        return;
+      }
+      const auto dimensions = selected.value("estimated_dimensions_m").toArray();
+      if (dimensions.size() < 3) {return;}
+      box_dimensions_label_->setText(
+        QString("X: %1 mm   Y: %2 mm\nZ: %3 mm")
+        .arg(dimensions[0].toDouble() * 1000.0, 0, 'f', 1)
+        .arg(dimensions[1].toDouble() * 1000.0, 0, 'f', 1)
+        .arg(dimensions[2].toDouble() * 1000.0, 0, 'f', 1));
+      QString status = QString("Estimator: %1, fit %2%")
+        .arg(requested_method == "depth_only" ? "depth only" : "marker seeded")
+        .arg(selected.value("confidence").toDouble() * 100.0, 0, 'f', 1);
+      if (requested_method == "depth_only") {
+        status += QString("\nRaw Z: %1 mm, dz: %2 mm")
+          .arg(selected.value("raw_height_m").toDouble() * 1000.0, 0, 'f', 1)
+          .arg(selected.value("height_offset_m").toDouble() * 1000.0, 0, 'f', 1);
+      } else {
+        status += "\nMeasurement ready";
+      }
+      box_estimation_status_label_->setText(status);
+    });
+  item_localization_status_sub_ =
+    node_->create_subscription<std_msgs::msg::String>(
+    "/item_localization/status", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      box_stability_label_->setText(
+        QString("Box stability: %1").arg(QString::fromStdString(msg->data)));
+    });
   pallet_config_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>(
     "/pallet_localization/config", 10);
   pallet_start_client_ = node_->create_client<std_srvs::srv::Trigger>(
@@ -513,8 +775,10 @@ void SafeServoPanel::onInitialize()
         const bool enabled = msg->data[14] > 0.5;
         const QSignalBlocker place_blocker(add_placed_item_obstacle_);
         const QSignalBlocker random_blocker(random_add_placed_item_obstacle_);
+        const QSignalBlocker policy_blocker(policy_add_placed_item_obstacle_);
         add_placed_item_obstacle_->setChecked(enabled);
         random_add_placed_item_obstacle_->setChecked(enabled);
+        policy_add_placed_item_obstacle_->setChecked(enabled);
       }
     });
   planning_scene_status_sub_ =
@@ -525,18 +789,45 @@ void SafeServoPanel::onInitialize()
         QByteArray::fromStdString(msg->data)).object();
       const bool enabled = json.value("add_placed_item_obstacle").toBool(true);
       const int count = json.value("placed_item_count").toInt(0);
+      const int visual_count =
+        json.value("placed_item_visual_count").toInt(count);
       const QSignalBlocker place_blocker(add_placed_item_obstacle_);
       const QSignalBlocker random_blocker(random_add_placed_item_obstacle_);
+      const QSignalBlocker policy_blocker(policy_add_placed_item_obstacle_);
       add_placed_item_obstacle_->setChecked(enabled);
       random_add_placed_item_obstacle_->setChecked(enabled);
+      policy_add_placed_item_obstacle_->setChecked(enabled);
       placed_obstacles_label_->setText(
-        QString("Placed obstacles: %1, registered: %2")
-        .arg(enabled ? "enabled" : "disabled").arg(count));
+        QString("Placed items: visualized %1, collision obstacles %2 (%3)")
+        .arg(visual_count).arg(count)
+        .arg(enabled ? "enabled" : "disabled"));
     });
   clear_placed_obstacles_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/planning_scene_obstacles/clear_placed_items");
   clear_picked_item_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/planning_scene_obstacles/clear_picked_item");
+  recover_ft_sensor_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/pickup_supervisor/recover_ft_sensor");
+  pickup_supervisor_status_sub_ =
+    node_->create_subscription<std_msgs::msg::String>(
+    "/pickup_supervisor/status", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      const auto json = QJsonDocument::fromJson(
+        QByteArray::fromStdString(msg->data)).object();
+      const auto state = json.value("state").toString();
+      const bool required = json.value("ft_recovery_required").toBool(false);
+      const auto reason = json.value("ft_recovery_reason").toString();
+      const int attempt = json.value("ft_recovery_attempt").toInt(0);
+      if (state == "RECOVERING_FT") {
+        ft_recovery_label_->setText(
+          QString("FT sensor: recovering (attempt %1)").arg(attempt));
+      } else if (required) {
+        ft_recovery_label_->setText(
+          QString("FT sensor: RECOVERY REQUIRED - %1").arg(reason));
+      } else {
+        ft_recovery_label_->setText("FT sensor: ready");
+      }
+    });
   set_gripper_client_ = node_->create_client<std_srvs::srv::SetBool>(
     "/pickup_supervisor/set_gripper");
   save_observation_client_ = node_->create_client<std_srvs::srv::Trigger>(
@@ -622,6 +913,62 @@ void SafeServoPanel::onInitialize()
       }
       random_loading_state_label_->setText(text);
     });
+  start_policy_loading_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/policy_loading/start");
+  plan_policy_loading_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/policy_loading/plan");
+  abort_policy_loading_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/policy_loading/abort");
+  reset_policy_loading_client_ = node_->create_client<std_srvs::srv::Trigger>(
+    "/policy_loading/reset_pallet");
+  continuous_policy_loading_client_ =
+    node_->create_client<std_srvs::srv::SetBool>(
+    "/policy_loading/set_continuous");
+  policy_loading_status_sub_ =
+    node_->create_subscription<std_msgs::msg::String>(
+    "/policy_loading/status", 10,
+    [this](const std_msgs::msg::String::SharedPtr msg) {
+      const auto json = QJsonDocument::fromJson(
+        QByteArray::fromStdString(msg->data)).object();
+      QString text = QString("Learned policy loading: %1")
+        .arg(json.value("state").toString("UNKNOWN"));
+      if (json.contains("continuous_loading_enabled")) {
+        const bool enabled =
+          json.value("continuous_loading_enabled").toBool(false);
+        const QSignalBlocker blocker(continuous_policy_loading_);
+        continuous_policy_loading_->setChecked(enabled);
+        text += QString("\nContinuous: %1%2")
+          .arg(enabled ? "enabled" : "disabled")
+          .arg(json.value("continuous_run_active").toBool(false) ?
+            " (running)" : "");
+      }
+      if (json.contains("policy_action_index")) {
+        text += QString("\nAction/EMS: %1/%2, value: %3")
+          .arg(json.value("policy_action_index").toInt())
+          .arg(json.value("policy_ems_index").toInt())
+          .arg(json.value("policy_predicted_value").toDouble(), 0, 'f', 4);
+      }
+      const auto corner = json.value("target_corner_mm").toArray();
+      if (corner.size() >= 3) {
+        text += QString("\nTarget corner: (%1, %2, %3) mm")
+          .arg(corner.at(0).toDouble(), 0, 'f', 0)
+          .arg(corner.at(1).toDouble(), 0, 'f', 0)
+          .arg(corner.at(2).toDouble(), 0, 'f', 0);
+      }
+      if (policy_repack_planning_->isChecked()) {
+        text += "\nRepack planning: UI only (backend disabled)";
+      } else {
+        text += "\nRepack planning: disabled";
+      }
+      const auto fault = json.value("fault").toString();
+      const auto result = json.value("last_result").toString();
+      if (!fault.isEmpty()) {
+        text += QString("\n%1").arg(fault);
+      } else if (!result.isEmpty()) {
+        text += QString("\n%1").arg(result);
+      }
+      policy_loading_state_label_->setText(text);
+    });
   start_place_client_ = node_->create_client<std_srvs::srv::Trigger>(
     "/place_pipeline/start");
   abort_place_client_ = node_->create_client<std_srvs::srv::Trigger>(
@@ -698,6 +1045,59 @@ void SafeServoPanel::publishRandomLoadingConfig()
   std_msgs::msg::Float64MultiArray msg;
   msg.data.push_back(static_cast<double>(com_bound_ratio_->value()) / 100.0);
   random_loading_config_pub_->publish(msg);
+}
+
+void SafeServoPanel::publishDepthOnlyBounds()
+{
+  if (!depth_only_bounds_pub_) {return;}
+  const int z_min = depth_only_bounds_[0]->value();
+  const int z_max = depth_only_bounds_[1]->value();
+  const int x_min = depth_only_bounds_[2]->value();
+  const int x_max = depth_only_bounds_[3]->value();
+  const int y_min = depth_only_bounds_[4]->value();
+  const int y_max = depth_only_bounds_[5]->value();
+  if (z_min >= z_max || x_min >= x_max || y_min >= y_max) {
+    box_estimation_status_label_->setText(
+      "Invalid crop: every minimum must be below its maximum");
+    return;
+  }
+  std_msgs::msg::Float64MultiArray message;
+  message.data = {
+    z_min / 1000.0, z_max / 1000.0,
+    x_min / 1000.0, x_max / 1000.0,
+    y_min / 1000.0, y_max / 1000.0,
+    depth_only_height_offset_->value() / 1000.0};
+  depth_only_bounds_pub_->publish(message);
+}
+
+void SafeServoPanel::publishObjectInfoConfig()
+{
+  if (!object_info_config_pub_) {return;}
+  std_msgs::msg::Float64MultiArray message;
+  message.data = {contact_reference_z_->value() / 1000.0};
+  object_info_config_pub_->publish(message);
+}
+
+void SafeServoPanel::estimateObjectInfo()
+{
+  if (!estimate_object_info_client_ ||
+    !estimate_object_info_client_->service_is_ready())
+  {
+    object_info_state_label_->setText("Object-info estimator unavailable");
+    return;
+  }
+  publishConfig();
+  publishMotionSpeed();
+  publishDepthOnlyBounds();
+  publishObjectInfoConfig();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    estimate_object_info_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      object_info_state_label_->setText(
+        QString::fromStdString(future.get()->message));
+    });
+  });
 }
 
 void SafeServoPanel::resetFault()
@@ -811,6 +1211,30 @@ void SafeServoPanel::clearPickedItem()
   clear_picked_item_client_->async_send_request(request, [this](
     rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
     manual_operations_label_->setText(QString::fromStdString(future.get()->message));
+  });
+}
+
+void SafeServoPanel::recoverFtSensor()
+{
+  const auto answer = QMessageBox::question(
+    this,
+    "Recover force/torque sensor",
+    "Confirm that the gripper holds no item and the tool is not touching "
+    "anything. The sensor will be disabled, enabled, and zeroed.",
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (answer != QMessageBox::Yes) {
+    return;
+  }
+  if (!recover_ft_sensor_client_->service_is_ready()) {
+    manual_operations_label_->setText("FT recovery service unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  recover_ft_sensor_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+    manual_operations_label_->setText(
+      QString::fromStdString(future.get()->message));
   });
 }
 
@@ -943,6 +1367,7 @@ void SafeServoPanel::startPickup()
   }
   publishConfig();
   publishMotionSpeed();
+  publishObjectInfoConfig();
   applyPalletConfig();
   QTimer::singleShot(100, this, [this, client]() {
     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
@@ -1043,6 +1468,32 @@ void SafeServoPanel::startRandomLoading()
   });
 }
 
+void SafeServoPanel::setDepthOnlyEstimation(bool enabled)
+{
+  if (!depth_only_estimation_client_ ||
+    !depth_only_estimation_client_->service_is_ready())
+  {
+    box_estimation_status_label_->setText(
+      "Estimator mode service unavailable");
+    const QSignalBlocker blocker(depth_only_estimation_);
+    depth_only_estimation_->setChecked(!enabled);
+    return;
+  }
+  publishDepthOnlyBounds();
+  auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+  request->data = enabled;
+  depth_only_estimation_client_->async_send_request(request, [this, enabled](
+    rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+    const auto response = future.get();
+    if (!response->success) {
+      const QSignalBlocker blocker(depth_only_estimation_);
+      depth_only_estimation_->setChecked(!enabled);
+    }
+    box_estimation_status_label_->setText(
+      QString::fromStdString(response->message));
+  });
+}
+
 void SafeServoPanel::setContinuousRandomLoading(bool enabled)
 {
   if (!continuous_random_loading_client_ ||
@@ -1099,6 +1550,112 @@ void SafeServoPanel::resetRandomLoading()
   reset_random_loading_client_->async_send_request(request, [this](
     rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
     random_loading_state_label_->setText(
+      QString::fromStdString(future.get()->message));
+  });
+}
+
+void SafeServoPanel::startPolicyLoading()
+{
+  if (!start_policy_loading_client_ ||
+    !start_policy_loading_client_->service_is_ready())
+  {
+    policy_loading_state_label_->setText(
+      "Learned policy loading service unavailable");
+    return;
+  }
+  publishConfig();
+  publishMotionSpeed();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    start_policy_loading_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      policy_loading_state_label_->setText(
+        QString::fromStdString(future.get()->message));
+    });
+  });
+}
+
+void SafeServoPanel::planPolicyLoading()
+{
+  if (!plan_policy_loading_client_ ||
+    !plan_policy_loading_client_->service_is_ready())
+  {
+    policy_loading_state_label_->setText(
+      "Policy target-planning service unavailable");
+    return;
+  }
+  publishConfig();
+  publishMotionSpeed();
+  QTimer::singleShot(100, this, [this]() {
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    plan_policy_loading_client_->async_send_request(request, [this](
+      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      policy_loading_state_label_->setText(
+        QString::fromStdString(future.get()->message));
+    });
+  });
+}
+
+void SafeServoPanel::setContinuousPolicyLoading(bool enabled)
+{
+  if (!continuous_policy_loading_client_ ||
+    !continuous_policy_loading_client_->service_is_ready())
+  {
+    policy_loading_state_label_->setText(
+      "Continuous policy-loading service unavailable");
+    const QSignalBlocker blocker(continuous_policy_loading_);
+    continuous_policy_loading_->setChecked(!enabled);
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+  request->data = enabled;
+  continuous_policy_loading_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+    policy_loading_state_label_->setText(
+      QString::fromStdString(future.get()->message));
+  });
+}
+
+void SafeServoPanel::abortPolicyLoading()
+{
+  if (!abort_policy_loading_client_ ||
+    !abort_policy_loading_client_->service_is_ready())
+  {
+    policy_loading_state_label_->setText(
+      "Learned policy loading abort service unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  abort_policy_loading_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+    policy_loading_state_label_->setText(
+      QString::fromStdString(future.get()->message));
+  });
+}
+
+void SafeServoPanel::resetPolicyLoading()
+{
+  const auto answer = QMessageBox::question(
+    this,
+    "Reset learned policy loading",
+    "Clear the policy virtual pallet and Three.js scene?\n\n"
+    "Only continue when the physical pallet is empty.",
+    QMessageBox::Yes | QMessageBox::No,
+    QMessageBox::No);
+  if (answer != QMessageBox::Yes) {
+    return;
+  }
+  if (!reset_policy_loading_client_ ||
+    !reset_policy_loading_client_->service_is_ready())
+  {
+    policy_loading_state_label_->setText(
+      "Learned policy loading reset service unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  reset_policy_loading_client_->async_send_request(request, [this](
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+    policy_loading_state_label_->setText(
       QString::fromStdString(future.get()->message));
   });
 }

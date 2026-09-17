@@ -71,8 +71,11 @@ class PalletLocalization(Node):
         super().__init__('pallet_localization')
         self.base_frame = 'link_base'
         self.declare_parameter('pre_place_clearance_m', 0.03)
+        self.declare_parameter('auto_load_saved_pose', True)
         self.pre_place_clearance = max(
             0.0, float(self.get_parameter('pre_place_clearance_m').value))
+        self.auto_load_saved_pose = bool(
+            self.get_parameter('auto_load_saved_pose').value)
         self.marker_id = 49
         self.required_samples = 30
         self.position_tolerance = 0.005
@@ -126,10 +129,21 @@ class PalletLocalization(Node):
         self.create_service(
             Trigger, '/pallet_localization/clear', self.clear_callback)
         self._load_config()
+        if self.auto_load_saved_pose and self.configured_pose_valid:
+            self.preview = (
+                self.configured_position.copy(), self.configured_q.copy())
+            self.locked = True
         self.create_timer(1.0 / 30.0, self.sample_marker)
         self.create_timer(1.0, self.publish_config_state)
         self.create_timer(1.0, self.republish_status)
-        self.publish_status('UNLOCALIZED')
+        if self.locked:
+            self.publish_preview('pallet_frame')
+            self.publish_status('LOCKED')
+            self.get_logger().info(
+                f'automatically loaded and locked saved pallet pose from '
+                f'{self.config_path}')
+        else:
+            self.publish_status('UNLOCALIZED')
 
     def config_callback(self, msg):
         if len(msg.data) < 13:
