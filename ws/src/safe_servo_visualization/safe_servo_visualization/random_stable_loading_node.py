@@ -268,7 +268,7 @@ class RandomStableLoadingNode(Node):
         self.last_result = ''
         self.target_acknowledged = False
         self.planning_future = self.planning_worker.submit(
-            self.loader.plan,
+            self._plan_item,
             item_id=item_id,
             dimensions_mm=dimensions_mm,
         )
@@ -420,6 +420,15 @@ class RandomStableLoadingNode(Node):
         if self.abort_requested:
             self._finish_abort()
             return
+        self._accept_planning_result(pending)
+
+    def _plan_item(self, *, item_id, dimensions_mm):
+        return self.loader.plan(
+            item_id=item_id,
+            dimensions_mm=dimensions_mm,
+        )
+
+    def _accept_planning_result(self, pending):
         self.state = 'WAITING_TARGET_ACK'
         self._publish_target(pending)
         self._log_pending(pending)

@@ -122,3 +122,28 @@ def test_tcp_settle_requires_three_new_converged_servo_samples():
 
     staging.servo_status_sequence = 13
     assert staging._settle_tcp(snapshot, 'test pose')
+
+
+def test_chained_store_finishes_at_raised_waypoint_without_observation():
+    staging = object.__new__(StagingSlots)
+    staging.return_to_observation = False
+    staging.pickup_status = {
+        'release_tcp_pose_mm_rad': [100.0, 200.0, 80.0, math.pi, 0.0, 0.0],
+        'place_fallback_reason': '',
+    }
+    staging.scene_status = {'placed_item_ids': ['placed_item_12']}
+    staging.placed_ids_before_store = set()
+    staging.pending_record = {'slot': 2, 'item_id': 'held_item'}
+    staging.expected_store_place_operation_id = 7
+    staging.occupied = {}
+    staging.operation = 'store'
+    staging.active_slot = 2
+    staging.publish_status = lambda: None
+    staging._begin_observation = lambda: pytest.fail(
+        'chained store must not plan observation')
+
+    staging._complete_safe_servo_store()
+
+    assert staging.state == StagingSlots.SUCCEEDED
+    assert staging.last_result == 'store completed for slot 2'
+    assert staging.occupied[2]['placed_obstacle_id'] == 'placed_item_12'

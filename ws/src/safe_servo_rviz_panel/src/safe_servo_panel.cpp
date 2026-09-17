@@ -488,19 +488,27 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   continuous_policy_loading_ = new QCheckBox(
     "Continue with the next detected item", this);
   policy_repack_planning_ = new QCheckBox(
-    "Enable repack planning (backend not implemented)", this);
+    "Enable MCTS + A* unpack/repack planning", this);
+  policy_simulation_ = new QCheckBox(
+    "Automatic simulation (cardboard; no robot commands)", this);
   policy_add_placed_item_obstacle_ = new QCheckBox(
     "Register placed items as static obstacles", this);
   policy_add_placed_item_obstacle_->setChecked(true);
   continuous_policy_loading_->setToolTip(
     "After a successful policy PickAndPlace, estimate and load the next item");
   policy_repack_planning_->setToolTip(
-    "UI placeholder only. Checking this does not enable MCTS, A*, unpacking, "
-    "or repacking in the current policy-only test stage.");
+    "When a direct policy placement is blocked, plan and execute a transactional "
+    "pack/unpack/repack sequence using the six staging slots.");
+  policy_simulation_->setToolTip(
+    "Automatically sample cardboard items, solve fixed-descent "
+    "pack/unpack/repack trajectories with MoveIt, and animate them in RViz "
+    "without execution, gripper, Servo, controller-switch, or force-sensor "
+    "commands. Enable continuous loading to keep sampling.");
   policy_add_placed_item_obstacle_->setToolTip(
     "After release, register the placed item as a MoveIt collision object");
   policy_loading_layout->addWidget(continuous_policy_loading_);
   policy_loading_layout->addWidget(policy_repack_planning_);
+  policy_loading_layout->addWidget(policy_simulation_);
   policy_loading_layout->addWidget(policy_add_placed_item_obstacle_);
   auto * start_policy_loading = new VisibleTextButton("Policy loading", this);
   auto * plan_policy_loading = new VisibleTextButton("Plan target only", this);
@@ -533,6 +541,49 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
     this, &SafeServoPanel::resetPolicyLoading);
   connect(continuous_policy_loading_, &QCheckBox::toggled,
     this, &SafeServoPanel::setContinuousPolicyLoading);
+  connect(policy_repack_planning_, &QCheckBox::toggled, this,
+    [this](bool enabled) {
+      if (!policy_rearrangement_client_ ||
+        !policy_rearrangement_client_->service_is_ready())
+      {
+        policy_loading_state_label_->setText(
+          "MCTS/A* configuration service unavailable");
+        const QSignalBlocker blocker(policy_repack_planning_);
+        policy_repack_planning_->setChecked(!enabled);
+        return;
+      }
+      auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+      request->data = enabled;
+      policy_rearrangement_client_->async_send_request(request, [this](
+        rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        policy_loading_state_label_->setText(
+          QString::fromStdString(future.get()->message));
+      });
+    });
+  connect(policy_simulation_, &QCheckBox::toggled, this,
+    [this](bool enabled) {
+      if (!policy_simulation_client_ ||
+        !policy_simulation_client_->service_is_ready())
+      {
+        policy_loading_state_label_->setText(
+          "Policy simulation service unavailable");
+        const QSignalBlocker blocker(policy_simulation_);
+        policy_simulation_->setChecked(!enabled);
+        return;
+      }
+      auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+      request->data = enabled;
+      policy_simulation_client_->async_send_request(request, [this](
+        rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        const auto result = future.get();
+        if (!result->success) {
+          const QSignalBlocker blocker(policy_simulation_);
+          policy_simulation_->setChecked(!policy_simulation_->isChecked());
+        }
+        policy_loading_state_label_->setText(
+          QString::fromStdString(result->message));
+      });
+    });
 
   auto * pickup_group = new QGroupBox("PickAndPlace cycle", this);
   auto * pickup_layout = new QVBoxLayout(pickup_group);
@@ -924,6 +975,12 @@ void SafeServoPanel::onInitialize()
   continuous_policy_loading_client_ =
     node_->create_client<std_srvs::srv::SetBool>(
     "/policy_loading/set_continuous");
+  policy_rearrangement_client_ =
+    node_->create_client<std_srvs::srv::SetBool>(
+    "/policy_loading/set_rearrangement");
+  policy_simulation_client_ =
+    node_->create_client<std_srvs::srv::SetBool>(
+    "/policy_loading/set_simulation");
   policy_loading_status_sub_ =
     node_->create_subscription<std_msgs::msg::String>(
     "/policy_loading/status", 10,
@@ -948,6 +1005,34 @@ void SafeServoPanel::onInitialize()
           .arg(json.value("policy_ems_index").toInt())
           .arg(json.value("policy_predicted_value").toDouble(), 0, 'f', 4);
       }
+      if (json.contains("rearrangement_enabled")) {
+        const bool enabled = json.value("rearrangement_enabled").toBool(false);
+        const QSignalBlocker blocker(policy_repack_planning_);
+        policy_repack_planning_->setChecked(enabled);
+      }
+      if (json.contains("simulation_enabled")) {
+        const bool enabled = json.value("simulation_enabled").toBool(false);
+        const QSignalBlocker blocker(policy_simulation_);
+        policy_simulation_->setChecked(enabled);
+        text += QString("\nSimulation: %1")
+          .arg(enabled ? "enabled (robot commands blocked)" : "disabled");
+        if (json.contains("simulation_fixed_descent_mm")) {
+          text += QString(", fixed descent %1 mm")
+            .arg(json.value("simulation_fixed_descent_mm").toDouble(),
+              0, 'f', 0);
+        }
+        if (enabled && json.contains("simulation_sample_count")) {
+          text += QString("\nAutomatic item source: cardboard, sampled: %1")
+            .arg(json.value("simulation_sample_count").toInt());
+        }
+      }
+      if (json.contains("operation_kind")) {
+        text += QString("\nOperation %1/%2: %3 from %4")
+          .arg(json.value("operation_number").toInt())
+          .arg(json.value("operation_count").toInt())
+          .arg(json.value("operation_kind").toString())
+          .arg(json.value("operation_source").toString());
+      }
       const auto corner = json.value("target_corner_mm").toArray();
       if (corner.size() >= 3) {
         text += QString("\nTarget corner: (%1, %2, %3) mm")
@@ -955,11 +1040,9 @@ void SafeServoPanel::onInitialize()
           .arg(corner.at(1).toDouble(), 0, 'f', 0)
           .arg(corner.at(2).toDouble(), 0, 'f', 0);
       }
-      if (policy_repack_planning_->isChecked()) {
-        text += "\nRepack planning: UI only (backend disabled)";
-      } else {
-        text += "\nRepack planning: disabled";
-      }
+      text += policy_repack_planning_->isChecked() ?
+        "\nRepack planning: MCTS + A* enabled" :
+        "\nRepack planning: disabled";
       const auto fault = json.value("fault").toString();
       const auto result = json.value("last_result").toString();
       if (!fault.isEmpty()) {

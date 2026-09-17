@@ -2,11 +2,11 @@ import json
 import math
 import time
 
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
 from controller_manager_msgs.srv import (
     ListControllers, ListHardwareComponents, SetHardwareComponentState,
     SwitchController)
-from action_msgs.msg import GoalStatus
-from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped, WrenchStamped
 from lifecycle_msgs.msg import State
 from moveit_msgs.msg import RobotState, ServoStatus
@@ -76,6 +76,8 @@ class PickupSupervisor(Node):
         self.declare_parameter('position_tolerance_m', 0.001)
         self.declare_parameter('xy_tolerance_m', 0.015)
         self.declare_parameter('pregrasp_z_tolerance_m', 0.015)
+        self.declare_parameter(
+            'retrieval_pregrasp_above_tolerance_m', 0.050)
         self.declare_parameter('minimum_contact_descent_m', 0.005)
         self.declare_parameter('descent_timeout_sec', 30.0)
         self.declare_parameter('place_descent_timeout_sec', 20.0)
@@ -149,7 +151,7 @@ class PickupSupervisor(Node):
             'arm_joint_names', [f'joint{i}' for i in range(1, 7)])
         self.declare_parameter('direct_transfer_ik_timeout_sec', 2.0)
         self.declare_parameter('direct_transfer_sample_step_rad', 0.05)
-        self.declare_parameter('direct_transfer_max_joint_delta_rad', 2.6)
+        self.declare_parameter('direct_transfer_max_joint_delta_rad', 5.0)
         self.declare_parameter('direct_transfer_joint_acc_rad_s2', 0.7)
         self.declare_parameter(
             'direct_transfer_periodic_joint_names',
@@ -176,6 +178,8 @@ class PickupSupervisor(Node):
         self.tolerance = float(p('position_tolerance_m'))
         self.xy_tolerance = float(p('xy_tolerance_m'))
         self.pregrasp_z_tolerance = float(p('pregrasp_z_tolerance_m'))
+        self.retrieval_pregrasp_above_tolerance = float(
+            p('retrieval_pregrasp_above_tolerance_m'))
         self.minimum_contact_descent = float(p('minimum_contact_descent_m'))
         self.descent_timeout = float(p('descent_timeout_sec'))
         self.place_descent_timeout = float(p('place_descent_timeout_sec'))
@@ -268,6 +272,11 @@ class PickupSupervisor(Node):
             raise ValueError(
                 'contact_search_margin_m must be within '
                 f'[0, max_descent_m={self.max_descent:.3f}]')
+        if not (self.pregrasp_z_tolerance <=
+                self.retrieval_pregrasp_above_tolerance <= self.max_descent):
+            raise ValueError(
+                'retrieval_pregrasp_above_tolerance_m must be between '
+                'pregrasp_z_tolerance_m and max_descent_m')
         if self.force_threshold <= 0.0:
             raise ValueError('force_contact_threshold_n must be positive')
         if not (0.0 < self.minimum_measured_object_height <
@@ -1087,14 +1096,34 @@ class PickupSupervisor(Node):
                 f'tolerance={self.xy_tolerance * 1000.0:.1f} mm')
         expected_z = float(snapshot['pregrasp_z_m'])
         z_error = z - expected_z
-        if abs(z_error) > self.pregrasp_z_tolerance:
+        is_retrieval = (
+            'retrieval_target_id' in snapshot or 'staging_slot' in snapshot)
+        # A Cartesian retrieval can finish slightly above its exact endpoint
+        # while preserving the verified XY alignment and overhead approach.
+        # Guarded contact search can safely start from that higher live pose.
+        # Being below the planned pose remains subject to the strict normal
+        # tolerance, as does every incoming-table pickup.
+        z_tolerance = (
+            self.retrieval_pregrasp_above_tolerance
+            if is_retrieval and z_error >= 0.0
+            else self.pregrasp_z_tolerance)
+        if abs(z_error) > z_tolerance:
             raise ValueError(
                 f'TCP is not at the verified pre-grasp height: '
                 f'current={z:.4f} m, expected={expected_z:.4f} m, '
                 f'error={z_error * 1000.0:+.1f} mm, '
-                f'tolerance={self.pregrasp_z_tolerance * 1000.0:.1f} mm')
+                f'tolerance={z_tolerance * 1000.0:.1f} mm')
         estimated_contact_z = float(snapshot['top_z_m']) + self.grasp_offset
-        servo_floor_z = self.servo_bounds_mm[4] / 1000.0
+        # Incoming-table pickups use the normal positive-Z workspace floor.
+        # A planned pallet/staging retrieval can legitimately have its TCP
+        # below the robot-base plane, because the localized pallet origin is
+        # below that plane.  Those targets were already collision-checked by
+        # the mandatory overhead and straight pre-pick plans, so use the same
+        # configured low-Z floor as pallet placement while retaining the
+        # contact-search and maximum-descent limits below.
+        servo_floor_z = (
+            self.place_workspace_z_min_mm / 1000.0
+            if is_retrieval else self.servo_bounds_mm[4] / 1000.0)
         floor_z = max(
             estimated_contact_z - self.contact_search_margin,
             z - self.max_descent,
@@ -2082,6 +2111,9 @@ class PickupSupervisor(Node):
                 float(configured_speed) * self._configured_speed_scale())
             return (
                 bool(self.servo_status.get('touch_mode')) and
+                bool(self.servo_status.get(
+                    'contact_on_fz_sign_change')) ==
+                (self.operation_kind == 'place') and
                 math.isclose(
                     float(self.servo_status.get('force_limit_n')),
                     expected_force, abs_tol=1e-6) and
@@ -2408,6 +2440,11 @@ class PickupSupervisor(Node):
     def _contact_reached(self):
         if self.servo_status.get('touch_contact'):
             return True
+        # Placement sign mode is validated by the bridge as a combined
+        # delta-Fz magnitude plus sign condition. Do not bypass that check
+        # here by consuming the raw magnitude alone.
+        if self.servo_status.get('contact_on_fz_sign_change'):
+            return False
         delta = self.servo_status.get('force_delta_z_n')
         if delta is not None and float(delta) >= self._contact_delta_n():
             return True
@@ -2850,8 +2887,13 @@ class PickupSupervisor(Node):
             self.expected_enable_generation is not None and
             current_generation >= self.expected_enable_generation)
         if current_enable_generation and self._contact_reached():
+            delta_fz = float(self.servo_status.get(
+                'force_delta_z_n', 0.0))
             self.get_logger().info(
-                f'Fz threshold reached after {descended * 1000.0:.1f} mm; '
+                f'guarded contact confirmed after '
+                f'{descended * 1000.0:.1f} mm '
+                f'(delta_fz={delta_fz:.2f} N, '
+                f'threshold={self._contact_delta_n():.2f} N); '
                 'stopping descent and triggering vacuum')
             self._handle_contact()
             return

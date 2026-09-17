@@ -417,7 +417,8 @@ class PlanningSceneObstacles(Node):
         except (KeyError, TypeError, ValueError):
             return None
         for status in (
-                self.policy_loading_status, self.random_loading_status):
+                getattr(self, 'policy_loading_status', {}),
+                getattr(self, 'random_loading_status', {})):
             if status.get('state') not in ('STARTING', 'EXECUTING'):
                 continue
             try:

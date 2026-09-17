@@ -3,6 +3,7 @@ import time
 
 from geometry_msgs.msg import WrenchStamped
 from moveit_msgs.msg import ServoStatus
+import pytest
 
 from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
 
@@ -358,6 +359,7 @@ def test_latched_place_fault_does_not_reject_next_safe_pregrasp():
     supervisor.max_pregrasp_plan_age = 5.0
     supervisor.xy_tolerance = 0.01
     supervisor.pregrasp_z_tolerance = 0.01
+    supervisor.retrieval_pregrasp_above_tolerance = 0.05
     supervisor.grasp_offset = 0.0
     supervisor.servo_bounds_mm = [-1000, 1000, -1000, 1000, -1000, 1000]
     supervisor.contact_search_margin = 0.02
@@ -370,6 +372,72 @@ def test_latched_place_fault_does_not_reject_next_safe_pregrasp():
     assert snapshot['box_id'] == 7
     assert start_z == 0.30
     assert math.isclose(floor_z, 0.18)
+
+
+def _low_pallet_pregrasp_supervisor(*, retrieval):
+    supervisor = object.__new__(PickupSupervisor)
+    snapshot = {
+        'box_id': 1005,
+        'planned_stamp_sec': 9.0,
+        'x_m': 0.128,
+        'y_m': -0.591,
+        'pregrasp_z_m': -0.021,
+        'top_z_m': -0.051,
+    }
+    if retrieval:
+        snapshot['retrieval_target_id'] = 5
+    supervisor.motion_status = {
+        'state': 'SUCCEEDED',
+        'target': 'pregrasp_box_1005',
+        'planned_pregrasp': snapshot,
+    }
+    supervisor.max_pregrasp_plan_age = 5.0
+    supervisor.xy_tolerance = 0.01
+    supervisor.pregrasp_z_tolerance = 0.01
+    supervisor.retrieval_pregrasp_above_tolerance = 0.05
+    supervisor.grasp_offset = 0.0
+    supervisor.servo_bounds_mm = [-1000, 1000, -1000, 1000, 50, 1000]
+    supervisor.place_workspace_z_min_mm = -200.0
+    supervisor.contact_search_margin = 0.015
+    supervisor.max_descent = 0.15
+    supervisor.get_clock = lambda: FakeClock()
+    supervisor._tcp_xyz = lambda: (0.128, -0.591, -0.021)
+    return supervisor
+
+
+def test_pallet_retrieval_uses_low_workspace_floor_for_servo_pickup():
+    supervisor = _low_pallet_pregrasp_supervisor(retrieval=True)
+
+    _snapshot, start_z, floor_z = supervisor._validate_pregrasp_ready()
+
+    assert start_z == pytest.approx(-0.021)
+    assert floor_z == pytest.approx(-0.066)
+    assert start_z - floor_z == pytest.approx(0.045)
+
+
+def test_pallet_retrieval_accepts_moderately_higher_live_pregrasp():
+    supervisor = _low_pallet_pregrasp_supervisor(retrieval=True)
+    supervisor._tcp_xyz = lambda: (0.128, -0.591, 0.0003)
+
+    _snapshot, start_z, floor_z = supervisor._validate_pregrasp_ready()
+
+    assert start_z == pytest.approx(0.0003)
+    assert floor_z == pytest.approx(-0.066)
+
+
+def test_pallet_retrieval_still_rejects_live_pose_below_pregrasp():
+    supervisor = _low_pallet_pregrasp_supervisor(retrieval=True)
+    supervisor._tcp_xyz = lambda: (0.128, -0.591, -0.042)
+
+    with pytest.raises(ValueError, match='verified pre-grasp height'):
+        supervisor._validate_pregrasp_ready()
+
+
+def test_normal_pickup_keeps_positive_workspace_floor():
+    supervisor = _low_pallet_pregrasp_supervisor(retrieval=False)
+
+    with pytest.raises(ValueError, match='pickup descent -0.071 m'):
+        supervisor._validate_pregrasp_ready()
 
 
 def test_tcp_validation_uses_link_tcp_servo_pose_when_fresh():

@@ -128,6 +128,7 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
     -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}" \
     -p place_descent_timeout_sec:="${PLACE_DESCENT_TIMEOUT_SEC}" \
+    -p direct_transfer_max_joint_delta_rad:=5.0 \
     -p singularity_place_recovery_timeout_sec:="${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC}" \
     -p singularity_place_step_m:="${PLACE_SINGULARITY_STEP_M}" \
     -p singularity_place_step_speed_mm_s:="${PLACE_SINGULARITY_STEP_SPEED_MM_S}" \
@@ -170,9 +171,8 @@ start_required "real-platform random stable-loading coordinator" \
     -p auto_start_pick_place:="${RANDOM_LOADING_AUTO_START}" \
     -p visualization_enabled:="${RANDOM_LOADING_VISUALIZE}" \
     -p visualization_port:="${RANDOM_LOADING_VISUAL_PORT}"
-start_required "real-platform learned-policy coordinator (MCTS/A* disabled)" \
+start_required "real-platform learned-policy coordinator" \
   ros2 run safe_servo_visualization policy_loading --ros-args \
-    -p container_size_mm:="[450, 550, 450]" \
     -p packing_height_resolution_mm:=5 \
     -p clearance_mm:=20 \
     -p checkpoint_path:="${POLICY_LOADING_CHECKPOINT}" \

@@ -110,6 +110,7 @@ private:
   QLabel * policy_loading_state_label_;
   QCheckBox * continuous_policy_loading_;
   QCheckBox * policy_repack_planning_;
+  QCheckBox * policy_simulation_;
   QCheckBox * policy_add_placed_item_obstacle_;
   QLabel * placed_obstacles_label_;
   QComboBox * staging_store_slot_;
@@ -166,6 +167,8 @@ private:
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr abort_policy_loading_client_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr reset_policy_loading_client_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr continuous_policy_loading_client_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr policy_rearrangement_client_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr policy_simulation_client_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr policy_loading_status_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr planning_scene_status_sub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr staging_store_selection_pub_;

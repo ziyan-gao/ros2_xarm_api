@@ -11,7 +11,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
-from xarm_msgs.srv import PlanExec, PlanJoint, PlanPose
+from xarm_msgs.srv import PlanExec, PlanJoint, PlanPose, PlanSingleStraight
 import yaml
 
 
@@ -94,6 +94,8 @@ class MotionCoordinator(Node):
             PlanJoint, '/xarm_joint_plan')
         self.pose_plan_client = self.create_client(
             PlanPose, '/xarm_pose_plan')
+        self.straight_plan_client = self.create_client(
+            PlanSingleStraight, '/xarm_straight_plan')
         self.constrained_pose_plan_client = self.create_client(
             PlanPose, '/xarm_pose_plan_orientation_constrained')
         self.exec_client = self.create_client(
@@ -147,6 +149,9 @@ class MotionCoordinator(Node):
             Trigger, '/motion_coordinator/plan_pregrasp',
             self.plan_pregrasp_callback)
         self.create_service(
+            Trigger, '/motion_coordinator/plan_staging_approach',
+            self.plan_staging_approach_callback)
+        self.create_service(
             Trigger, '/motion_coordinator/plan_staging_pregrasp',
             self.plan_staging_pregrasp_callback)
         self.create_service(
@@ -196,8 +201,10 @@ class MotionCoordinator(Node):
             'required before pickup')
 
     def _persist_pregrasp_snapshot(self):
-        if not self.planned_pregrasp or not str(self.target).startswith(
-                'pregrasp_box_'):
+        target = str(self.target)
+        if (not self.planned_pregrasp or
+                not target.startswith(
+                    ('pregrasp_box_', 'straight_pregrasp_box_'))):
             return
         # The successful execution time is the start of the snapshot validity
         # window. Pickup still independently checks the live TCP pose.
@@ -259,6 +266,7 @@ class MotionCoordinator(Node):
             'operation_id': self.operation_id,
             'planner_ready': self.plan_client.service_is_ready(),
             'pose_planner_ready': self.pose_plan_client.service_is_ready(),
+            'straight_planner_ready': self.straight_plan_client.service_is_ready(),
             'constrained_pose_planner_ready': (
                 self.constrained_pose_plan_client.service_is_ready()),
             'executor_ready': self.exec_client.service_is_ready(),
@@ -668,6 +676,30 @@ class MotionCoordinator(Node):
             f'operation_id={request_id}')
         return response
 
+    def _start_straight_plan(self, pose, box_id, response):
+        """Plan one collision-checked Cartesian segment to a target pose."""
+        self.operation_id += 1
+        request_id = self.operation_id
+        # Keep the established semantic target name. Pickup validation keys
+        # the verified snapshot to ``pregrasp_box_<id>`` regardless of which
+        # planner produced the collision-checked trajectory.
+        self.target = f'pregrasp_box_{int(box_id)}'
+        self.cancel_requested = False
+        self.pause_requested = False
+        self._publish_pregrasp_marker(pose, int(box_id))
+        self._set_state(self.PLANNING)
+        plan_request = PlanSingleStraight.Request()
+        plan_request.target = pose
+        future = self.straight_plan_client.call_async(plan_request)
+        future.add_done_callback(
+            lambda completed: self._plan_completed(request_id, completed))
+        response.success = True
+        response.message = (
+            f'Planning straight pregrasp for box {int(box_id)} at '
+            f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
+            f'{pose.position.z:.3f}] m; operation_id={request_id}')
+        return response
+
     def _publish_pregrasp_marker(self, pose, box_id):
         marker = Marker()
         marker.header.frame_id = 'link_base'
@@ -723,36 +755,49 @@ class MotionCoordinator(Node):
 
     def staging_retrieve_target_callback(self, message):
         # [slot, contact-reference TCP xyz_m, release TCP rpy_rad,
-        #  unrotated_item_size_xyz_m, clearance_m]
+        #  unrotated_item_size_xyz_m, clearance_m, object_yaw_rad,
+        #  optional approach_tcp_z_m]
         if len(message.data) < 11:
             self.get_logger().warning('ignored incomplete staging retrieve target')
             return
-        values = tuple(map(float, message.data[:11]))
+        values = tuple(map(float, message.data[:13]))
         if not all(math.isfinite(value) for value in values):
             self.get_logger().warning('ignored non-finite staging retrieve target')
             return
-        slot = int(round(values[0]))
+        target_id = int(round(values[0]))
         size = values[7:10]
         clearance = values[10]
-        if not 0 <= slot < 6 or any(value <= 0.0 for value in size):
-            self.get_logger().warning('ignored invalid staging slot or item size')
+        object_yaw = values[11] if len(message.data) >= 12 else 0.0
+        approach_tcp_z = values[12] if len(message.data) >= 13 else None
+        if target_id < 0 or any(value <= 0.0 for value in size):
+            self.get_logger().warning('ignored invalid retrieval target or item size')
             return
         if not 0.005 <= clearance <= 0.100:
             self.get_logger().warning('ignored invalid staging pre-pick clearance')
             return
+        pregrasp_z = values[3] + clearance
+        if (approach_tcp_z is not None and
+                approach_tcp_z < pregrasp_z + 0.010):
+            self.get_logger().warning(
+                'ignored retrieval approach below the pre-pick safety margin')
+            return
         self.staging_retrieve_target = {
-            'slot': slot,
+            'target_id': target_id,
             'contact_tcp_pose': values[1:7],
             'size': size,
             'clearance': clearance,
+            'object_yaw': object_yaw,
+            'approach_tcp_z': approach_tcp_z,
             'received_at': time.monotonic(),
         }
 
-    def plan_staging_pregrasp_callback(self, _request, response):
+    def plan_staging_approach_callback(self, _request, response):
+        """Plan the mandatory above-container waypoint for pallet retrieval."""
         if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
-        if not self._require_fresh_joint_state(response, 'plan staging pre-pick'):
+        if not self._require_fresh_joint_state(
+                response, 'plan staging approach'):
             return response
         if not self.pose_plan_client.service_is_ready():
             response.message = 'xArm pose planning service is unavailable'
@@ -761,7 +806,35 @@ class MotionCoordinator(Node):
         if target is None or time.monotonic() - target['received_at'] > 2.0:
             response.message = 'fresh staging retrieve target is unavailable'
             return response
-        slot = target['slot']
+        approach_z = target.get('approach_tcp_z')
+        if approach_z is None:
+            response.message = 'above-container retrieval waypoint is unavailable'
+            return response
+        target_id = target['target_id']
+        x, y, _contact_z, roll, pitch, yaw = target['contact_tcp_pose']
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        pose.position.z = float(approach_z)
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = self._quaternion_from_rpy(
+            roll, pitch, yaw)
+        # The overhead waypoint is not a verified grasp approach. Prevent a
+        # restored snapshot from being refreshed when this first leg executes.
+        self.planned_pregrasp = None
+        return self._start_pose_plan(pose, 2000 + target_id, response)
+
+    def plan_staging_pregrasp_callback(self, _request, response):
+        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
+            return response
+        if not self._require_fresh_joint_state(response, 'plan staging pre-pick'):
+            return response
+        target = self.staging_retrieve_target
+        if target is None or time.monotonic() - target['received_at'] > 2.0:
+            response.message = 'fresh staging retrieve target is unavailable'
+            return response
+        target_id = target['target_id']
         x, y, contact_z, roll, pitch, yaw = target['contact_tcp_pose']
         size_x, size_y, size_z = target['size']
         pose = Pose()
@@ -771,7 +844,7 @@ class MotionCoordinator(Node):
         (pose.orientation.x, pose.orientation.y,
          pose.orientation.z, pose.orientation.w) = self._quaternion_from_rpy(
             roll, pitch, yaw)
-        box_id = 1000 + slot
+        box_id = 1000 + target_id
         self.planned_pregrasp = {
             'box_id': box_id,
             'x_m': x,
@@ -782,11 +855,19 @@ class MotionCoordinator(Node):
             'size_z_m': size_z,
             'top_z_m': contact_z,
             'pregrasp_z_m': pose.position.z,
-            # Staged items are always aligned to robot-base/grid yaw zero.
-            'yaw_rad': 0.0,
+            'yaw_rad': float(target['object_yaw']),
             'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
-            'staging_slot': slot,
+            'retrieval_target_id': target_id,
         }
+        if target.get('approach_tcp_z') is not None:
+            if not self.straight_plan_client.service_is_ready():
+                response.message = (
+                    'xArm Cartesian straight planning service is unavailable')
+                return response
+            return self._start_straight_plan(pose, box_id, response)
+        if not self.pose_plan_client.service_is_ready():
+            response.message = 'xArm pose planning service is unavailable'
+            return response
         return self._start_pose_plan(pose, box_id, response)
 
     def _load_waypoint(self, name):

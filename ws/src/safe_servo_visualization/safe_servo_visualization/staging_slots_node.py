@@ -185,6 +185,7 @@ class StagingSlots(Node):
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
         self.expected_store_place_operation_id = None
+        self.return_to_observation = True
         self.waiting_removed_id = ''
         self.retrieval_settle_started = None
         self.retrieval_settle_after_sequence = 0
@@ -252,6 +253,9 @@ class StagingSlots(Node):
         self.enable_servo = self.create_client(SetBool, '/safe_servo/enable')
 
         self.create_service(Trigger, '/staging_slots/store', self.store_callback)
+        self.create_service(
+            Trigger, '/staging_slots/store_chained',
+            self.store_chained_callback)
         self.create_service(
             Trigger, '/staging_slots/retrieve', self.retrieve_callback)
         self.create_service(Trigger, '/staging_slots/reset', self.reset_callback)
@@ -451,6 +455,12 @@ class StagingSlots(Node):
         )
 
     def store_callback(self, _request, response):
+        return self._store_callback(response, return_to_observation=True)
+
+    def store_chained_callback(self, _request, response):
+        return self._store_callback(response, return_to_observation=False)
+
+    def _store_callback(self, response, return_to_observation):
         reason = self._busy_reason()
         if reason:
             response.message = reason
@@ -471,6 +481,7 @@ class StagingSlots(Node):
             response.message = 'MoveIt compute_ik service is unavailable'
             return response
         self.operation = 'store'
+        self.return_to_observation = bool(return_to_observation)
         self.active_slot = slot_index
         self.direct_phase = 'approach_to_servo'
         self.direct_control_claim_started = False
@@ -497,13 +508,19 @@ class StagingSlots(Node):
         self.ik_solutions = []
         self.motion_queue = []
         self._solve_next_store_ik(joint_seed)
+        completion_route = (
+            'returning to observation'
+            if self.return_to_observation else
+            'remaining at the raised staging waypoint')
         response.success = True
         response.message = (
             f'storing attached item in slot {slot_index} at FLB '
             f'{tuple(round(v*1000) for v in self.slots[slot_index])} mm; '
             'solving transfer/pre-place IK; item yaw fixed to 0 deg; '
             f'item bottom={self.transfer_item_bottom_above_pallet*1000:.0f} mm '
-            'above pallet')
+            'above pallet; '
+            f'{completion_route}'
+        )
         self.publish_status()
         return response
 
@@ -1112,7 +1129,16 @@ class StagingSlots(Node):
         self.occupied[slot] = dict(self.pending_record)
         self.pending_record = None
         self.expected_store_place_operation_id = None
-        self._begin_observation()
+        if self.return_to_observation:
+            self._begin_observation()
+        else:
+            self._finish_operation()
+
+    def _finish_operation(self):
+        self.state = self.SUCCEEDED
+        self.last_result = (
+            f'{self.operation} completed for slot {self.active_slot}')
+        self.publish_status()
 
     def _begin_observation(self):
         if not self.plan_observation.service_is_ready():
@@ -1196,11 +1222,7 @@ class StagingSlots(Node):
                 self._execute_latest_motion(self.EXECUTING_OBSERVATION)
         elif self.state == self.EXECUTING_OBSERVATION:
             if self._motion_matches() and self.motion_status.get('state') == 'SUCCEEDED':
-                self.state = self.SUCCEEDED
-                self.last_result = (
-                    f'{self.operation} completed for slot '
-                    f'{self.active_slot}')
-                self.publish_status()
+                self._finish_operation()
 
     def _motion_matches(self):
         return int(self.motion_status.get('operation_id', -1)) >= int(
@@ -1333,6 +1355,7 @@ class StagingSlots(Node):
         self.fault = ''
         self.pending_fault = ''
         self.last_result = 'staging fault/state reset; occupied slots retained'
+        self.return_to_observation = True
         self.ik_targets = []
         self.ik_solutions = []
         response.success = True
@@ -1351,6 +1374,7 @@ class StagingSlots(Node):
             'selected_retrieve_slot': self.selected_retrieve_slot,
             'transfer_item_bottom_above_pallet_mm': (
                 self.transfer_item_bottom_above_pallet * 1000.0),
+            'return_to_observation': self.return_to_observation,
             'slots': [
                 {
                     'slot': index,

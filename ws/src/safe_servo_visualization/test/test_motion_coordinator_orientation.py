@@ -1,7 +1,10 @@
 import math
+from types import SimpleNamespace
+import time
 
 import pytest
 from geometry_msgs.msg import Pose
+from std_msgs.msg import Float64MultiArray
 
 from safe_servo_visualization.motion_coordinator_node import MotionCoordinator
 from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
@@ -194,3 +197,90 @@ def test_place_servo_uses_its_lower_z_bound_without_changing_pickup_bound():
     supervisor._publish_servo_config(touch_mode=True)
     assert supervisor.config_pub.messages[-1].data[1:7] == pytest.approx(
         [-450.0, 450.0, 100.0, 750.0, -100.0, 800.0])
+
+
+def test_retrieval_target_accepts_rearrangement_id_and_object_yaw():
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.staging_retrieve_target = None
+    message = Float64MultiArray()
+    message.data = [
+        27.0, 0.4, -0.2, 0.3, math.pi, 0.0, 0.5,
+        0.22, 0.17, 0.12, 0.03, 0.5, 0.72,
+    ]
+
+    coordinator.staging_retrieve_target_callback(message)
+
+    assert coordinator.staging_retrieve_target['target_id'] == 27
+    assert coordinator.staging_retrieve_target['object_yaw'] == pytest.approx(0.5)
+    assert coordinator.staging_retrieve_target['approach_tcp_z'] == pytest.approx(
+        0.72)
+    assert coordinator.staging_retrieve_target['size'] == pytest.approx(
+        (0.22, 0.17, 0.12))
+
+
+def test_pallet_retrieval_pregrasp_uses_straight_cartesian_plan():
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.state = coordinator.SUCCEEDED
+    coordinator.staging_retrieve_target = {
+        'target_id': 27,
+        'contact_tcp_pose': (0.4, -0.2, 0.3, math.pi, 0.0, 0.5),
+        'size': (0.22, 0.17, 0.12),
+        'clearance': 0.03,
+        'object_yaw': 0.5,
+        'approach_tcp_z': 0.72,
+        'received_at': time.monotonic(),
+    }
+    coordinator._require_fresh_joint_state = lambda *_args: True
+    coordinator.straight_plan_client = SimpleNamespace(
+        service_is_ready=lambda: True)
+    coordinator.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
+    captured = {}
+
+    def start_straight(pose, box_id, response):
+        captured.update(pose=pose, box_id=box_id)
+        response.success = True
+        return response
+
+    coordinator._start_straight_plan = start_straight
+    response = SimpleNamespace(success=False, message='')
+
+    result = coordinator.plan_staging_pregrasp_callback(None, response)
+
+    assert result.success
+    assert captured['box_id'] == 1027
+    assert captured['pose'].position.x == pytest.approx(0.4)
+    assert captured['pose'].position.y == pytest.approx(-0.2)
+    assert captured['pose'].position.z == pytest.approx(0.33)
+
+
+def test_straight_pregrasp_preserves_supervisor_target_contract():
+    class PendingFuture:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class StraightClient:
+        def call_async(self, request):
+            self.request = request
+            self.future = PendingFuture()
+            return self.future
+
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.operation_id = 3
+    coordinator.cancel_requested = False
+    coordinator.pause_requested = False
+    coordinator.straight_plan_client = StraightClient()
+    coordinator._publish_pregrasp_marker = lambda *_args: None
+    coordinator._set_state = lambda state: setattr(coordinator, 'state', state)
+    pose = Pose()
+    pose.position.x = 0.4
+    pose.position.y = -0.2
+    pose.position.z = 0.33
+    response = SimpleNamespace(success=False, message='')
+
+    result = coordinator._start_straight_plan(pose, 1027, response)
+
+    assert result.success
+    assert coordinator.target == 'pregrasp_box_1027'
+    assert coordinator.state == coordinator.PLANNING
+    assert coordinator.straight_plan_client.request.target is pose

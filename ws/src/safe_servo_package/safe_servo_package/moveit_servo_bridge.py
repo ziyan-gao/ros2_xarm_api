@@ -225,6 +225,18 @@ class MoveItServoBridge(Node):
             return max(12.0, 3.0 * self.force_limit)
         return max(50.0, 3.0 * self.force_limit)
 
+    @staticmethod
+    def _touch_contact_reached(
+            delta_fz, contact_delta, require_sign_reversal,
+            sign_observable, sign_reversed):
+        """Require force magnitude and, when observable, the requested sign."""
+        magnitude_reached = delta_fz >= contact_delta
+        sign_confirmed = (
+            not require_sign_reversal or
+            not sign_observable or
+            sign_reversed)
+        return magnitude_reached and sign_confirmed
+
     def _update_wrench_delta(self, force, torque):
         self.latest_wrench = force + torque
         if self.enable_wrench_baseline is None:
@@ -257,15 +269,22 @@ class MoveItServoBridge(Node):
             delta = self.force_delta_z or 0.0
             if self.touch_descent:
                 baseline_z = self.enable_wrench_baseline[2]
+                sign_observable = (
+                    abs(baseline_z) >= self.fz_sign_deadband)
                 sign_reversed = (
                     self.contact_on_fz_sign_change and
-                    abs(baseline_z) >= self.fz_sign_deadband and
+                    sign_observable and
                     abs(force[2]) >= self.fz_sign_deadband and
                     baseline_z * force[2] < 0.0)
-                # Contact does not always cross raw zero because payload and
-                # sensor bias set the starting sign. Stop on either a clear
-                # sign reversal or the baseline-relative Fz threshold.
-                if sign_reversed or delta >= contact_delta:
+                # A noisy zero crossing is not contact by itself. Placement
+                # sign mode requires the configured baseline-relative Fz
+                # magnitude as well as a sign reversal whenever the baseline
+                # has a reliable sign. If it starts inside the deadband, the
+                # magnitude threshold remains the safe usable signal.
+                if self._touch_contact_reached(
+                        delta, contact_delta,
+                        self.contact_on_fz_sign_change,
+                        sign_observable, sign_reversed):
                     self._latch_touch_contact()
                 elif self.force_norm >= safety_cap or self.torque_norm >= self.torque_limit:
                     self.latch_fault(
