@@ -22,23 +22,22 @@ diff --git a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp b/xarm_co
 index d654894..91cf0b2 100644
 --- a/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
 +++ b/xarm_controller/src/hardware/uf_robot_system_hardware.cpp
-@@ -250,6 +250,19 @@ namespace uf_robot_hardware
+@@ -250,6 +250,18 @@ namespace uf_robot_hardware
  
      CallbackReturn UFRobotSystemHardware::on_activate(const rclcpp_lifecycle::State& previous_state)
      {
 +        // Keep the real-time read/write callbacks inert until activation has
 +        // established a fresh report snapshot and initialized all commands.
 +        ros_control_active_.store(false, std::memory_order_release);
-+        // SERVICE_CALL_FAILED is also used as a synthetic latency-watchdog
-+        // latch. It must not survive a successful lifecycle reactivation.
++        // Never let an automatic lifecycle retry clear a command-write fault.
++        // Recovery requires operator inspection and a hardware process restart.
 +        if (latency_watchdog_latched_) {
-+            RCLCPP_WARN(LOGGER,
-+                "[%s] clearing recovered Servo-J latency watchdog latch",
++            RCLCPP_ERROR(LOGGER,
++                "[%s] Servo-J fault latched; activation blocked until inspected and process restarted",
 +                robot_ip_.c_str());
-+            write_code_ = 0;
++            return CallbackReturn::ERROR;
 +        }
 +        late_write_streak_ = 0;
-+        latency_watchdog_latched_ = false;
          xarm_driver_.arm->clean_error();
          xarm_driver_.arm->clean_warn();
          xarm_driver_.arm->motion_enable(true);
@@ -71,10 +70,13 @@ index d654894..91cf0b2 100644
          read_cnts_ += 1;
          read_ready_ = _xarm_is_ready_read();
          rclcpp::Time start = node_->get_clock()->now();
-@@ -373,6 +384,9 @@ namespace uf_robot_hardware
+@@ -373,6 +384,12 @@ namespace uf_robot_hardware
  
      hardware_interface::return_type UFRobotSystemHardware::write(const rclcpp::Time & time, const rclcpp::Duration &period)
      {
++        if (latency_watchdog_latched_) {
++            return hardware_interface::return_type::ERROR;
++        }
 +        if (!ros_control_active_.load(std::memory_order_acquire)) {
 +            return hardware_interface::return_type::OK;
 +        }

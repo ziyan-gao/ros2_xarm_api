@@ -19,7 +19,7 @@ index f4817fd..e53dc1a 100644
          int read_code_;
          int write_code_;
 +        int late_write_streak_ = 0;
-+        bool latency_watchdog_latched_ = false;
++        std::atomic_bool latency_watchdog_latched_{false};
 
          std::string robot_ip_;
 
@@ -46,17 +46,17 @@ index b570b6e..56ecda1 100644
 +                    std::chrono::steady_clock::now() - write_started_at).count();
                  if (cmd_ret != 0) {
 -                    RCLCPP_WARN(LOGGER, "[%s] set_servo_angle_j, ret= %d", robot_ip_.c_str(), cmd_ret);
++                    latency_watchdog_latched_ = true;
 +                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
 +                    RCLCPP_ERROR(LOGGER,
 +                        "[%s] set_servo_angle_j failed (ret=%d); robot STOP requested (ret=%d), aborting controllers",
 +                        robot_ip_.c_str(), cmd_ret, stop_ret);
 +                    write_code_ = cmd_ret;
-+                    latency_watchdog_latched_ = false;
 +                    return hardware_interface::return_type::ERROR;
 +                }
 +                constexpr long warning_latency_ms = 30;
-+                constexpr long emergency_latency_ms = 250;
-+                constexpr int consecutive_warning_limit = 3;
++                constexpr long emergency_latency_ms = 100;
++                constexpr int consecutive_warning_limit = 2;
 +                if (write_latency_ms > warning_latency_ms) {
 +                    ++late_write_streak_;
 +                    RCLCPP_WARN(LOGGER,
@@ -66,18 +66,18 @@ index b570b6e..56ecda1 100644
 +                } else {
 +                    late_write_streak_ = 0;
 +                }
-+                // A moderate one-off delay is reported without poisoning the
-+                // hardware lifecycle. Persistent latency, or one extreme delay,
-+                // still stops execution before trajectory catch-up becomes unsafe.
++                // Containment after a blocking write returns, not prevention
++                // of the initial stall. Latch before requesting STOP so no
++                // later write or lifecycle retry can resume this trajectory.
 +                if (write_latency_ms >= emergency_latency_ms ||
 +                    late_write_streak_ >= consecutive_warning_limit) {
++                    latency_watchdog_latched_ = true;
 +                    const int stop_ret = xarm_driver_.arm->set_state(XARM_STATE::STOP);
 +                    RCLCPP_ERROR(LOGGER,
 +                        "[%s] Servo-J latency watchdog tripped at %ld ms (streak=%d); robot STOP requested (ret=%d), aborting controllers",
 +                        robot_ip_.c_str(), static_cast<long>(write_latency_ms),
 +                        late_write_streak_, stop_ret);
 +                    write_code_ = SERVICE_CALL_FAILED;
-+                    latency_watchdog_latched_ = true;
 +                    return hardware_interface::return_type::ERROR;
                  }
                  if (cmd_ret == 0) {

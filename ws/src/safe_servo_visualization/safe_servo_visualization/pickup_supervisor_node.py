@@ -23,9 +23,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from xarm_msgs.msg import RobotMsg
 from xarm_msgs.srv import (
     Call, GetInt16, MoveCartesian, SetInt16, VacuumGripperCtrl)
+from .continuous_transport import ContinuousTransport
 
 
-class PickupSupervisor(Node):
+class PickupSupervisor(ContinuousTransport, Node):
     """Supervise a vertical-only pickup after pre-grasp execution."""
 
     IDLE = 'IDLE'
@@ -60,7 +61,7 @@ class PickupSupervisor(Node):
         WAITING_PLACE_STEP_FEEDBACK, RESTORING_CONTROL,
         SOLVING_TRANSFER_IK, VALIDATING_TRANSFER, CHECKING_LOADING_PATH, EXECUTING_TRANSFER,
         C52_STOPPING, RECOVERING_FT,
-    }
+    } | ContinuousTransport.TRANSPORT_STATES | {ContinuousTransport.RETURN_DISABLING}
 
     def __init__(self):
         super().__init__('pickup_supervisor')
@@ -623,6 +624,7 @@ class PickupSupervisor(Node):
         self.create_service(
             Trigger, '/pickup_supervisor/recover_ft_sensor',
             self.recover_ft_sensor_callback)
+        self._init_continuous_transport()
         self.create_timer(0.05, self.control_tick)
         self.create_timer(0.1, self.retreat_tick)
         self.create_timer(0.5, self.publish_status)
@@ -661,6 +663,10 @@ class PickupSupervisor(Node):
         if all(name in positions for name in self.arm_joint_names):
             self.latest_joint_positions = tuple(
                 positions[name] for name in self.arm_joint_names)
+            self.transport_joint_sample_time = self.last_joint_state_time
+            stamp = getattr(getattr(message, 'header', None), 'stamp', None)
+            self.transport_joint_stamp_ns = (
+                None if stamp is None else stamp.sec * 1000000000 + stamp.nanosec)
         try:
             index = message.name.index(self.joint6_name)
             position = float(message.position[index])
@@ -862,6 +868,7 @@ class PickupSupervisor(Node):
             return
         self.latest_force_z = force_z
         self.last_force_time = time.monotonic()
+        self._transport_force(force_z)
         if (self.operation_kind != 'loading' or
                 self.state != self.RETREATING or
                 self.loading_contact_fallback or
@@ -1367,6 +1374,9 @@ class PickupSupervisor(Node):
         self.operation_id += 1
         self.operation_kind = 'pickup'
         self.probe_only = bool(probe_only)
+        self.continuous_return_completed = False
+        self.continuous_return_target_id = None
+        self.transport_is_return = False
         self.object_info_obtained = False
         self.contact_tcp_z = None
         self.contact_tcp_xyz = None
@@ -1448,6 +1458,12 @@ class PickupSupervisor(Node):
         return corrected
 
     def grasp_at_contact_callback(self, _request, response):
+        return self._grasp_at_contact(response, defer_lift=False)
+
+    def grasp_and_hold_callback(self, _request, response):
+        return self._grasp_at_contact(response, defer_lift=True)
+
+    def _grasp_at_contact(self, response, defer_lift):
         if self.state != self.AWAITING_GRASP or not self.object_info_obtained:
             response.message = (
                 f'object information is not ready at contact; state={self.state}')
@@ -1471,6 +1487,7 @@ class PickupSupervisor(Node):
             self.publish_status()
             return response
         self.probe_only = False
+        self.defer_pickup_lift = defer_lift
         self._turn_vacuum_on()
         response.success = True
         response.message = 'object information accepted; vacuum pickup started'
@@ -3174,6 +3191,19 @@ class PickupSupervisor(Node):
                 self._fault(reason)
 
     def retreat_tick(self):
+        if (self.state == self.RETURN_DISABLING and
+                getattr(self, 'return_staged_fallback_used', False)):
+            if time.monotonic() - self.return_handoff_started > 30.0:
+                self._fault('staged return Servo pause confirmation timed out')
+            return
+        if getattr(self, 'continuous_return_restoring', False):
+            if time.monotonic() - self.return_handoff_started > 30.0:
+                self._fault('continuous return controller handoff timed out')
+                return
+            if self.state == self.RETURN_DISABLING:
+                return
+        if self._transport_tick():
+            return
         if self.state == self.CHECKING_LOADING_PATH:
             if time.monotonic() - self.loading_path_started > 10.0:
                 self._fault('loading-path validation service timed out')
@@ -3707,6 +3737,10 @@ class PickupSupervisor(Node):
             # therefore SDK TCP Z=211 mm.
             self.direct_command_target_z = (
                 self.direct_target_z - self.direct_tcp_z_offset)
+            if getattr(self, 'return_clearance_pending', False):
+                # Early contact may already be above pre-place: never descend
+                # again after releasing an item.
+                self.direct_command_target_z = max(self.direct_command_target_z, current_z)
             delta = (
                 0.0, 0.0, self.direct_command_target_z - current_z)
             distance_mm = tuple(value * 1000.0 for value in delta)
@@ -3717,6 +3751,12 @@ class PickupSupervisor(Node):
             request.relative = True
         request.speed = self.retreat_speed
         request.acc = self.retreat_acc
+        if getattr(self, 'return_clearance_pending', False):
+            request.speed = min(self.retreat_speed, self.return_clearance_speed)
+            request.acc = min(self.retreat_acc, 100.0)
+            self.get_logger().info(
+                f'slow post-release retreat to pre-place at {request.speed:.1f} mm/s; '
+                'continuous return starts only after ROS control settles')
         request.mvtime = 0.0
         nonblocking_loading_descent = (
             self.operation_kind == 'loading' and
@@ -3811,6 +3851,16 @@ class PickupSupervisor(Node):
             return
         state_id = component.state.id
         if state_id == State.PRIMARY_STATE_ACTIVE:
+            if (getattr(self, 'continuous_return_restoring', False) and
+                    self.robot_state_time is not None and
+                    time.monotonic() - self.robot_state_time <= self.status_timeout and
+                    self.robot_mode == self.ros2_control_mode and self.robot_error == 0 and
+                    self.robot_state in (0, 2)):
+                # Normal Servo placement already owns healthy ROS control.
+                # Preserve it, but still verify controllers, new samples and
+                # the full configured post-restore settling interval.
+                self._verify_restored_controllers()
+                return
             self.get_logger().info(
                 'ros2_control hardware unexpectedly active after direct '
                 'retreat; deactivating it before restoring robot mode')
@@ -4019,6 +4069,10 @@ class PickupSupervisor(Node):
                 self.restore_settle_ready_count += 1
             else:
                 self.restore_settle_ready_count = 0
+                if getattr(self, 'continuous_return_restoring', False):
+                    # Return motion requires one uninterrupted healthy delay,
+                    # not merely enough elapsed wall time since activation.
+                    self.restore_settle_started = now
             if (now - self.restore_settle_started >=
                     self.post_restore_settle and
                     self.restore_settle_ready_count >=
@@ -4071,6 +4125,9 @@ class PickupSupervisor(Node):
             reason = self.post_retreat_fault
             self.post_retreat_fault = ''
             self._fault(reason)
+            return
+        if getattr(self, 'continuous_return_restoring', False):
+            self._plan_continuous_return()
             return
         if getattr(self, 'c52_retreat_active', False):
             self.c52_retreat_active = False
@@ -4193,6 +4250,20 @@ class PickupSupervisor(Node):
 
     def _proceed_to_retreat(self, vacuum_verified=True):
         self.vacuum_verified = vacuum_verified
+        if self._should_return_continuously():
+            self.vacuum_verified = False
+            self._begin_continuous_return()
+            return
+        if (self.operation_kind == 'pickup' and
+                getattr(self, 'defer_pickup_lift', False) and vacuum_verified):
+            self.defer_pickup_lift = False
+            self.state = self.SUCCEEDED
+            self.publish_status()
+            return
+        if getattr(self, 'continuous_contact_retreat', False):
+            self.continuous_contact_retreat = False
+            self._disable_servo_then_direct_retreat()
+            return
         if self.operation_kind == 'loading' and self.loading_contact_fallback:
             self._resume_loading_contact_retreat()
             return
@@ -4413,6 +4484,10 @@ class PickupSupervisor(Node):
         self._request_vacuum_status()
 
     def _fault(self, reason):
+        if getattr(self, 'transport_is_return', False) and reason.startswith('KINEMATIC_REJECTED:'):
+            reason = 'continuous return rejected:' + reason.removeprefix('KINEMATIC_REJECTED:')
+        self.continuous_return_restoring = False
+        self.return_clearance_pending = False
         if self.state == self.FAULT:
             return
         transfer_goal = getattr(self, 'transfer_goal_handle', None)
@@ -4760,6 +4835,9 @@ class PickupSupervisor(Node):
             'singularity_place_step_mm':
                 self.singularity_place_step * 1000.0,
             'direct_transfer_succeeded': self.direct_transfer_succeeded,
+            'continuous_return_completed': getattr(self, 'continuous_return_completed', False),
+            'continuous_return_active': bool(
+                getattr(self, 'transport_is_return', False) and self.state in self.ACTIVE),
             'direct_transfer_motion_started': self.direct_transfer_motion_started,
             'direct_transfer_validation_sample':
                 self.direct_transfer_validation_index,

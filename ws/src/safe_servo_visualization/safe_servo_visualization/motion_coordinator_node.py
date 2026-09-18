@@ -289,6 +289,12 @@ class MotionCoordinator(Node):
             'pre_place_tcp_z_m': (
                 None if self.pre_place_tcp_pose is None else
                 self.pre_place_tcp_pose.position.z),
+            'pre_place_tcp_xyz_m': (
+                None if self.pre_place_tcp_pose is None else [
+                    self.pre_place_tcp_pose.position.x,
+                    self.pre_place_tcp_pose.position.y,
+                    self.pre_place_tcp_pose.position.z]),
+            'transport_corner_clearance_z_m': self.nominal_transfer_corner_z,
             'transfer_tcp_z_m': (
                 None if self.transfer_tcp_pose is None else
                 self.transfer_tcp_pose.position.z),

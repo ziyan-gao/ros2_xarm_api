@@ -13,6 +13,8 @@ class PickPlacePipeline(Node):
     def __init__(self):
         super().__init__('pick_place_pipeline')
         self.declare_parameter('cycle_timeout_sec', 300.0)
+        self.declare_parameter('continuous_transport_enabled', True)
+        self.continuous_transport = bool(self.get_parameter('continuous_transport_enabled').value)
         self.timeout = float(self.get_parameter('cycle_timeout_sec').value)
         self.state, self.fault, self.operation_id = 'IDLE', '', 0
         self.pick_only = False
@@ -25,9 +27,11 @@ class PickPlacePipeline(Node):
         self.create_subscription(String, '/place_pipeline/status',
                                  lambda msg: self._status(msg, False), 10)
         self.start_pickup = self.create_client(Trigger, '/pickup_pipeline/start')
+        self.start_pickup_hold = self.create_client(Trigger, '/pickup_pipeline/start_for_transport')
         self.abort_pickup = self.create_client(Trigger, '/pickup_pipeline/abort')
         self.reset_pickup = self.create_client(Trigger, '/pickup_pipeline/reset')
         self.start_place = self.create_client(Trigger, '/place_pipeline/start')
+        self.start_continuous_place = self.create_client(Trigger, '/place_pipeline/start_continuous')
         self.abort_place = self.create_client(Trigger, '/place_pipeline/abort')
         self.reset_place = self.create_client(Trigger, '/place_pipeline/reset')
         self.create_service(Trigger, '/pick_place_pipeline/start', self.start)
@@ -61,7 +65,9 @@ class PickPlacePipeline(Node):
         if self.state in self.ACTIVE:
             response.message = f'PickAndPlace already active in {self.state}'
             return response
-        if not self.start_pickup.service_is_ready():
+        self.use_continuous = getattr(self, 'continuous_transport', False) and not pick_only
+        pickup_client = self.start_pickup_hold if self.use_continuous else self.start_pickup
+        if not pickup_client.service_is_ready():
             response.message = 'pickup pipeline is unavailable'
             return response
         self.operation_id += 1
@@ -70,7 +76,7 @@ class PickPlacePipeline(Node):
         self.started = time.monotonic()
         self.expected_pickup_id = int(self.pickup_status.get('operation_id', 0)) + 1
         self.expected_place_id = None
-        future = self.start_pickup.call_async(Trigger.Request())
+        future = pickup_client.call_async(Trigger.Request())
         future.add_done_callback(lambda done: self._start_done(done, 'pickup'))
         response.success = True
         response.message = (
@@ -83,14 +89,15 @@ class PickPlacePipeline(Node):
                 not self.fault.startswith('KINEMATIC_REJECTED:')):
             response.message = 'retry requires a pre-motion kinematic rejection'
             return response
-        if not self.start_place.service_is_ready():
+        client = self.start_continuous_place if getattr(self, 'use_continuous', False) else self.start_place
+        if not client.service_is_ready():
             response.message = 'place pipeline is unavailable'
             return response
         self.operation_id += 1
         self.state, self.fault = 'PLACING', ''
         self.started = time.monotonic()
         self.expected_place_id = int(self.place_status.get('operation_id', 0)) + 1
-        future = self.start_place.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(lambda done: self._start_done(done, 'place'))
         response.success = True
         response.message = 'retrying placement of the carried item'
@@ -123,12 +130,13 @@ class PickPlacePipeline(Node):
             if self.pick_only:
                 self.state = 'SUCCEEDED'
                 return
-            if not self.start_place.service_is_ready():
+            client = self.start_continuous_place if getattr(self, 'use_continuous', False) else self.start_place
+            if not client.service_is_ready():
                 self._fault('place pipeline is unavailable')
                 return
             self.state = 'PLACING'
             self.expected_place_id = int(self.place_status.get('operation_id', 0)) + 1
-            future = self.start_place.call_async(Trigger.Request())
+            future = client.call_async(Trigger.Request())
             future.add_done_callback(lambda done: self._start_done(done, 'place'))
         elif status.get('state') == 'SUCCEEDED' and self.state == 'PLACING':
             self.state = 'SUCCEEDED'

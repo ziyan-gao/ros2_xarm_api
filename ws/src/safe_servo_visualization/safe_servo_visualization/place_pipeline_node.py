@@ -18,7 +18,8 @@ class PlacePipeline(Node):
     SUCCEEDED = 'SUCCEEDED'
     FAULT = 'FAULT'
     ABORTING = 'ABORTING'
-    ACTIVE = {MOVE_TRANSFER, LOAD_PRE_PLACE, CONTACT_PLACE, MOVE_OBSERVATION, ABORTING}
+    WAIT_ATTACHMENT = 'WAIT_ATTACHMENT'
+    ACTIVE = {MOVE_TRANSFER, LOAD_PRE_PLACE, CONTACT_PLACE, MOVE_OBSERVATION, ABORTING, WAIT_ATTACHMENT}
 
     def __init__(self):
         super().__init__('place_pipeline')
@@ -66,6 +67,8 @@ class PlacePipeline(Node):
             Trigger, '/pickup_supervisor/start_place')
         self.start_loading = self.create_client(
             Trigger, '/pickup_supervisor/start_loading')
+        self.start_transport = self.create_client(
+            Trigger, '/pickup_supervisor/start_continuous_transport')
         self.start_joint_transfer = self.create_client(
             Trigger, '/pickup_supervisor/start_joint_transfer')
         self.accept_direct_transfer = self.create_client(
@@ -73,6 +76,7 @@ class PlacePipeline(Node):
         self.abort_supervisor = self.create_client(
             Trigger, '/pickup_supervisor/abort')
         self.create_service(Trigger, '/place_pipeline/start', self.start_callback)
+        self.create_service(Trigger, '/place_pipeline/start_continuous', self.start_continuous)
         self.create_service(Trigger, '/place_pipeline/abort', self.abort_callback)
         self.create_service(Trigger, '/place_pipeline/reset', self.reset_callback)
         self.create_timer(0.1, self.tick)
@@ -98,6 +102,24 @@ class PlacePipeline(Node):
         self.pallet_status = message.data
 
     def start_callback(self, _request, response):
+        return self._start(response, continuous=False)
+
+    def start_continuous(self, _request, response):
+        if self.state in self.ACTIVE:
+            response.message = f'place pipeline already active in {self.state}'
+            return response
+        if not self.scene_status.get('attached_item_id'):
+            self.operation_id += 1
+            self.state = self.WAIT_ATTACHMENT
+            self.phase_started = time.monotonic()
+            self.fault = ''
+            response.success = True
+            response.message = 'waiting for confirmed carried-item attachment'
+            self.publish_status()
+            return response
+        return self._start(response, continuous=True)
+
+    def _start(self, response, continuous):
         if self.state in self.ACTIVE:
             response.message = f'place pipeline already active in {self.state}'
             return response
@@ -110,6 +132,9 @@ class PlacePipeline(Node):
             return self._reject_start(
                 response, 'transfer target preparation service is unavailable')
         self.operation_id += 1
+        self.continuous_transport = continuous
+        self.continuous_ack_started = None
+        self.continuous_ack_received = False
         self.fault = ''
         self.transfer_fallback_used = False
         self.transfer_fallback_reason = ''
@@ -166,6 +191,15 @@ class PlacePipeline(Node):
             self._fault(f'motion execution rejected: {message}')
 
     def tick(self):
+        if self.state == self.WAIT_ATTACHMENT:
+            if self.scene_status.get('attached_item_id'):
+                self.state = self.IDLE
+                response = self._start(Trigger.Response(), continuous=True)
+                if not response.success:
+                    self._fault(response.message)
+            elif time.monotonic() - self.phase_started > 5.0:
+                self._fault('timed out waiting for carried-item attachment')
+            return
         if self.state not in self.ACTIVE or self.state == self.ABORTING:
             return
         if time.monotonic() - self.phase_started > self.motion_timeout:
@@ -221,6 +255,18 @@ class PlacePipeline(Node):
             return
         state = self.motion_status.get('state')
         if state == 'PREPARED' and self.pending_motion == 'transfer_preparing':
+            if getattr(self, 'continuous_transport', False):
+                if not self.start_transport.service_is_ready():
+                    self._fault('continuous transport service is unavailable')
+                    return
+                self.state = self.LOAD_PRE_PLACE
+                self.phase_started = time.monotonic()
+                self.loading_succeeded_at = None
+                self.expected_supervisor_operation_id = int(
+                    self.supervisor_status.get('operation_id', 0)) + 1
+                future = self.start_transport.call_async(Trigger.Request())
+                future.add_done_callback(self._start_loading_completed)
+                return
             if self.motion_status.get(
                     'keep_eef_perpendicular_to_pallet', False):
                 self.get_logger().info(
@@ -354,6 +400,10 @@ class PlacePipeline(Node):
         if state == 'FAULT':
             self._fault(self.supervisor_status.get('fault', 'linear loading failed'))
         elif state == 'SUCCEEDED':
+            if self.supervisor_status.get('continuous_return_completed'):
+                self.state, self.pending_motion = self.SUCCEEDED, None
+                self.publish_status()
+                return
             if self.supervisor_status.get('place_fallback_used'):
                 self.loading_succeeded_at = None
                 self.get_logger().warning(
@@ -361,6 +411,9 @@ class PlacePipeline(Node):
                     f'{self.supervisor_status.get("place_fallback_reason", "")}; '
                     'returning to observation without starting safe-servo place')
                 self._begin_observation_motion()
+                return
+            if (getattr(self, 'continuous_transport', False) and
+                    not self._continuous_transport_acknowledged()):
                 return
             if self.loading_succeeded_at is None:
                 self.loading_succeeded_at = time.monotonic()
@@ -381,6 +434,59 @@ class PlacePipeline(Node):
                 self.supervisor_status.get('operation_id', 0)) + 1
             future = self.start_place.call_async(Trigger.Request())
             future.add_done_callback(self._start_place_completed)
+
+    def _continuous_transport_acknowledged(self):
+        """Finish the coordinator operation before requesting guarded descent.
+
+        Continuous transport already reached pre-place, so the legacy direct
+        transfer callback must NOT be used: it would start another loading move.
+        Require both the service response and matching coordinator telemetry.
+        """
+        if not self.supervisor_status.get('direct_transfer_succeeded'):
+            self._fault('continuous transport completion was not verified')
+            return False
+        if (self.motion_status.get('operation_id') != self.expected_motion_operation_id or
+                self.motion_status.get('target') != 'transfer'):
+            self._fault('coordinator operation changed before continuous transport handoff')
+            return False
+        now = time.monotonic()
+        if self.continuous_ack_started is None:
+            if self.motion_status.get('state') != 'PREPARED':
+                self._fault('continuous transport handoff requires its prepared coordinator target')
+                return False
+            if not self.accept_direct_transfer.service_is_ready():
+                self._fault('continuous transport acknowledgement service unavailable')
+                return False
+            self.continuous_ack_started = now
+            self.pending_motion = 'continuous_accepting'
+            operation = self.operation_id
+            future = self.accept_direct_transfer.call_async(Trigger.Request())
+            future.add_done_callback(
+                lambda done: self._continuous_ack_completed(done, operation))
+            return False
+        if self.continuous_ack_received and self.motion_status.get('state') == 'SUCCEEDED':
+            return True
+        if now - self.continuous_ack_started > 5.0:
+            self._fault('timed out confirming continuous transport coordinator completion')
+        return False
+
+    def _continuous_ack_completed(self, future, operation):
+        if (self.operation_id != operation or self.state != self.LOAD_PRE_PLACE or
+                self.pending_motion != 'continuous_accepting'):
+            return
+        try:
+            result = future.result()
+            if result is None or not result.success:
+                message = 'no response' if result is None else result.message
+                self._fault(f'continuous transport acknowledgement rejected: {message}')
+                return
+        except Exception as exc:
+            self._fault(f'continuous transport acknowledgement failed: {exc}')
+            return
+        self.continuous_ack_received = True
+        self.pending_motion = None
+        self.get_logger().info(
+            'continuous transport acknowledged; waiting for coordinator SUCCEEDED before safe-servo')
 
     def _start_place_completed(self, future):
         try:
@@ -403,6 +509,10 @@ class PlacePipeline(Node):
         if state == 'FAULT':
             self._fault(self.supervisor_status.get('fault', 'guarded place failed'))
         elif state == 'SUCCEEDED':
+            if self.supervisor_status.get('continuous_return_completed'):
+                self.state, self.pending_motion = self.SUCCEEDED, None
+                self.publish_status()
+                return
             if self.supervisor_status.get('place_fallback_used'):
                 self.get_logger().warning(
                     'guarded place completed through singularity fallback: '

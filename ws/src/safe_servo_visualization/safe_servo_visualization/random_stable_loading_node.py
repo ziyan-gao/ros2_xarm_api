@@ -63,6 +63,7 @@ class RandomStableLoadingNode(Node):
                 self.get_parameter('com_bound_ratio').value),
             height_tolerance=float(
                 self.get_parameter('height_tolerance').value),
+            use_fm=bool(self.get_parameter('use_fm').value),
             vertical_loading_filter_enabled=bool(self.get_parameter(
                 'vertical_loading_filter_enabled').value),
         )
@@ -76,6 +77,7 @@ class RandomStableLoadingNode(Node):
         self.declare_parameter('scan_downscale', 2)
         self.declare_parameter('com_bound_ratio', 0.2)
         self.declare_parameter('height_tolerance', 0.0)
+        self.declare_parameter('use_fm', True)
         self.declare_parameter('vertical_loading_filter_enabled', True)
         self.declare_parameter('packing_height_resolution_mm', 5)
         self.declare_parameter('transfer_corner_height_m', 0.47)
@@ -207,7 +209,7 @@ class RandomStableLoadingNode(Node):
         self.get_logger().info(
             'random stable loading ready: container=%s mm, clearance=%d mm (%s), '
             'vertical_filter=%s, selection=random_at_minimum_z, '
-            'com_bound_ratio=%.2f, height_tolerance=%.1f mm, '
+            'com_bound_ratio=%.2f, height_tolerance=%.1f mm, use_fm=%s, '
             'transfer_corner_height=%.3f m, '
             'auto_start=%s' % (
                 container_size,
@@ -216,6 +218,7 @@ class RandomStableLoadingNode(Node):
                 str(self.loader.vertical_loading_filter_enabled).lower(),
                 self.loader.com_bound_ratio,
                 self.loader.height_tolerance,
+                str(self.loader.use_fm).lower(),
                 self.transfer_corner_height,
                 self.auto_start))
 
@@ -925,6 +928,7 @@ class RandomStableLoadingNode(Node):
             'candidate_sampling_enabled': False,
             'com_bound_ratio': self.loader.com_bound_ratio,
             'height_tolerance_mm': self.loader.height_tolerance,
+            'use_fm': self.loader.use_fm,
             'container_size_mm': list(self.loader.container_size),
             'clearance_mm': self.loader.clearance_mm,
             'clearance_mode': self.loader.clearance_mode,

@@ -179,6 +179,7 @@ def test_status_reports_shared_random_loading_geometry():
         clearance_mode='one_sided',
         com_bound_ratio=0.25,
         height_tolerance=10.0,
+        use_fm=False,
         vertical_loading_filter_enabled=False,
     )
     node.transfer_corner_height = 0.33
@@ -191,10 +192,23 @@ def test_status_reports_shared_random_loading_geometry():
     assert payload['clearance_mm'] == 12
     assert payload['clearance_mode'] == 'one_sided'
     assert payload['height_tolerance_mm'] == pytest.approx(10.0)
+    assert payload['use_fm'] is False
     assert payload['vertical_loading_filter_enabled'] is False
     assert payload['selection_pipeline'] == 'stable_then_random_at_minimum_z'
     assert payload['transfer_corner_height_m'] == pytest.approx(0.33)
     assert payload['random_loading_config_path'] == '/config/random.yaml'
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_build_loader_passes_fm_parameter(enabled):
+    node = object.__new__(RandomStableLoadingNode)
+    parameters = dict(clearance_mm=10, clearance_mode='one_sided', seed=101,
+                      scan_downscale=2, com_bound_ratio=.2, height_tolerance=5.,
+                      vertical_loading_filter_enabled=False, use_fm=enabled)
+    node.get_parameter = lambda name: SimpleNamespace(value=parameters[name])
+    loader = node._build_loader((450, 500, 450))
+    assert loader.use_fm is enabled
+    assert loader.env.heu_stable.use_fm is enabled
 
 
 def test_live_visualization_draws_virtual_item_dimensions():

@@ -508,11 +508,9 @@ class PalletLocalization(Node):
         deck.pose.position.z = -0.0025
         deck.pose.orientation.w = 1.0
         deck.scale.x, deck.scale.y, deck.scale.z = self.pallet_x, self.pallet_y, 0.005
-        if self.locked:
-            deck.color.r, deck.color.g, deck.color.b = 0.1, 0.85, 0.25
-        else:
-            deck.color.r, deck.color.g, deck.color.b = 1.0, 0.65, 0.05
-        deck.color.a = 0.32
+        # Match the MoveIt pallet_surface color; keep preview translucent.
+        deck.color.r, deck.color.g, deck.color.b = 0.55, 0.30, 0.12
+        deck.color.a = 0.90 if self.locked else 0.32
         self.marker_pub.publish(deck)
         label = Marker()
         label.header = deck.header

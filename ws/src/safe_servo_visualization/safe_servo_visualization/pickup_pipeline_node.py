@@ -167,6 +167,9 @@ class PickupPipeline(Node):
             Trigger, '/pickup_supervisor/start_probe')
         self.grasp_at_contact_client = self.create_client(
             Trigger, '/pickup_supervisor/grasp_at_contact')
+        self.grasp_hold_client = self.create_client(
+            Trigger, '/pickup_supervisor/grasp_and_hold')
+        self.defer_lift = False
         self.clear_object_info_client = self.create_client(
             Trigger, '/pickup_supervisor/clear_object_info')
         self.abort_pickup_client = self.create_client(
@@ -177,6 +180,7 @@ class PickupPipeline(Node):
             Trigger, '/pickup_supervisor/reset')
 
         self.create_service(Trigger, '/pickup_pipeline/start', self.start_callback)
+        self.create_service(Trigger, '/pickup_pipeline/start_for_transport', self.start_for_transport)
         self.create_service(
             Trigger, '/pickup_pipeline/estimate_object_info',
             self.estimate_object_info_callback)
@@ -243,7 +247,17 @@ class PickupPipeline(Node):
         return marker
 
     def start_callback(self, _request, response):
+        if self.state not in self.ACTIVE:
+            self.defer_lift = False
         return self._start(response, estimation_only=False)
+
+    def start_for_transport(self, _request, response):
+        if self.state not in self.ACTIVE:
+            self.defer_lift = True
+        return self._start(response, estimation_only=False)
+
+    def _grasp_client(self):
+        return self.grasp_hold_client if getattr(self, 'defer_lift', False) else self.grasp_at_contact_client
 
     def estimate_object_info_callback(self, _request, response):
         return self._start(response, estimation_only=True)
@@ -304,7 +318,7 @@ class PickupPipeline(Node):
                 response.message = 'object information is already ready at contact'
                 self.publish_status()
                 return response
-            if not self.grasp_at_contact_client.service_is_ready():
+            if not self._grasp_client().service_is_ready():
                 response.message = 'grasp-at-contact service is unavailable'
                 return response
             self.pending_motion = None
@@ -313,7 +327,7 @@ class PickupPipeline(Node):
             self.phase_started = time.monotonic()
             self.state = self.SERVO_PICKUP
             self.grasp_requested = True
-            future = self.grasp_at_contact_client.call_async(Trigger.Request())
+            future = self._grasp_client().call_async(Trigger.Request())
             future.add_done_callback(self._grasp_at_contact_completed)
             response.success = True
             response.message = 'object information ready; pickup started at contact'
@@ -726,11 +740,11 @@ class PickupPipeline(Node):
                 self.publish_status()
                 return
             if not self.grasp_requested:
-                if not self.grasp_at_contact_client.service_is_ready():
+                if not self._grasp_client().service_is_ready():
                     self._set_fault('grasp-at-contact service is unavailable')
                     return
                 self.grasp_requested = True
-                future = self.grasp_at_contact_client.call_async(
+                future = self._grasp_client().call_async(
                     Trigger.Request())
                 future.add_done_callback(self._grasp_at_contact_completed)
             return

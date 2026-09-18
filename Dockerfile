@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-moveit-servo \
     ros-jazzy-pilz-industrial-motion-planner \
     ros-jazzy-ros2-control \
+    ros-jazzy-ros2-control-cmake \
+    ros-jazzy-ament-cmake-gen-version-h \
     ros-jazzy-ros2-controllers \
     ros-jazzy-joint-state-publisher \
     ros-jazzy-xacro \
@@ -49,6 +51,19 @@ COPY patches/xarm_realmove_joint_states.patch /tmp/xarm_realmove_joint_states.pa
 COPY patches/xarm_control_write_watchdog.patch /tmp/xarm_control_write_watchdog.patch
 COPY patches/xarm_nonblocking_report_states.patch /tmp/xarm_nonblocking_report_states.patch
 COPY patches/xarm_control_handoff_lifecycle_guard.patch /tmp/xarm_control_handoff_lifecycle_guard.patch
+COPY patches/ros2_control_fault_stop.patch /tmp/ros2_control_fault_stop.patch
+
+# Match the installed ABI exactly; do not silently mix this patch with another
+# ros2_control release. This overlay only changes stop-only error cleanup.
+RUN grep -q '<version>4.48.0</version>' /opt/ros/jazzy/share/hardware_interface/package.xml && \
+    git clone --branch 4.48.0 --depth 1 https://github.com/ros-controls/ros2_control.git /opt/ros2_control_ws/src/ros2_control && \
+    cd /opt/ros2_control_ws/src/ros2_control && \
+    test "$(git rev-parse HEAD)" = cdbc1127521074c2c5d19b4af2b73591e69d762b && \
+    git apply /tmp/ros2_control_fault_stop.patch && \
+    source /opt/ros/jazzy/setup.bash && \
+    cd /opt/ros2_control_ws && \
+    colcon build --base-paths src/ros2_control/hardware_interface \
+      --packages-select hardware_interface --cmake-args -DBUILD_TESTING=OFF
 
 # Official UFACTORY ROS 2 driver and collision-aware planning stack. Gazebo is
 # excluded from this real-robot image by the manifest-only patch copied above.
@@ -73,6 +88,7 @@ RUN mkdir -p /opt/xarm_ws/src && \
     git apply /tmp/xarm_nonblocking_report_states.patch && \
     git apply /tmp/xarm_control_handoff_lifecycle_guard.patch && \
     source /opt/ros/jazzy/setup.bash && \
+    source /opt/ros2_control_ws/install/setup.bash && \
     rosdep update && \
     rosdep install --from-paths \
       /opt/xarm_ws/src/xarm_ros2/uf_ros_lib \

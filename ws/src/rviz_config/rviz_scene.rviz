@@ -278,7 +278,7 @@ Visualization Manager:
       Enabled: true
       Name: Depth Refined Boxes
       Namespaces:
-        depth_refined_box_labels: true
+        depth_refined_box_labels: false
         depth_refined_boxes: true
       Topic:
         Depth: 5

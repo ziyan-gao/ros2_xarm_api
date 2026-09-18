@@ -1,5 +1,195 @@
 # Collision-Aware Pick-and-Place Motion Plan
 
+## Continuous new-item transport
+
+Combined PickAndPlace now defaults to one **lift → overhead transfer →
+pre-place descent** trajectory. After contact measurement and verified suction,
+pickup holds at contact (without performing its old separate retreat). The
+place pipeline waits for the attached-item geometry, prepares the pallet target,
+then plans and validates the complete path before moving.
+
+- Cartesian lift/descent legs have fixed orientation. Two rounded upper corners
+  lie above the configured item-bottom clearance; yaw changes smoothly on the
+  elevated segment. The blend adds up to 40 mm to the clearance-level TCP height,
+  plus a 2 mm geometry margin. A workspace-ceiling violation rejects the path.
+- MoveIt's Cartesian path service solves the entire path with collision checks;
+  no sampling-based free-space planner or direct-service fallback is used here.
+  Partial paths are rejected. The timed controller spline is additionally checked
+  for joint limits, collision, tool tilt, and carried-item clearance. Sampled
+  collision checks are not a continuous-collision guarantee.
+  Continuous transport does not apply the start-relative
+  `direct_transfer_max_joint_delta_rad` cap. Absolute joint-position limits,
+  collision checks, and velocity/acceleration limits remain enforced. The cap
+  remains unchanged for the legacy direct joint-transfer path.
+  Endpoint velocities are explicitly set to zero before spline validation and
+  timing adjustment; nonzero endpoint velocities returned by the Cartesian
+  service no longer reject an otherwise usable path.
+- One FollowJointTrajectory goal executes all three legs in ROS control/mode 1.
+  The non-servo speed slider scales limits. Feasible original interval times are
+  retained exactly; violations receive local timing repairs with smooth
+  neighboring transitions (0.5 s neighborhood in original trajectory time).
+  The worst interval no longer unconditionally stretches the whole path.
+  Shared knot velocities are reduced using the local time scale; acceleration
+  is recomputed and all intervals rechecked after each repair. A verified uniform
+  timing candidate is used only if it is shorter than the local repair result.
+  Repairs are bounded to 20 passes / a 10 s processing deadline and fail closed
+  if unresolved. Logs report original/final duration, adjusted interval count,
+  timing strategy and the initial limiting joint/interval/derivative.
+  These changes do not relax the configured velocity/acceleration limits
+  and do not guarantee the original duration for an infeasible timed path. Interior stopped
+  waypoints are allowed. Shared interior accelerations are obtained with a
+  tridiagonal minimum-integrated-squared-jerk solve, retaining the planner's
+  knot positions. Only endpoints and full stops are constrained
+  to zero acceleration, rather than artificially resetting acceleration at
+  every dense waypoint. JTC uses C2 quintic interpolation, with continuous
+  acceleration including at stops. This minimizes integrated jerk for the
+  fixed knot data, not necessarily peak jerk or total motion time; derivative
+  limits can still require slower motion on difficult paths.
+  Analytic extrema of this spline are checked for joint bounds, speed,
+  acceleration and (when enabled) jerk; the retimed, nanosecond-quantized curve is checked again
+  and sampled for collision/FK validation at <=20 ms and <=0.02 rad intervals.
+  `CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT=false` is the default: the recently
+  added software jerk cap no longer stretches otherwise valid paths. This
+  restores velocity/acceleration-only timing checks; it does not impose a
+  numerical jerk ceiling. Predicted peak jerk is still logged, and acceleration
+  remains continuous. Set the option to `true` to enforce
+  `CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3` (10 rad/s³ at 100% speed by default,
+  scaled with the non-servo slider). This is an extra software guard, not a
+  manufacturer-certified limit. Jerk may change at knots in either mode;
+  this is not a guarantee of hardware tracking or absence of vibration.
+  The robot still stops at pre-place to enable final safe-servo.
+  Controller success enters `TRANSPORT_VERIFYING`: a complete measured joint
+  sample must be received and timestamped after completion. FK from that sample
+  must place the TCP within 10 mm of pre-place. Verification allows up to five
+  seconds for settling/service feedback; stale samples or a persistent mismatch
+  cannot authorize descent. Cached 2 Hz Servo TCP telemetry is not used here.
+  Before enabling Servo, the place pipeline acknowledges the completed transport
+  through the coordinator and waits for matching-operation `SUCCEEDED` telemetry,
+  then observes the existing telemetry-settling interval. A failed acknowledgement
+  or a five-second confirmation timeout faults without starting descent.
+- Force contact on the final non-servo descent cancels that goal. Release requires
+  accepted cancellation, a terminal controller result, and fresh stationary joint
+  feedback for 250 ms. Failed stop confirmation keeps the gripper closed and faults.
+  Confirmed contact uses the existing release, upward retreat and observation flow.
+- Before-motion kinematic rejections retain the random-loading resampling path.
+  Invalid timing or derivative data stops the cycle without excluding loading poses.
+  Execution failures do not resample or silently switch to direct motion.
+- Pick-only, staging store/retrieve, and standalone legacy place remain unchanged.
+
+Docker `.env` settings (defaults shown):
+
+```ini
+CONTINUOUS_TRANSPORT_ENABLED=true
+CONTINUOUS_RETURN_ENABLED=true
+CONTINUOUS_TRANSPORT_BLEND_RADIUS_M=0.04
+CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT=false
+```
+
+Set `CONTINUOUS_TRANSPORT_ENABLED=false` to restore the previous split sequence.
+Recreate the Compose service to apply changes (`docker compose up -d --force-recreate`);
+the startup script builds the mounted ROS workspace. Do this only with the robot
+stopped and the cell clear. This feature requires real-hardware commissioning at
+reduced speed; offline regression tests do not validate physical stopping distance.
+
+### Connected post-release return
+
+For continuous-transport cycles, successful pallet release/detachment now starts
+two stages: **slow vertical retreat to pre-place**, then one
+**vertical lift → rounded overhead transition → observation** trajectory.
+The first leg uses the existing direct-mode ownership handoff and a relative
+vertical command at at most `return_clearance_speed_mm_s` (default 10 mm/s,
+allowed range (0, 30]), with acceleration capped at 100 mm/s². It never moves
+downward if release already occurred above pre-place. Completion and live height
+are checked before planning the continuous leg.
+There is a stationary handoff/planning interval between the stages,
+with no required stop at the elevated waypoint. Interior all-joint stops are
+allowed with the same C2 interpolation and derivative checks as outbound paths.
+If MoveIt returns a complete geometric return path but no usable timing
+(empty velocity arrays or non-increasing timestamps), or smooth retiming
+exceeds the bounded validation sample budget on return,
+the supervisor instead uses the previous staged route:
+confirm Servo paused, deactivate ROS writers and confirm direct mode, retreat
+vertically to the saved overhead height, restore ROS control with its existing
+fresh-feedback/settling gate, then request the separate observation plan.
+The slow pre-place clearance leg is not repeated and the rejected trajectory is
+never submitted. This fallback is one-shot and requires fresh stationary robot
+feedback, no attached item, and an upward target within the workspace ceiling.
+All response points are checked for joint names, array lengths and finite
+positions/derivatives before any indexing. An untimed return must also match
+the measured start and saved observation joints and satisfy joint-position
+bounds before selecting fallback. No missing velocities are filled with zeros
+to make an untimed path executable. Outbound timing failure faults while
+retaining the carried item; it does not trigger release or resampling.
+Collision, partial-path, malformed geometry/arrays, hardware, and execution faults
+still stop the cycle; they do not trigger this fallback. This is containment,
+not a guarantee of jerk continuity or singularity avoidance. The empty TCP initially retreats
+at fixed orientation to at least the recorded transfer TCP height; orientation
+changes occur on the elevated segment. Both upper bends stay above that level.
+
+Servo must confirm pause before the slow leg; ROS controllers are deactivated
+and direct mode 0 is confirmed before that command. After the slow leg,
+the existing hardware/controller restoration
+sequence then confirms mode 1, active controllers and fresh joint samples. An
+already healthy mode-1 system retains ownership. Direct-mode recovery restores
+the hardware and controllers before continuing. Both routes enforce
+`POST_RESTORE_SETTLE_SEC` (default 0.75 s), the configured ready-sample count, and
+an uninterrupted healthy interval; a readiness interruption restarts the delay.
+A 30-second handoff deadline prevents an indefinite wait. No return trajectory
+is sent until this gate has completed.
+
+The saved observation joints in `config/taught_waypoints.yaml` anchor the return:
+Cartesian IK is solved backward from observation, then the timed path is reversed
+and fully revalidated. A mismatching release IK branch is rejected rather than
+joined by an unchecked joint move. Absolute joint limits, collision checks,
+clearance, endpoint speeds, and timing limits remain enforced. Completion also
+requires fresh observation TCP and joint verification; the place pipeline then
+finishes without commanding observation a second time.
+
+Confirmed early-contact and singularity-recovery releases in the same cycle use
+this return too. A failed release/detach does not authorize it. Return planning
+errors fault; they do not resample a loading target for an item already released.
+Set `CONTINUOUS_RETURN_ENABLED=false` to retain split retreat/observation behavior
+without disabling continuous outbound transport. Pick-only and staging are unchanged.
+
+### Servo-J write-stall containment
+
+The patched hardware requests STOP and returns ERROR after any failed Servo-J
+write, one write taking at least 100 ms, or two consecutive writes over 30 ms.
+The fault latch blocks subsequent writes and lifecycle reactivation; automatic
+controller restoration cannot clear it. Inspect the robot and communication
+fault before an operator-approved hardware-process restart. A restart is not a
+repair of the latency source, and must not be followed by automatic cycle replay.
+This watchdog measures a blocking call after it returns: it cannot prevent the
+initial stall or guarantee STOP delivery over a stalled connection.
+
+These C++ patch changes require rebuilding the Docker image; restarting an old
+image only loads the Python changes, not the hardware watchdog fix. Validate in
+isolation first. No live restart or physical motion is performed by offline tests.
+
+### Controller fault cleanup and partial-path diagnostics
+
+`patches/ros2_control_fault_stop.patch` fixes stop-only cleanup when a hardware
+error has already made every interface in the stop list unavailable. Existence
+checks still apply, and every interface must belong to a component in the current
+read/write cycle's failed-hardware list. Merely unconfigured hardware is not
+exempted. Requests with start interfaces do not use the exception;
+the hardware fault latch still blocks reactivation. The image builds a
+`hardware_interface` overlay from pinned ros2_control 4.48.0 and requires the
+installed version to match, avoiding a silent ABI mismatch. Rebuilding and
+recreating the image is necessary; the live stack is not updated by source edits.
+
+For partial Cartesian responses, the supervisor now probes the requested
+waypoint interval identified by `fraction * waypoint_count`, seeded from the
+last returned joints. This is an approximation: MoveIt does not return the exact
+failed internal interpolation pose. A diagnostic IK request ignores collisions
+only to separate solving from a subsequent state-validity query. Diagnostic
+solutions are never executed. Logs report the target/waypoint/XYZ, IK result,
+joint-bound violations, or up to eight collision pairs. A valid nearby probe
+does not validate the whole path. All outcomes preserve the original rejection
+and random-target resampling, with a two-second diagnostic deadline and stale
+callback guards. This explains future partial paths; it does not retrospectively
+prove why the earlier 60.9% path failed.
+
 ## Goal
 
 Implement a repeatable pick-and-place cycle for the UFACTORY 850 that combines:

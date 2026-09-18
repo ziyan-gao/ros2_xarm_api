@@ -27,6 +27,11 @@ set -u
 : "${PLACE_SINGULARITY_STEP_SPEED_MM_S:=10.0}"
 : "${DIRECT_CARTESIAN_MAX_SPEED_MM_S:=200.0}"
 : "${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2:=500.0}"
+: "${CONTINUOUS_TRANSPORT_ENABLED:=true}"
+: "${CONTINUOUS_RETURN_ENABLED:=true}"
+: "${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M:=0.04}"
+: "${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3:=10.0}"
+: "${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT:=false}"
 : "${RANDOM_LOADING_AUTO_START:=false}"
 : "${RANDOM_LOADING_CONFIG_PATH:=/opt/neuromeka_bin_packing/configs/real_platform_random.yaml}"
 : "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M:=0.480}"
@@ -80,7 +85,8 @@ IFS=$'\t' read -r \
   RANDOM_LOADING_HEIGHT_TOLERANCE_MM \
   RANDOM_LOADING_VERTICAL_FILTER_ENABLED \
   RANDOM_LOADING_HEIGHT_RESOLUTION_MM \
-  TRANSFER_CORNER_HEIGHT_M <<< "${random_loading_fields}"
+  TRANSFER_CORNER_HEIGHT_M \
+  RANDOM_LOADING_USE_FM <<< "${random_loading_fields}"
 
 if [[ -z "${RANDOM_LOADING_CONTAINER_CSV}" ||
       -z "${RANDOM_LOADING_CLEARANCE_MM}" ||
@@ -91,11 +97,13 @@ if [[ -z "${RANDOM_LOADING_CONTAINER_CSV}" ||
       -z "${RANDOM_LOADING_HEIGHT_TOLERANCE_MM}" ||
       -z "${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}" ||
       -z "${RANDOM_LOADING_HEIGHT_RESOLUTION_MM}" ||
-      -z "${TRANSFER_CORNER_HEIGHT_M}" ]]; then
+      -z "${TRANSFER_CORNER_HEIGHT_M}" ||
+      -z "${RANDOM_LOADING_USE_FM}" ]]; then
   echo "FATAL: random-loading configuration returned incomplete startup values." >&2
   exit 2
 fi
 RANDOM_LOADING_CONTAINER_ROS="[${RANDOM_LOADING_CONTAINER_CSV//,/, }]"
+echo "Random loading feasibility-map mask: use_fm=${RANDOM_LOADING_USE_FM}"
 echo "Random loading config: container=${RANDOM_LOADING_CONTAINER_ROS} mm, clearance=${RANDOM_LOADING_CLEARANCE_MM} mm (${RANDOM_LOADING_CLEARANCE_MODE}), height tolerance=${RANDOM_LOADING_HEIGHT_TOLERANCE_MM} mm, vertical filter=${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}, transfer corner height=${TRANSFER_CORNER_HEIGHT_M} m"
 
 # A non-real-time controller_manager previously missed tens of Servo-J write
@@ -163,9 +171,14 @@ start_required "pickup pipeline orchestrator" \
 start_required "place pipeline orchestrator" \
   ros2 run safe_servo_visualization place_pipeline
 start_required "combined PickAndPlace orchestrator" \
-  ros2 run safe_servo_visualization pick_place_pipeline
+  ros2 run safe_servo_visualization pick_place_pipeline --ros-args \
+    -p continuous_transport_enabled:="${CONTINUOUS_TRANSPORT_ENABLED}"
 start_required "supervised Phase 4 pickup coordinator" \
   ros2 run safe_servo_visualization pickup_supervisor --ros-args \
+    -p continuous_return_enabled:="${CONTINUOUS_RETURN_ENABLED}" \
+    -p continuous_transport_blend_radius_m:="${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M}" \
+    -p continuous_transport_max_joint_jerk_rad_s3:="${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3}" \
+    -p continuous_transport_enforce_jerk_limit:="${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT}" \
     -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
     -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}" \
     -p place_descent_timeout_sec:="${PLACE_DESCENT_TIMEOUT_SEC}" \
@@ -214,6 +227,7 @@ start_required "real-platform random stable-loading coordinator" \
     -p scan_downscale:="${RANDOM_LOADING_SCAN_DOWNSCALE}" \
     -p com_bound_ratio:="${RANDOM_LOADING_COM_BOUND_RATIO}" \
     -p height_tolerance:="${RANDOM_LOADING_HEIGHT_TOLERANCE_MM}" \
+    -p use_fm:="${RANDOM_LOADING_USE_FM}" \
     -p vertical_loading_filter_enabled:="${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p random_loading_config_path:="${RANDOM_LOADING_CONFIG_PATH}" \

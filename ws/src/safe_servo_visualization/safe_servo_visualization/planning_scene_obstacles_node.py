@@ -177,6 +177,13 @@ class PlanningSceneObstacles(Node):
         scene = PlanningScene()
         scene.is_diff = True
         scene.world.collision_objects = objects
+        for obj in objects:
+            if obj.id == 'pallet_surface' and obj.operation == CollisionObject.ADD:
+                color = ObjectColor()
+                color.id = obj.id
+                color.color.r, color.color.g, color.color.b = 0.55, 0.30, 0.12
+                color.color.a = 0.90
+                scene.object_colors.append(color)
         return self._apply_scene(scene, description, on_success)
 
     def _apply_scene(self, scene, description, on_success=None):
