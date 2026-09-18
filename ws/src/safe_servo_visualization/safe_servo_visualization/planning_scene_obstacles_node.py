@@ -121,6 +121,13 @@ class PlanningSceneObstacles(Node):
             message.markers.append(self._marker_from_box(obj, marker_id))
         self.placed_marker_pub.publish(message)
 
+    def _placed_item_visual_ids(self):
+        """Return IDs represented by RViz markers, obstacle or visual-only."""
+        return sorted({
+            str(obj.id) for obj in self.placed_item_visuals.values()
+            if getattr(obj, 'id', '')
+        })
+
     def _box(self, object_id, size, center, orientation=None):
         obj = CollisionObject()
         obj.header.frame_id, obj.id = self.base_frame, object_id
@@ -650,15 +657,22 @@ class PlanningSceneObstacles(Node):
         return response
 
     def remove_placed_item_callback(self, request, response):
-        """Remove one staged world object before its supervised pickup."""
+        """Remove one placed-item obstacle and/or its visual-only marker."""
         object_id = f'placed_item_{int(request.data)}'
         if self.apply_pending:
             response.ret = 1
             response.message = 'planning-scene update is busy'
             return response
-        if object_id not in self.placed_item_ids:
+        collision_registered = object_id in self.placed_item_ids
+        visual_registered = object_id in self._placed_item_visual_ids()
+        if not collision_registered and not visual_registered:
             response.ret = 2
-            response.message = f'placed collision object not found: {object_id}'
+            response.message = f'placed item not found: {object_id}'
+            return response
+        if not collision_registered:
+            self._one_placed_item_removed(object_id)
+            response.ret = 0
+            response.message = f'removed visual-only placed item {object_id}'
             return response
         obj = CollisionObject()
         obj.header.frame_id = self.base_frame
@@ -709,6 +723,7 @@ class PlanningSceneObstacles(Node):
                 self.attached_item_orientation,
             'placed_item_ids': list(self.placed_item_ids),
             'placed_item_count': len(self.placed_item_ids),
+            'placed_item_visual_ids': self._placed_item_visual_ids(),
             'placed_item_visual_count': len(self.placed_item_visuals),
             'add_placed_item_obstacle': self.add_placed_item_obstacle,
             'last_placement_error': self.last_placement_error,

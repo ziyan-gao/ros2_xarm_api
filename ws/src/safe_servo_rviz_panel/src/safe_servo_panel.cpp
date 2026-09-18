@@ -225,8 +225,9 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   motion_speed_->setPageStep(10);
   motion_speed_->setValue(80);
   motion_speed_->setToolTip(
-    "Controls MoveIt and direct robot-service motion. Safe-servo speed is unchanged.");
-  motion_speed_label_ = new QLabel("30% (30 mm/s service, 9% MoveIt)", this);
+    "Scales the commissioned MoveIt, joint-transfer, and direct Cartesian "
+    "motion envelopes. Safe-servo speed is unchanged.");
+  motion_speed_label_ = new QLabel("80% of non-servo motion envelope", this);
   auto * motion_speed_layout = new QVBoxLayout();
   motion_speed_layout->addWidget(motion_speed_);
   motion_speed_layout->addWidget(motion_speed_label_);
@@ -236,8 +237,7 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
     this, [this](double) {publishConfig();});
   connect(motion_speed_, &QSlider::valueChanged, this, [this](int value) {
     motion_speed_label_->setText(
-      QString("%1% (%1 mm/s service, %2% MoveIt)")
-      .arg(value).arg(value * 0.3, 0, 'f', 1));
+      QString("%1% of non-servo motion envelope").arg(value));
     publishMotionSpeed();
   });
   reset_button_ = new VisibleTextButton("Reset fault", this);
@@ -950,10 +950,13 @@ void SafeServoPanel::onInitialize()
           QString("COM bound ratio: %1% of item X/Y").arg(percent));
       }
       if (json.contains("stable_candidate_count")) {
-        text += QString("\nCandidates stable/vertical/sample: %1/%2/%3")
+        const int final_pool = json.contains("minimum_z_candidate_count") ?
+          json.value("minimum_z_candidate_count").toInt() :
+          json.value("sampled_candidate_count").toInt();
+        text += QString("\nCandidates stable/vertical/min-Z pool: %1/%2/%3")
           .arg(json.value("stable_candidate_count").toInt())
           .arg(json.value("vertical_candidate_count").toInt())
-          .arg(json.value("sampled_candidate_count").toInt());
+          .arg(final_pool);
       }
       const auto fault = json.value("fault").toString();
       const auto result = json.value("last_result").toString();
@@ -1117,8 +1120,8 @@ void SafeServoPanel::publishMotionSpeed()
   if (!motion_speed_config_pub_) {return;}
   std_msgs::msg::Float64MultiArray msg;
   const double operator_percent = static_cast<double>(motion_speed_->value());
-  msg.data.push_back(operator_percent * 0.003);  // MoveIt: 0.015 .. 0.30.
-  msg.data.push_back(operator_percent);  // Direct service: 5 .. 100 mm/s.
+  msg.data.push_back(operator_percent / 100.0);  // MoveIt: 0.05 .. 1.00.
+  msg.data.push_back(operator_percent);  // Shared envelope: 5 .. 100%.
   motion_speed_config_pub_->publish(msg);
 }
 

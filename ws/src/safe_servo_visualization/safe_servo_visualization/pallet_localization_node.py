@@ -183,17 +183,22 @@ class PalletLocalization(Node):
             self.publish_status('CONFIGURED AND SAVED')
 
     def loading_target_callback(self, msg):
-        """Apply a bin-packing FLB target without replacing pallet settings.
+        """Apply a physical item-corner target without replacing pallet settings.
 
         Message layout (lengths in millimeters):
-        [sequence_id, item_id, x, y, z, rotate_90,
-         raw_dx, raw_dy, raw_dz, virtual_dx, virtual_dy, virtual_dz]
+        [sequence_id, item_id, physical_x, physical_y, physical_z, rotate_90,
+         raw_dx, raw_dy, raw_dz, virtual_dx, virtual_dy, virtual_dz,
+         virtual_x, virtual_y, virtual_z]
+
+        The final virtual-envelope corner is optional for compatibility with
+        legacy publishers, where the physical and virtual corners coincide.
         """
         if len(msg.data) < 12:
             self.get_logger().error(
                 'random loading target requires 12 numeric fields')
             return
-        values = np.asarray(msg.data[:12], dtype=float)
+        field_count = 15 if len(msg.data) >= 15 else 12
+        values = np.asarray(msg.data[:field_count], dtype=float)
         sequence_id = int(round(values[0])) if math.isfinite(values[0]) else 0
         if not np.isfinite(values).all():
             self.get_logger().error('random loading target contains non-finite values')
@@ -202,15 +207,20 @@ class PalletLocalization(Node):
         item_id = int(round(values[1]))
         xyz_mm = values[2:5]
         virtual_dim_mm = values[9:12]
-        if sequence_id < 1 or np.any(xyz_mm < 0.0) or np.any(virtual_dim_mm <= 0.0):
+        virtual_xyz_mm = values[12:15] if field_count >= 15 else xyz_mm
+        if (sequence_id < 1 or np.any(xyz_mm < 0.0) or
+                np.any(virtual_xyz_mm < 0.0) or
+                np.any(virtual_dim_mm <= 0.0)):
             self.get_logger().error('random loading target contains invalid values')
             self._acknowledge_loading_target(sequence_id, False, 1)
             return
-        if xyz_mm[0] + virtual_dim_mm[0] > self.pallet_x * 1000.0 + 1e-6:
+        if (virtual_xyz_mm[0] + virtual_dim_mm[0] >
+                self.pallet_x * 1000.0 + 1e-6):
             self.get_logger().error('random loading target exceeds pallet X extent')
             self._acknowledge_loading_target(sequence_id, False, 2)
             return
-        if xyz_mm[1] + virtual_dim_mm[1] > self.pallet_y * 1000.0 + 1e-6:
+        if (virtual_xyz_mm[1] + virtual_dim_mm[1] >
+                self.pallet_y * 1000.0 + 1e-6):
             self.get_logger().error('random loading target exceeds pallet Y extent')
             self._acknowledge_loading_target(sequence_id, False, 3)
             return
@@ -226,8 +236,10 @@ class PalletLocalization(Node):
         self._acknowledge_loading_target(sequence_id, True, 0)
         self.get_logger().info(
             'applied random loading target %d for item %d: '
-            'corner=(%.0f, %.0f, %.0f) mm, rotate_90=%s' % (
-                sequence_id, item_id, *xyz_mm, self.rotate_item_90))
+            'physical_corner=(%.0f, %.0f, %.0f) mm, '
+            'virtual_corner=(%.0f, %.0f, %.0f) mm, rotate_90=%s' % (
+                sequence_id, item_id, *xyz_mm, *virtual_xyz_mm,
+                self.rotate_item_90))
 
     def _acknowledge_loading_target(self, sequence_id, accepted, reason_code):
         acknowledgement = Float64MultiArray()

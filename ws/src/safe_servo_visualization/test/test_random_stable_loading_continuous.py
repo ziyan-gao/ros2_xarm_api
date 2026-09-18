@@ -4,6 +4,7 @@ import pytest
 
 from safe_servo_visualization.random_stable_loading_node import (
     RandomStableLoadingNode,
+    round_down_to_increment,
     round_up_to_increment,
 )
 
@@ -35,12 +36,37 @@ class FakePlanningWorker:
         return SimpleNamespace(done=lambda: False)
 
 
+class FakeVisualizationBuilder:
+    def __init__(self):
+        self.calls = []
+
+    def build(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return 'frame'
+
+
+class FakeVisualizationServer:
+    def __init__(self):
+        self.frames = []
+
+    def push(self, frame):
+        self.frames.append(frame)
+
+
 @pytest.mark.parametrize(
     ('measured', 'expected'),
     [(140.0, 140.0), (141.0, 145.0), (149.0, 150.0), (150.0, 150.0)],
 )
 def test_packing_height_is_rounded_up_to_five_millimetres(measured, expected):
     assert round_up_to_increment(measured, 5) == expected
+
+
+@pytest.mark.parametrize(
+    ('measured', 'expected'),
+    [(150.0, 150.0), (149.0, 145.0), (136.0, 135.0), (131.0, 130.0)],
+)
+def test_item_xy_is_rounded_down_to_five_millimetres(measured, expected):
+    assert round_down_to_increment(measured, 5) == expected
 
 
 def test_corrected_object_result_plans_only_during_requested_estimation():
@@ -66,7 +92,7 @@ def test_corrected_object_result_plans_only_during_requested_estimation():
     assert len(node.planning_worker.calls) == 1
     assert node.planning_worker.calls[0][1] == {
         'item_id': 4,
-        'dimensions_mm': (141.0, 149.0, 150.0),
+        'dimensions_mm': (140.0, 145.0, 150.0),
     }
 
 
@@ -143,3 +169,50 @@ def test_disabling_continuous_mode_stops_idle_item_wait():
     assert node.state == 'IDLE'
     assert node.continuous_run_active is False
     assert clears == [True]
+
+
+def test_status_reports_shared_random_loading_geometry():
+    node = object.__new__(RandomStableLoadingNode)
+    node.loader = SimpleNamespace(
+        container_size=(400, 500, 300),
+        clearance_mm=12,
+        clearance_mode='one_sided',
+        com_bound_ratio=0.25,
+        height_tolerance=10.0,
+        vertical_loading_filter_enabled=False,
+    )
+    node.transfer_corner_height = 0.33
+    node.random_loading_config_path = '/config/random.yaml'
+    payload = {}
+
+    node._extend_status(payload, pending=None)
+
+    assert payload['container_size_mm'] == [400, 500, 300]
+    assert payload['clearance_mm'] == 12
+    assert payload['clearance_mode'] == 'one_sided'
+    assert payload['height_tolerance_mm'] == pytest.approx(10.0)
+    assert payload['vertical_loading_filter_enabled'] is False
+    assert payload['selection_pipeline'] == 'stable_then_random_at_minimum_z'
+    assert payload['transfer_corner_height_m'] == pytest.approx(0.33)
+    assert payload['random_loading_config_path'] == '/config/random.yaml'
+
+
+def test_live_visualization_draws_virtual_item_dimensions():
+    node = object.__new__(RandomStableLoadingNode)
+    pending_item = object()
+    node.loader = SimpleNamespace(
+        env=object(),
+        pending_item_for_visualization=lambda: pending_item,
+    )
+    node.visualization_builder = FakeVisualizationBuilder()
+    node.visualization_server = FakeVisualizationServer()
+    node.visualization_fault = ''
+    node.get_logger = lambda: FakeLogger()
+
+    node._push_visualization('virtual footprint')
+
+    assert node.visualization_server.frames == ['frame']
+    args, kwargs = node.visualization_builder.calls[0]
+    assert args == (node.loader.env, 'virtual footprint')
+    assert kwargs['highlighted_items'] == [pending_item]
+    assert kwargs['virtual_boxes'] is True

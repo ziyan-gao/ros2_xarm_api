@@ -25,6 +25,9 @@ class StagingSlots(Node):
     """Store and retrieve carried boxes in six fixed robot-base slots."""
 
     IDLE = 'IDLE'
+    PREPARING_STORE_TRANSFER = 'PREPARING_STORE_TRANSFER'
+    TRANSFERRING_STORE = 'TRANSFERRING_STORE'
+    LOADING_STORE = 'LOADING_STORE'
     SOLVING_STORE_IK = 'SOLVING_STORE_IK'
     PREPARING_DIRECT = 'PREPARING_DIRECT'
     MOVING_DIRECT = 'MOVING_DIRECT'
@@ -42,6 +45,7 @@ class StagingSlots(Node):
     FAULT = 'FAULT'
 
     ACTIVE = {
+        PREPARING_STORE_TRANSFER, TRANSFERRING_STORE, LOADING_STORE,
         SOLVING_STORE_IK, PREPARING_DIRECT, MOVING_DIRECT,
         RESTORING_CONTROL, SETTLING_STORE, PLACING_STORE, PREPARING_RETRIEVAL,
         PLANNING_RETRIEVAL, EXECUTING_RETRIEVAL, SETTLING_RETRIEVAL,
@@ -69,6 +73,8 @@ class StagingSlots(Node):
         self.declare_parameter('motion_timeout_sec', 120.0)
         self.declare_parameter('joint_speed_rad_s', 0.30)
         self.declare_parameter('joint_acc_rad_s2', 0.70)
+        self.declare_parameter('joint_max_speed_rad_s', 2.14)
+        self.declare_parameter('joint_max_acc_rad_s2', 10.0)
         self.declare_parameter('planning_group', 'uf850')
         self.declare_parameter('ik_link_name', 'link_tcp')
         self.declare_parameter('ik_timeout_sec', 1.0)
@@ -111,6 +117,8 @@ class StagingSlots(Node):
         self.motion_timeout = float(p('motion_timeout_sec'))
         self.joint_speed = float(p('joint_speed_rad_s'))
         self.joint_acc = float(p('joint_acc_rad_s2'))
+        self.joint_max_speed = float(p('joint_max_speed_rad_s'))
+        self.joint_max_acc = float(p('joint_max_acc_rad_s2'))
         self.planning_group = str(p('planning_group'))
         self.ik_link_name = str(p('ik_link_name'))
         self.ik_timeout = float(p('ik_timeout_sec'))
@@ -132,7 +140,8 @@ class StagingSlots(Node):
                 'pre_pick_clearance_m')
         if self.retrieval_settle_timeout <= 0.0:
             raise ValueError('retrieval_settle_timeout_sec must be positive')
-        if self.joint_speed <= 0.0 or self.joint_acc <= 0.0:
+        if (self.joint_speed <= 0.0 or self.joint_acc <= 0.0 or
+                self.joint_max_speed <= 0.0 or self.joint_max_acc <= 0.0):
             raise ValueError('staging joint speed and acceleration must be positive')
         if self.ik_timeout <= 0.0:
             raise ValueError('ik_timeout_sec must be positive')
@@ -185,6 +194,10 @@ class StagingSlots(Node):
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
         self.expected_store_place_operation_id = None
+        self.expected_store_transfer_operation_id = None
+        self.store_transfer_phase = ''
+        self.store_transfer_fallback_used = False
+        self.store_transfer_fallback_reason = ''
         self.return_to_observation = True
         self.waiting_removed_id = ''
         self.retrieval_settle_started = None
@@ -192,6 +205,7 @@ class StagingSlots(Node):
         self.retrieval_last_checked_sequence = 0
         self.retrieval_converged_samples = 0
         self._staging_place_timer = None
+        self._store_transfer_timer = None
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -203,6 +217,8 @@ class StagingSlots(Node):
             Float64MultiArray, '/staging_slots/retrieve_target', 10)
         self.place_config_pub = self.create_publisher(
             Float64MultiArray, '/staging_slots/place_config', 10)
+        self.store_transfer_target_pub = self.create_publisher(
+            Float64MultiArray, '/staging_slots/store_transfer_target', 10)
         self.create_subscription(
             Int32, '/staging_slots/select_store', self._select_store, 10)
         self.create_subscription(
@@ -242,6 +258,16 @@ class StagingSlots(Node):
             SetInt16, '/planning_scene_obstacles/remove_placed_item')
         self.plan_staging_pregrasp = self.create_client(
             Trigger, '/motion_coordinator/plan_staging_pregrasp')
+        self.prepare_staging_store_transfer = self.create_client(
+            Trigger, '/motion_coordinator/prepare_staging_store_transfer')
+        self.start_joint_transfer = self.create_client(
+            Trigger, '/pickup_supervisor/start_joint_transfer')
+        self.accept_direct_transfer = self.create_client(
+            Trigger, '/motion_coordinator/accept_direct_transfer')
+        self.plan_transfer = self.create_client(
+            Trigger, '/motion_coordinator/plan_transfer')
+        self.start_loading = self.create_client(
+            Trigger, '/pickup_supervisor/start_loading')
         self.plan_observation = self.create_client(
             Trigger, '/motion_coordinator/plan_observation')
         self.execute_motion = self.create_client(
@@ -324,9 +350,9 @@ class StagingSlots(Node):
         if len(message.data) >= 2:
             speed = float(message.data[1])
             if math.isfinite(speed) and 5.0 <= speed <= 100.0:
-                # The shared panel slider publishes 5..100. Convert that to
-                # a conservative 0.05..1.0 rad/s direct joint speed.
-                self.joint_speed = speed / 100.0
+                scale = speed / 100.0
+                self.joint_speed = self.joint_max_speed * scale
+                self.joint_acc = self.joint_max_acc * scale
 
     def _select_store(self, message):
         if 0 <= int(message.data) < len(self.slots):
@@ -472,23 +498,25 @@ class StagingSlots(Node):
         try:
             geometry = self._attached_geometry()
             target = self._store_target(self.slots[slot_index], geometry)
-            joint_seed = self._fresh_joint_seed()
             pallet_origin_z = self._pallet_origin_z()
         except ValueError as exc:
             response.message = str(exc)
             return response
-        if not self.compute_ik.service_is_ready():
-            response.message = 'MoveIt compute_ik service is unavailable'
+        if not self.prepare_staging_store_transfer.service_is_ready():
+            response.message = 'staging transfer preparation service is unavailable'
             return response
         self.operation = 'store'
         self.return_to_observation = bool(return_to_observation)
         self.active_slot = slot_index
-        self.direct_phase = 'approach_to_servo'
+        self.direct_phase = ''
         self.direct_control_claim_started = False
         self.pending_fault = ''
-        self.state = self.SOLVING_STORE_IK
+        self.state = self.PREPARING_STORE_TRANSFER
         self.fault = ''
         self.last_result = ''
+        self.store_transfer_phase = 'preparing'
+        self.store_transfer_fallback_used = False
+        self.store_transfer_fallback_reason = ''
         self.phase_started = time.monotonic()
         self.pending_record = {
             'slot': slot_index, 'slot_flb_m': self.slots[slot_index],
@@ -501,13 +529,22 @@ class StagingSlots(Node):
             target[2], self.slots[slot_index][2], pallet_origin_z,
             self.transfer_item_bottom_above_pallet)
         self.pending_record['transfer_tcp_z'] = target_transfer_z
-        self.ik_targets = [
-            (target[0], target[1], target_transfer_z, *target[3:]),
-            pre_place,
+        self.pending_record['pre_place_tcp_z'] = pre_place[2]
+        transfer_quaternion = self._quaternion_from_rpy(*target[3:])
+        transfer_target = Float64MultiArray()
+        transfer_target.data = [
+            float(slot_index), target[0], target[1], target_transfer_z,
+            *transfer_quaternion, pre_place[2],
         ]
+        self.store_transfer_target_pub.publish(transfer_target)
+        self.expected_motion_operation_id = int(
+            self.motion_status.get('operation_id', 0)) + 1
         self.ik_solutions = []
         self.motion_queue = []
-        self._solve_next_store_ik(joint_seed)
+        # Allow the target subscription in motion_coordinator to run before
+        # invoking its preparation service.
+        self._store_transfer_timer = self.create_timer(
+            0.15, self._request_store_transfer_prepare)
         completion_route = (
             'returning to observation'
             if self.return_to_observation else
@@ -516,13 +553,140 @@ class StagingSlots(Node):
         response.message = (
             f'storing attached item in slot {slot_index} at FLB '
             f'{tuple(round(v*1000) for v in self.slots[slot_index])} mm; '
-            'solving transfer/pre-place IK; item yaw fixed to 0 deg; '
+            'using validated new-item transfer logic; item yaw fixed to 0 deg; '
             f'item bottom={self.transfer_item_bottom_above_pallet*1000:.0f} mm '
             'above pallet; '
             f'{completion_route}'
         )
         self.publish_status()
         return response
+
+    def _request_store_transfer_prepare(self):
+        if self._store_transfer_timer is not None:
+            self._store_transfer_timer.cancel()
+            self._store_transfer_timer = None
+        if self.state != self.PREPARING_STORE_TRANSFER:
+            return
+        future = self.prepare_staging_store_transfer.call_async(
+            Trigger.Request())
+        future.add_done_callback(self._store_transfer_prepare_completed)
+
+    def _store_transfer_prepare_completed(self, future):
+        if self.state != self.PREPARING_STORE_TRANSFER:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'staging transfer preparation failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(f'staging transfer preparation rejected: {message}')
+
+    def _begin_store_direct_transfer(self):
+        if not self.start_joint_transfer.service_is_ready():
+            self._begin_store_moveit_fallback(
+                'deterministic joint-transfer service is unavailable')
+            return
+        self.state = self.TRANSFERRING_STORE
+        self.store_transfer_phase = 'direct_starting'
+        self.expected_store_transfer_operation_id = int(
+            self.pickup_status.get('operation_id', 0)) + 1
+        self.phase_started = time.monotonic()
+        future = self.start_joint_transfer.call_async(Trigger.Request())
+        future.add_done_callback(self._store_direct_transfer_started)
+
+    def _store_direct_transfer_started(self, future):
+        if (self.state != self.TRANSFERRING_STORE or
+                self.store_transfer_phase != 'direct_starting'):
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._begin_store_moveit_fallback(
+                f'deterministic staging transfer start failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._begin_store_moveit_fallback(
+                f'deterministic staging transfer rejected: {message}')
+            return
+        self.store_transfer_phase = 'direct_executing'
+
+    def _begin_store_moveit_fallback(self, reason):
+        if not self.plan_transfer.service_is_ready():
+            self._fault(f'{reason}; MoveIt transfer service is unavailable')
+            return
+        self.state = self.TRANSFERRING_STORE
+        self.store_transfer_phase = 'moveit_planning'
+        self.store_transfer_fallback_used = True
+        self.store_transfer_fallback_reason = str(reason)
+        self.expected_motion_operation_id = int(
+            self.motion_status.get('operation_id', 0)) + 1
+        self.phase_started = time.monotonic()
+        self.get_logger().warning(
+            f'{reason}; falling back to collision-aware MoveIt staging transfer')
+        future = self.plan_transfer.call_async(Trigger.Request())
+        future.add_done_callback(self._request_accepted)
+
+    def _accept_store_direct_transfer(self):
+        if not self.accept_direct_transfer.service_is_ready():
+            self._fault('direct staging transfer acknowledgement is unavailable')
+            return
+        self.store_transfer_phase = 'direct_accepting'
+        future = self.accept_direct_transfer.call_async(Trigger.Request())
+        future.add_done_callback(self._store_direct_transfer_accepted)
+
+    def _store_direct_transfer_accepted(self, future):
+        if (self.state != self.TRANSFERRING_STORE or
+                self.store_transfer_phase != 'direct_accepting'):
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'direct staging transfer acknowledgement failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(
+                f'direct staging transfer acknowledgement rejected: {message}')
+
+    def _begin_store_loading(self):
+        if not self.start_loading.service_is_ready():
+            self._fault('staging vertical loading service is unavailable')
+            return
+        self._publish_store_place_config()
+        self.state = self.LOADING_STORE
+        self.store_transfer_phase = 'loading'
+        self.expected_store_transfer_operation_id = int(
+            self.pickup_status.get('operation_id', 0)) + 1
+        self.phase_started = time.monotonic()
+        future = self.start_loading.call_async(Trigger.Request())
+        future.add_done_callback(self._store_loading_started)
+
+    def _store_loading_started(self, future):
+        if self.state != self.LOADING_STORE:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._fault(f'staging vertical loading start failed: {exc}')
+            return
+        if result is None or not result.success:
+            message = 'no response' if result is None else result.message
+            self._fault(f'staging vertical loading rejected: {message}')
+
+    def _publish_store_place_config(self):
+        if self.pending_record is None:
+            return
+        target = self.pending_record['target_tcp_pose']
+        config = Float64MultiArray()
+        config.data = [
+            float(self.active_slot),
+            float(target[2]),
+            float(self.pending_record['transfer_tcp_z']),
+        ]
+        self.place_config_pub.publish(config)
 
     def _disable_servo_before_direct(self):
         if not self.enable_servo.service_is_ready():
@@ -1080,14 +1244,7 @@ class StagingSlots(Node):
         self.publish_status()
 
     def _arm_safe_servo_store(self):
-        target = self.pending_record['target_tcp_pose']
-        config = Float64MultiArray()
-        config.data = [
-            float(self.active_slot),
-            float(target[2]),
-            float(self.pending_record['transfer_tcp_z']),
-        ]
-        self.place_config_pub.publish(config)
+        self._publish_store_place_config()
         self.expected_store_place_operation_id = int(
             self.pickup_status.get('operation_id', 0)) + 1
         self.state = self.PLACING_STORE
@@ -1167,7 +1324,16 @@ class StagingSlots(Node):
             return
         if self.state == self.MOVING_DIRECT and not self.motion_pending:
             return
-        if self.state == self.SETTLING_STORE:
+        if self.state == self.PREPARING_STORE_TRANSFER:
+            if (self._motion_matches() and
+                    self.motion_status.get('target') == 'transfer' and
+                    self.motion_status.get('state') == 'PREPARED'):
+                self._begin_store_direct_transfer()
+        elif self.state == self.TRANSFERRING_STORE:
+            self._tick_store_transfer()
+        elif self.state == self.LOADING_STORE:
+            self._tick_store_loading()
+        elif self.state == self.SETTLING_STORE:
             self._settle_store()
         elif self.state == self.PLACING_STORE:
             if int(self.pickup_status.get('operation_id', -1)) < int(
@@ -1223,6 +1389,67 @@ class StagingSlots(Node):
         elif self.state == self.EXECUTING_OBSERVATION:
             if self._motion_matches() and self.motion_status.get('state') == 'SUCCEEDED':
                 self._finish_operation()
+
+    def _tick_store_transfer(self):
+        phase = self.store_transfer_phase
+        if phase in ('direct_starting', 'direct_executing'):
+            if int(self.pickup_status.get('operation_id', -1)) < int(
+                    self.expected_store_transfer_operation_id or 0):
+                return
+            if self.pickup_status.get('operation_kind') != 'transfer':
+                return
+            state = self.pickup_status.get('state')
+            if state == 'FAULT':
+                reason = self.pickup_status.get(
+                    'fault', 'deterministic staging transfer failed')
+                if self.pickup_status.get(
+                        'direct_transfer_motion_started', False):
+                    self._fault(
+                        f'{reason}; direct staging motion had already started, '
+                        'so automatic MoveIt fallback is unsafe')
+                else:
+                    self._begin_store_moveit_fallback(reason)
+            elif (state == 'SUCCEEDED' and
+                  self.pickup_status.get('direct_transfer_succeeded')):
+                self._accept_store_direct_transfer()
+            return
+        if phase == 'direct_accepting':
+            if (self._motion_matches() and
+                    self.motion_status.get('target') == 'transfer' and
+                    self.motion_status.get('state') == 'SUCCEEDED'):
+                self._begin_store_loading()
+            return
+        if not self._motion_matches() or self.motion_status.get(
+                'target') != 'transfer':
+            return
+        state = self.motion_status.get('state')
+        if state == 'FAULT':
+            self._fault(self.motion_status.get(
+                'fault', 'MoveIt staging transfer failed'))
+        elif state == 'PLANNED' and phase == 'moveit_planning':
+            self.store_transfer_phase = 'moveit_executing'
+            self._execute_latest_motion(self.TRANSFERRING_STORE)
+        elif state == 'SUCCEEDED' and phase == 'moveit_executing':
+            self._begin_store_loading()
+
+    def _tick_store_loading(self):
+        if int(self.pickup_status.get('operation_id', -1)) < int(
+                self.expected_store_transfer_operation_id or 0):
+            return
+        if self.pickup_status.get('operation_kind') != 'loading':
+            return
+        state = self.pickup_status.get('state')
+        if state == 'FAULT':
+            self._fault(self.pickup_status.get(
+                'fault', 'staging vertical loading failed'))
+        elif state == 'SUCCEEDED':
+            if self.pickup_status.get('place_fallback_used'):
+                self._fault(
+                    'staging vertical loading released the item through its '
+                    'contact fallback: ' + str(self.pickup_status.get(
+                        'place_fallback_reason', 'unknown contact')))
+                return
+            self._begin_safe_servo_store()
 
     def _motion_matches(self):
         return int(self.motion_status.get('operation_id', -1)) >= int(
@@ -1330,6 +1557,9 @@ class StagingSlots(Node):
         if self._staging_place_timer is not None:
             self._staging_place_timer.cancel()
             self._staging_place_timer = None
+        if self._store_transfer_timer is not None:
+            self._store_transfer_timer.cancel()
+            self._store_transfer_timer = None
         self._clear_mode_wait()
         if (self.direct_control_claim_started and
                 self.state != self.RESTORING_CONTROL):
@@ -1356,6 +1586,10 @@ class StagingSlots(Node):
         self.pending_fault = ''
         self.last_result = 'staging fault/state reset; occupied slots retained'
         self.return_to_observation = True
+        self.store_transfer_phase = ''
+        self.store_transfer_fallback_used = False
+        self.store_transfer_fallback_reason = ''
+        self.expected_store_transfer_operation_id = None
         self.ik_targets = []
         self.ik_solutions = []
         response.success = True
@@ -1375,6 +1609,9 @@ class StagingSlots(Node):
             'transfer_item_bottom_above_pallet_mm': (
                 self.transfer_item_bottom_above_pallet * 1000.0),
             'return_to_observation': self.return_to_observation,
+            'store_transfer_phase': self.store_transfer_phase,
+            'store_transfer_fallback_used': self.store_transfer_fallback_used,
+            'store_transfer_fallback_reason': self.store_transfer_fallback_reason,
             'slots': [
                 {
                     'slot': index,

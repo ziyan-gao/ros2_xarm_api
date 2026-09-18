@@ -45,13 +45,13 @@ class RecordingClient:
         return self.future
 
 
-def _descending_supervisor(operation_kind):
+def _descending_supervisor(operation_kind, fault=None):
     supervisor = object.__new__(PickupSupervisor)
     supervisor.state = PickupSupervisor.DESCENDING
     supervisor.operation_kind = operation_kind
     supervisor.servo_status = {
         'state': 'FAULT',
-        'fault': (
+        'fault': fault or (
             'MoveIt Servo halted: Very close to a singularity, emergency stop'),
     }
     supervisor._tick_descent_config = lambda: False
@@ -86,6 +86,41 @@ def test_pickup_singularity_remains_a_hard_fault():
     assert 'singularity' in faults[0]
 
 
+def test_place_external_wrench_limit_releases_item_instead_of_faulting():
+    supervisor = _descending_supervisor(
+        'place',
+        'external wrench safety limit: force=12.12 N, delta_fz=11.37 N')
+    fallbacks = []
+    faults = []
+    supervisor._begin_place_release_fallback = (
+        lambda reason, cause: fallbacks.append((reason, cause)))
+    supervisor._fault = faults.append
+
+    supervisor.control_tick()
+
+    assert len(fallbacks) == 1
+    assert 'external wrench safety limit' in fallbacks[0][0]
+    assert fallbacks[0][1] == 'external-wrench-limit'
+    assert faults == []
+
+
+def test_pickup_external_wrench_limit_remains_a_hard_fault():
+    supervisor = _descending_supervisor(
+        'pickup',
+        'external wrench safety limit: force=12.12 N, delta_fz=11.37 N')
+    fallbacks = []
+    faults = []
+    supervisor._begin_place_release_fallback = (
+        lambda reason, cause: fallbacks.append((reason, cause)))
+    supervisor._fault = faults.append
+
+    supervisor.control_tick()
+
+    assert fallbacks == []
+    assert len(faults) == 1
+    assert 'external wrench safety limit' in faults[0]
+
+
 def test_singularity_recovery_records_fallback_and_disables_servo_first():
     supervisor = object.__new__(PickupSupervisor)
     supervisor.place_fallback_used = False
@@ -102,6 +137,9 @@ def test_singularity_recovery_records_fallback_and_disables_servo_first():
     supervisor.singularity_place_step = 0.003
     supervisor.enable_client = RecordingClient()
     supervisor.get_logger = lambda: FakeLogger()
+    supervisor.direct_tcp_z_offset = None
+    supervisor._capture_direct_tcp_z_offset = lambda: setattr(
+        supervisor, 'direct_tcp_z_offset', 0.024)
     published = []
     supervisor.publish_status = lambda: published.append(True)
 
@@ -131,6 +169,7 @@ def _direct_step_supervisor(current_z=0.100, floor_z=0.080):
     supervisor.direct_place_force_baseline_z = -8.0
     supervisor.place_force_threshold = 4.0
     supervisor.floor_z = floor_z
+    supervisor.direct_tcp_z_offset = 0.0
     supervisor.tolerance = 0.0005
     supervisor.singularity_place_step = 0.003
     supervisor.singularity_place_step_speed = 10.0
@@ -158,13 +197,14 @@ def test_direct_singularity_recovery_commands_one_relative_3mm_step():
 
 
 def test_direct_singularity_recovery_clamps_last_step_to_floor():
-    supervisor = _direct_step_supervisor(current_z=0.0815, floor_z=0.080)
+    supervisor = _direct_step_supervisor(current_z=0.0575, floor_z=0.080)
+    supervisor.direct_tcp_z_offset = 0.024
 
     supervisor._send_direct_place_step()
 
     request = supervisor.retreat_client.requests[0]
     assert math.isclose(request.pose[2], -1.5)
-    assert math.isclose(supervisor.retreat_target_z, 0.080)
+    assert math.isclose(supervisor.retreat_target_z, 0.056)
 
 
 def test_direct_singularity_recovery_releases_before_step_on_contact():
@@ -456,6 +496,28 @@ def test_tcp_validation_uses_link_tcp_servo_pose_when_fresh():
     }
 
     assert supervisor._tcp_xyz() == (0.10, 0.20, 0.30)
+
+
+def test_direct_handoff_captures_link_tcp_to_sdk_tcp_z_offset():
+    supervisor = object.__new__(PickupSupervisor)
+    now = time.monotonic()
+    supervisor.status_timeout = 1.0
+    supervisor.robot_tcp_xyz = (0.10, 0.20, 0.276)
+    supervisor.robot_state_time = now
+    supervisor.servo_status_time = now
+    supervisor.last_joint_state_time = now
+    supervisor.servo_status = {
+        'tcp_x_m': 0.10,
+        'tcp_y_m': 0.20,
+        'tcp_z_m': 0.300,
+        'joint_state_age_sec': 0.0,
+    }
+    supervisor.get_logger = lambda: FakeLogger()
+
+    offset = supervisor._capture_direct_tcp_z_offset()
+
+    assert offset == pytest.approx(0.024)
+    assert supervisor.direct_tcp_z_offset == pytest.approx(0.024)
 
 
 def test_linear_loading_contact_requires_consecutive_delta_fz_samples():

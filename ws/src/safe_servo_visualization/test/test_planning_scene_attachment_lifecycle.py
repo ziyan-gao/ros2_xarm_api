@@ -1,11 +1,11 @@
 import json
+from types import SimpleNamespace
 
-from std_msgs.msg import String
-
+from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
 from safe_servo_visualization.planning_scene_obstacles_node import (
     PlanningSceneObstacles,
 )
-from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
+from std_msgs.msg import String
 
 
 class FakeLogger:
@@ -148,6 +148,33 @@ def test_clear_picked_item_is_idempotent_when_nothing_is_attached():
 
     assert response.success is True
     assert response.message == 'no picked item to clear'
+
+
+def test_remove_placed_item_removes_visual_only_marker_without_scene_update():
+    node = object.__new__(PlanningSceneObstacles)
+    node.apply_pending = False
+    node.placed_item_ids = []
+    node.placed_item_visuals = {
+        3: SimpleNamespace(id='placed_item_3'),
+        4: SimpleNamespace(id='placed_item_4'),
+    }
+    scene_updates = []
+    marker_updates = []
+    status_updates = []
+    node._apply = lambda *args: scene_updates.append(args) or True
+    node._publish_placed_item_visuals = lambda: marker_updates.append(True)
+    node.publish_status = lambda: status_updates.append(True)
+    response = SimpleNamespace(ret=-1, message='')
+
+    result = node.remove_placed_item_callback(
+        SimpleNamespace(data=3), response)
+
+    assert result.ret == 0
+    assert result.message == 'removed visual-only placed item placed_item_3'
+    assert scene_updates == []
+    assert node._placed_item_visual_ids() == ['placed_item_4']
+    assert marker_updates == [True]
+    assert status_updates == [True]
 
 
 class FakeServiceResult:

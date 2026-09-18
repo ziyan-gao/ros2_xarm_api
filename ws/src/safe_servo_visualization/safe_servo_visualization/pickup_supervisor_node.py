@@ -41,6 +41,7 @@ class PickupSupervisor(Node):
     STOPPING_LOADING = 'STOPPING_LOADING'
     SOLVING_TRANSFER_IK = 'SOLVING_TRANSFER_IK'
     VALIDATING_TRANSFER = 'VALIDATING_TRANSFER'
+    CHECKING_LOADING_PATH = 'CHECKING_LOADING_PATH'
     EXECUTING_TRANSFER = 'EXECUTING_TRANSFER'
     PREPARING_RETREAT = 'PREPARING_RETREAT'
     RETREATING = 'RETREATING'
@@ -57,7 +58,7 @@ class PickupSupervisor(Node):
         VACUUM_ON, VACUUM_OFF, DETACHING, VERIFYING_VACUUM,
         STOPPING_LOADING, PREPARING_RETREAT, RETREATING,
         WAITING_PLACE_STEP_FEEDBACK, RESTORING_CONTROL,
-        SOLVING_TRANSFER_IK, VALIDATING_TRANSFER, EXECUTING_TRANSFER,
+        SOLVING_TRANSFER_IK, VALIDATING_TRANSFER, CHECKING_LOADING_PATH, EXECUTING_TRANSFER,
         C52_STOPPING, RECOVERING_FT,
     }
 
@@ -90,6 +91,8 @@ class PickupSupervisor(Node):
         self.declare_parameter('retreat_timeout_sec', 120.0)
         self.declare_parameter('retreat_speed_mm_s', 30.0)
         self.declare_parameter('retreat_acc_mm_s2', 200.0)
+        self.declare_parameter('direct_cartesian_max_speed_mm_s', 200.0)
+        self.declare_parameter('direct_cartesian_max_acc_mm_s2', 500.0)
         self.declare_parameter('ros2_control_mode', 1)
         self.declare_parameter('trajectory_controller', 'uf850_traj_controller')
         self.declare_parameter('joint_state_broadcaster', 'joint_state_broadcaster')
@@ -151,8 +154,13 @@ class PickupSupervisor(Node):
             'arm_joint_names', [f'joint{i}' for i in range(1, 7)])
         self.declare_parameter('direct_transfer_ik_timeout_sec', 2.0)
         self.declare_parameter('direct_transfer_sample_step_rad', 0.05)
-        self.declare_parameter('direct_transfer_max_joint_delta_rad', 5.0)
-        self.declare_parameter('direct_transfer_joint_acc_rad_s2', 0.7)
+        # A direct joint line should never select an IK branch that sweeps any
+        # axis by more than half a revolution. Periodic joints are first
+        # normalized to their nearest equivalent below.
+        self.declare_parameter(
+            'direct_transfer_max_joint_delta_rad', math.pi)
+        self.declare_parameter('direct_transfer_max_joint_speed_rad_s', 2.14)
+        self.declare_parameter('direct_transfer_joint_acc_rad_s2', 10.0)
         self.declare_parameter(
             'direct_transfer_periodic_joint_names',
             ['joint1', 'joint4', 'joint6'])
@@ -195,6 +203,11 @@ class PickupSupervisor(Node):
         self.retreat_timeout = float(p('retreat_timeout_sec'))
         self.retreat_speed = float(p('retreat_speed_mm_s'))
         self.retreat_acc = float(p('retreat_acc_mm_s2'))
+        self.direct_cartesian_max_speed = float(
+            p('direct_cartesian_max_speed_mm_s'))
+        self.direct_cartesian_max_acc = float(
+            p('direct_cartesian_max_acc_mm_s2'))
+        self.motion_speed_percent = 0.0
         self.ros2_control_mode = int(p('ros2_control_mode'))
         self.trajectory_controller = str(p('trajectory_controller'))
         self.joint_state_broadcaster = str(p('joint_state_broadcaster'))
@@ -259,6 +272,8 @@ class PickupSupervisor(Node):
             p('direct_transfer_sample_step_rad'))
         self.direct_transfer_max_joint_delta = float(
             p('direct_transfer_max_joint_delta_rad'))
+        self.direct_transfer_max_joint_speed = float(
+            p('direct_transfer_max_joint_speed_rad_s'))
         self.direct_transfer_joint_acc = float(
             p('direct_transfer_joint_acc_rad_s2'))
         self.direct_transfer_periodic_joint_names = frozenset(
@@ -307,6 +322,9 @@ class PickupSupervisor(Node):
             raise ValueError('mode_ready_samples must be at least 1')
         if self.place_descent_timeout <= 0.0:
             raise ValueError('place_descent_timeout_sec must be positive')
+        if (self.direct_cartesian_max_speed <= 0.0 or
+                self.direct_cartesian_max_acc <= 0.0):
+            raise ValueError('direct Cartesian speed/acceleration must be positive')
         if self.singularity_place_recovery_timeout <= 0.0:
             raise ValueError(
                 'singularity_place_recovery_timeout_sec must be positive')
@@ -325,6 +343,7 @@ class PickupSupervisor(Node):
         if (self.direct_transfer_ik_timeout <= 0.0 or
                 self.direct_transfer_sample_step <= 0.0 or
                 self.direct_transfer_max_joint_delta <= 0.0 or
+                self.direct_transfer_max_joint_speed <= 0.0 or
                 self.direct_transfer_joint_acc <= 0.0 or
                 self.direct_transfer_joint_tolerance <= 0.0):
             raise ValueError('direct-transfer parameters must be positive')
@@ -369,6 +388,13 @@ class PickupSupervisor(Node):
         self.retreat_target_z = None
         self.retreat_start_z = None
         self.retreat_start_xyz = None
+        # MoveIt/Servo reports the URDF link_tcp pose, while xArm's direct
+        # set_position service reports and commands the controller-configured
+        # SDK TCP. They are not necessarily colocated. Capture their live Z
+        # separation before relinquishing ros2_control so vertical targets can
+        # be converted instead of silently mixing the two coordinate origins.
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.direct_target_z = None
         self.direct_target_pose = None
         self.direct_target_quaternion = None
@@ -705,6 +731,13 @@ class PickupSupervisor(Node):
         self.c52_retreat_active = True
         self.c52_clear_attempts = 0
         self.c52_tcp_snapshot = self.robot_tcp_xyz
+        if getattr(self, 'direct_tcp_z_offset', None) is None:
+            try:
+                self._capture_direct_tcp_z_offset()
+            except ValueError as exc:
+                self.get_logger().warning(
+                    'could not snapshot TCP-frame conversion at C52 onset: '
+                    f'{exc}')
         self.state = self.C52_STOPPING
         self.get_logger().error(
             f'{self.ft_recovery_reason}; stopping Servo, preserving vacuum, '
@@ -893,6 +926,8 @@ class PickupSupervisor(Node):
             self.place_target_z = self.place_target_xyz[2]
         if len(message.data) >= 13:
             self.rotate_item_90 = bool(message.data[12] > 0.5)
+        if len(message.data) >= 14:
+            self.keep_eef_perpendicular = bool(message.data[13] > 0.5)
 
     def pre_place_pose_callback(self, message):
         if message.header.frame_id == 'link_base':
@@ -973,14 +1008,23 @@ class PickupSupervisor(Node):
             self.get_logger().warning(
                 'ignoring incomplete motion speed configuration')
             return
-        speed = float(message.data[1])
-        if not math.isfinite(speed) or not 5.0 <= speed <= 100.0:
+        speed_percent = float(message.data[1])
+        if (not math.isfinite(speed_percent) or
+                not 5.0 <= speed_percent <= 100.0):
             self.get_logger().warning(
-                f'ignoring service speed outside 5..100 mm/s: {speed}')
+                'ignoring non-servo speed outside 5..100%: '
+                f'{speed_percent}')
             return
-        self.retreat_speed = speed
+        scale = speed_percent / 100.0
+        self.motion_speed_percent = speed_percent
+        self.retreat_speed = self.direct_cartesian_max_speed * scale
+        self.retreat_acc = self.direct_cartesian_max_acc * scale
         self.get_logger().info(
-            f'non-servo service speed set to {self.retreat_speed:.1f} mm/s')
+            f'non-servo speed set to {speed_percent:.1f}%: '
+            f'{self.retreat_speed:.1f} mm/s service, '
+            f'{self.retreat_acc:.1f} mm/s^2 service, '
+            f'{self.direct_transfer_max_joint_speed * scale:.3f} '
+            'rad/s joint limit')
 
     def set_gripper_callback(self, request, response):
         action = 'close' if request.data else 'open'
@@ -1140,15 +1184,12 @@ class PickupSupervisor(Node):
         # fault and published its disabled IDLE state.
         return snapshot, z, floor_z
 
-    def _tcp_xyz(self):
+    def _link_tcp_xyz(self):
+        """Return the fresh MoveIt/Servo link_tcp position without fallback."""
         keys = ('tcp_x_m', 'tcp_y_m', 'tcp_z_m')
         if self.servo_status_time is None or (
                 time.monotonic() - self.servo_status_time > self.status_timeout):
-            if (self.robot_tcp_xyz is not None and
-                    self.robot_state_time is not None and
-                    time.monotonic() - self.robot_state_time <= self.status_timeout):
-                return self.robot_tcp_xyz
-            raise ValueError('TCP telemetry is stale')
+            raise ValueError('link_tcp telemetry is stale')
         joint_age = self.servo_status.get('joint_state_age_sec')
         supervisor_joint_age = (
             None if self.last_joint_state_time is None else
@@ -1170,6 +1211,36 @@ class PickupSupervisor(Node):
         if not all(math.isfinite(value) for value in xyz):
             raise ValueError('safe-servo TCP telemetry is invalid')
         return xyz
+
+    def _tcp_xyz(self):
+        try:
+            return self._link_tcp_xyz()
+        except ValueError as link_error:
+            if (self.robot_tcp_xyz is not None and
+                    self.robot_state_time is not None and
+                    time.monotonic() - self.robot_state_time <=
+                    self.status_timeout):
+                return self.robot_tcp_xyz
+            raise link_error
+
+    def _capture_direct_tcp_z_offset(self):
+        """Snapshot link_tcp Z minus SDK TCP Z before direct-mode handoff."""
+        link_xyz = self._link_tcp_xyz()
+        if (self.robot_tcp_xyz is None or self.robot_state_time is None or
+                time.monotonic() - self.robot_state_time > self.status_timeout):
+            raise ValueError('xArm SDK TCP telemetry is stale')
+        sdk_xyz = tuple(float(value) for value in self.robot_tcp_xyz)
+        if not all(math.isfinite(value) for value in sdk_xyz):
+            raise ValueError('xArm SDK TCP telemetry is invalid')
+        offset = float(link_xyz[2] - sdk_xyz[2])
+        if abs(offset) > 0.25:
+            raise ValueError(
+                f'link_tcp to xArm SDK TCP Z offset {offset:.3f} m is invalid')
+        self.direct_tcp_z_offset = offset
+        self.get_logger().info(
+            'captured direct-mode TCP Z conversion: '
+            f'link_tcp - xArm SDK TCP = {offset * 1000.0:+.1f} mm')
+        return offset
 
     def _direct_mode_tcp_xyz(self):
         if (self.robot_tcp_xyz is not None and
@@ -1307,6 +1378,8 @@ class PickupSupervisor(Node):
         self.post_retreat_fault = ''
         self.direct_target_pose = None
         self.direct_target_joints = None
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.direct_transfer_validation_samples = []
         self.direct_transfer_validation_index = 0
         self.direct_transfer_succeeded = False
@@ -1486,6 +1559,8 @@ class PickupSupervisor(Node):
         self.post_retreat_fault = ''
         self.direct_target_pose = None
         self.direct_target_joints = None
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.direct_place_recovery_active = False
@@ -1576,6 +1651,8 @@ class PickupSupervisor(Node):
         self.post_retreat_fault = ''
         self.direct_target_pose = None
         self.direct_target_joints = None
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.direct_target_z = transfer_z
         self.place_fallback_used = False
         self.place_fallback_reason = ''
@@ -1716,6 +1793,7 @@ class PickupSupervisor(Node):
             message = '' if result is None else result.error_code.message
             suffix = f' ({message})' if message else ''
             self._fault(
+                ('KINEMATIC_REJECTED: ' if code == -31 else '') +
                 f'MoveIt/KDL transfer IK failed after '
                 f'{elapsed or 0.0:.3f} s: code={code}{suffix}')
             return
@@ -1756,6 +1834,12 @@ class PickupSupervisor(Node):
                 'normalized periodic IK joints to nearest equivalents: ' +
                 ', '.join(normalized))
         max_delta = max(abs(goal - current) for current, goal in zip(start, target))
+        joint_deltas = tuple(
+            goal - current for current, goal in zip(start, target))
+        self.get_logger().info(
+            'direct transfer joint deltas: ' + ', '.join(
+                f'{name}={delta:+.3f} rad'
+                for name, delta in zip(self.arm_joint_names, joint_deltas)))
         if max_delta > self.direct_transfer_max_joint_delta:
             self._fault(
                 f'direct transfer joint jump {max_delta:.3f} rad exceeds '
@@ -1792,7 +1876,7 @@ class PickupSupervisor(Node):
                 f'{len(self.direct_transfer_validation_samples)} collision '
                 f'checks in {elapsed:.3f} s; sending the validated path to '
                 f'{self.trajectory_controller}')
-            self._send_joint_trajectory_transfer()
+            self._check_loading_path_before_transfer()
             return
         request = GetStateValidity.Request()
         request.group_name = self.planning_group
@@ -1823,6 +1907,119 @@ class PickupSupervisor(Node):
         self.direct_transfer_validation_index += 1
         self._validate_next_direct_transfer_sample()
 
+    def _check_loading_path_before_transfer(self):
+        """Check descent from the selected transfer joints before moving."""
+        if self.motion_status.get('transfer_context', 'pallet') != 'pallet':
+            self._send_joint_trajectory_transfer()
+            return
+        if not self.compute_ik_client.service_is_ready():
+            self._fault('loading-path validation service is unavailable')
+            return
+        try:
+            target_z = float(self.motion_status['pre_place_tcp_z_m']) - self.pre_place_clearance
+            xyz = tuple(map(float, self.motion_status['transfer_tcp_xyz_m']))
+            if (len(xyz) != 3 or not all(math.isfinite(v) for v in xyz) or
+                    not math.isfinite(target_z) or target_z > xyz[2]):
+                raise ValueError('invalid loading height')
+        except (KeyError, TypeError, ValueError) as exc:
+            self._fault(f'loading-path geometry unavailable: {exc}')
+            return
+        count = max(1, math.ceil((xyz[2] - target_z) / 0.005))
+        self.loading_path_samples = [
+            (xyz[0], xyz[1], max(target_z, xyz[2] - 0.005 * i))
+            for i in range(1, count + 1)
+        ]
+        self.loading_path_index = 0
+        self.loading_path_seed = tuple(self.direct_target_joints)
+        self.state = self.CHECKING_LOADING_PATH
+        self.loading_path_started = time.monotonic()
+        self._request_loading_ik_sample()
+
+    def _request_loading_ik_sample(self):
+        if self.state != self.CHECKING_LOADING_PATH:
+            return
+        if self.loading_path_index == len(self.loading_path_samples):
+            self.get_logger().info(
+                'vertical loading path passed sequential IK at '
+                f'{self.loading_path_index} explicit steps of at most 5 mm; '
+                'executing transfer')
+            self.state = self.VALIDATING_TRANSFER
+            self._send_joint_trajectory_transfer()
+            return
+        request = GetPositionIK.Request()
+        ik = request.ik_request
+        ik.group_name = self.planning_group
+        ik.ik_link_name = self.ik_link_name
+        ik.robot_state.is_diff = True
+        ik.robot_state.joint_state.name = list(self.arm_joint_names)
+        ik.robot_state.joint_state.position = list(self.loading_path_seed)
+        ik.pose_stamped.header.frame_id = 'link_base'
+        pose = ik.pose_stamped.pose
+        pose.position.x, pose.position.y, pose.position.z = (
+            self.loading_path_samples[self.loading_path_index])
+        (pose.orientation.x, pose.orientation.y,
+         pose.orientation.z, pose.orientation.w) = self.direct_target_quaternion
+        # Contact is intentional: validate kinematics, retaining the separate
+        # collision check for the transfer trajectory.
+        ik.avoid_collisions = False
+        seconds = max(0.001, self.direct_transfer_ik_timeout)
+        ik.timeout.sec = int(seconds)
+        ik.timeout.nanosec = int((seconds - int(seconds)) * 1e9)
+        operation = self.operation_id
+        index = self.loading_path_index
+        future = self.compute_ik_client.call_async(request)
+        future.add_done_callback(
+            lambda done: self._loading_path_checked(done, operation, index))
+
+    def _loading_path_checked(self, future, operation, index):
+        if self.state != self.CHECKING_LOADING_PATH or self.operation_id != operation:
+            return
+        if self.loading_path_index != index:
+            return
+        location = (f'step {index + 1}/{len(self.loading_path_samples)}, '
+                    f'Z={self.loading_path_samples[index][2]:.4f} m')
+        try:
+            result = future.result()
+            if result is None:
+                raise ValueError('empty response')
+            if result.error_code.val not in (1, -31):
+                raise ValueError(f'service error {result.error_code.val}')
+            if result.error_code.val == -31:
+                self._fault(
+                    f'KINEMATIC_REJECTED: no descent IK at {location}')
+                return
+            joints = result.solution.joint_state
+            solution = dict(zip(joints.name, joints.position))
+            current = tuple(float(solution[name]) for name in self.arm_joint_names)
+            if not all(math.isfinite(v) for v in current):
+                raise ValueError('non-finite IK joints')
+            lower, upper = self.direct_transfer_periodic_limits
+            current = tuple(
+                self._nearest_periodic_equivalent(goal, previous, lower, upper)
+                if name in self.direct_transfer_periodic_joint_names else goal
+                for name, goal, previous in zip(
+                    self.arm_joint_names, current, self.loading_path_seed))
+            for name, goal, previous in zip(
+                    self.arm_joint_names, current, self.loading_path_seed):
+                if (name in self.direct_transfer_periodic_joint_names and
+                        not lower <= goal <= upper):
+                    self._fault(
+                        f'KINEMATIC_REJECTED: {name} outside configured '
+                        f'periodic joint limits at {location}')
+                    return
+                if abs(goal - previous) > 0.15:
+                    self._fault(
+                        f'KINEMATIC_REJECTED: {name} changes '
+                        f'{abs(goal - previous):.3f} rad at {location} '
+                        '(limit 0.15 rad per <=5 mm step)')
+                    return
+        except Exception as exc:
+            self._fault(f'loading-path validation failed at {location}: {exc}')
+            return
+        self.loading_path_seed = current
+        self.loading_path_index += 1
+        self._request_loading_ik_sample()
+
     @staticmethod
     def _smoothstep5(progress):
         """Return position, first-, and second-derivative quintic scales."""
@@ -1831,6 +2028,23 @@ class PickupSupervisor(Node):
         velocity = 30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4
         acceleration = 60.0 * u - 180.0 * u**2 + 120.0 * u**3
         return position, velocity, acceleration
+
+    @staticmethod
+    def _joint_transfer_timing(
+            max_delta, operator_percent, maximum_speed,
+            maximum_acceleration):
+        """Return duration and scaled limits for a quintic joint motion."""
+        speed_fraction = max(
+            0.05, min(1.0, float(operator_percent) / 100.0))
+        max_speed = float(maximum_speed) * speed_fraction
+        max_acceleration = float(maximum_acceleration) * speed_fraction
+        duration = max(
+            0.5,
+            1.875 * float(max_delta) / max_speed,
+            math.sqrt(
+                5.774 * float(max_delta) / max_acceleration),
+        )
+        return duration, max_speed, max_acceleration, speed_fraction
 
     def _send_joint_trajectory_transfer(self):
         """Execute the collision-checked joint line through ros2_control."""
@@ -1852,14 +2066,17 @@ class PickupSupervisor(Node):
 
         deltas = tuple(goal - current for current, goal in zip(start, target))
         max_delta = max(abs(delta) for delta in deltas)
-        max_speed = max(0.05, min(1.0, self.retreat_speed / 100.0))
         # Quintic smoothstep has peak normalized velocity 1.875 and peak
         # normalized acceleration about 5.774. Choose a duration that respects
         # both shared speed-slider velocity and configured acceleration limits.
-        duration = max(
-            0.5,
-            1.875 * max_delta / max_speed,
-            math.sqrt(5.774 * max_delta / self.direct_transfer_joint_acc))
+        duration, max_speed, max_acceleration, speed_fraction = (
+            self._joint_transfer_timing(
+                max_delta,
+                getattr(self, 'motion_speed_percent', 0.0) or
+                self.retreat_speed,
+                self.direct_transfer_max_joint_speed,
+                self.direct_transfer_joint_acc,
+            ))
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(self.arm_joint_names)
@@ -1888,7 +2105,9 @@ class PickupSupervisor(Node):
         self.direct_transfer_execution_started = time.monotonic()
         self.get_logger().info(
             f'executing {samples}-point deterministic joint trajectory over '
-            f'{duration:.3f} s (limit {max_speed:.3f} rad/s)')
+            f'{duration:.3f} s (limits {max_speed:.3f} rad/s, '
+            f'{max_acceleration:.3f} rad/s^2; '
+            f'slider={speed_fraction * 100.0:.1f}%)')
         future = self.transfer_trajectory_client.send_goal_async(goal)
         future.add_done_callback(self._joint_transfer_goal_response)
         self.publish_status()
@@ -2028,6 +2247,8 @@ class PickupSupervisor(Node):
         self.post_retreat_fault = ''
         self.direct_target_pose = None
         self.direct_target_joints = None
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.place_fallback_used = False
         self.place_fallback_reason = ''
         self.direct_place_recovery_active = False
@@ -2468,6 +2689,14 @@ class PickupSupervisor(Node):
         normalized = str(reason).lower()
         return 'singular' in normalized
 
+    @staticmethod
+    def _is_servo_external_wrench_limit(reason):
+        normalized = str(reason).lower()
+        return (
+            'external wrench safety limit' in normalized or
+            ('external wrench' in normalized and 'limit' in normalized)
+        )
+
     def _place_singularity_requires_fallback(self, current_z, now):
         """Debounce Servo deceleration and detect lack of vertical progress."""
         if not self._servo_is_singularity_decelerating():
@@ -2527,6 +2756,13 @@ class PickupSupervisor(Node):
             'switching to '
             f'{self.singularity_place_step * 1000.0:.1f} mm direct vertical '
             'steps with force checks between steps')
+        try:
+            self._capture_direct_tcp_z_offset()
+        except ValueError as exc:
+            self._fault(
+                'cannot prepare direct singularity recovery TCP conversion: '
+                f'{exc}')
+            return
         if not self.enable_client.service_is_ready():
             self._fault(
                 'safe-servo disable service is unavailable before direct '
@@ -2557,6 +2793,8 @@ class PickupSupervisor(Node):
                 'dry-run singularity recovery completed', contact_detected=True)
             return
         try:
+            if self.direct_tcp_z_offset is None:
+                self._capture_direct_tcp_z_offset()
             self.retreat_start_xyz = self._direct_mode_tcp_xyz()
             self.retreat_start_z = self.retreat_start_xyz[2]
         except ValueError as exc:
@@ -2602,7 +2840,12 @@ class PickupSupervisor(Node):
             self._release_from_direct_place(
                 f'cannot read TCP during direct singularity recovery: {exc}')
             return
-        remaining = current_z - self.floor_z
+        if self.direct_tcp_z_offset is None:
+            self._release_from_direct_place(
+                'link_tcp to xArm SDK TCP Z conversion is unavailable')
+            return
+        sdk_floor_z = self.floor_z - self.direct_tcp_z_offset
+        remaining = current_z - sdk_floor_z
         if remaining <= self.tolerance:
             self._release_from_direct_place(
                 'direct singularity recovery reached the configured place floor')
@@ -2867,6 +3110,10 @@ class PickupSupervisor(Node):
             if (self.operation_kind == 'place' and
                     self._is_servo_singularity_fault(reason)):
                 self._begin_place_singularity_fallback(reason)
+            elif (self.operation_kind == 'place' and
+                  self._is_servo_external_wrench_limit(reason)):
+                self._begin_place_release_fallback(
+                    reason, 'external-wrench-limit')
             else:
                 self._fault(reason)
             return
@@ -2927,6 +3174,10 @@ class PickupSupervisor(Node):
                 self._fault(reason)
 
     def retreat_tick(self):
+        if self.state == self.CHECKING_LOADING_PATH:
+            if time.monotonic() - self.loading_path_started > 10.0:
+                self._fault('loading-path validation service timed out')
+            return
         if self.pre_descent_wait_callback is not None:
             self._pre_descent_readiness_tick()
             return
@@ -2959,12 +3210,20 @@ class PickupSupervisor(Node):
             return
         if (self.operation_kind == 'loading' and
                 not self.loading_contact_fallback):
+            if self.robot_error not in (None, 0):
+                self._fault(f'xArm error {self.robot_error} during linear loading')
+                return
             try:
                 current_z = self._direct_mode_tcp_xyz()[2]
             except ValueError as exc:
                 self._fault(f'cannot monitor linear loading: {exc}')
                 return
-            if current_z <= self.direct_target_z + self.tolerance:
+            command_target_z = self.direct_command_target_z
+            if command_target_z is None:
+                self._fault(
+                    'xArm SDK loading target is unavailable during descent')
+                return
+            if current_z <= command_target_z + self.tolerance:
                 self._begin_loading_completion_stop()
                 return
             if (time.monotonic() - self.retreat_started >
@@ -2972,12 +3231,22 @@ class PickupSupervisor(Node):
                 self._begin_loading_release_fallback(
                     f'linear loading exceeded '
                     f'{self.place_descent_timeout:.1f} s before reaching '
-                    f'pre-place Z {self.direct_target_z:.4f} m')
+                    f'link_tcp pre-place Z {self.direct_target_z:.4f} m '
+                    f'(xArm SDK Z {command_target_z:.4f} m)')
             return
         if time.monotonic() - self.retreat_started > self.retreat_timeout:
             self._fault('direct vertical retreat timed out')
 
     def _disable_servo_then_direct_retreat(self):
+        if (not self.dry_run and self.operation_kind != 'transfer' and
+                self.direct_tcp_z_offset is None):
+            try:
+                self._capture_direct_tcp_z_offset()
+            except ValueError as exc:
+                self._fault(
+                    'cannot prepare direct vertical TCP conversion: '
+                    f'{exc}')
+                return
         if not self.enable_client.service_is_ready():
             self._begin_direct_retreat()
             return
@@ -3007,6 +3276,9 @@ class PickupSupervisor(Node):
             self._finish_retreat()
             return
         try:
+            if (self.operation_kind != 'transfer' and
+                    self.direct_tcp_z_offset is None):
+                self._capture_direct_tcp_z_offset()
             self.retreat_start_xyz = self._direct_mode_tcp_xyz()
         except ValueError as exc:
             if (not self.c52_retreat_active or
@@ -3425,7 +3697,18 @@ class PickupSupervisor(Node):
             request.radius = -1.0
         else:
             current_z = self.retreat_start_z
-            delta = (0.0, 0.0, self.direct_target_z - current_z)
+            if self.direct_tcp_z_offset is None:
+                self._fault(
+                    'link_tcp to xArm SDK TCP Z conversion is unavailable')
+                return
+            # direct_target_z is expressed for MoveIt's link_tcp. Convert it
+            # to the SDK TCP origin before forming the relative set_position
+            # displacement. For a +24 mm tool offset, link_tcp Z=235 mm is
+            # therefore SDK TCP Z=211 mm.
+            self.direct_command_target_z = (
+                self.direct_target_z - self.direct_tcp_z_offset)
+            delta = (
+                0.0, 0.0, self.direct_command_target_z - current_z)
             distance_mm = tuple(value * 1000.0 for value in delta)
             if math.sqrt(sum(value * value for value in delta)) <= self.tolerance:
                 self._restore_ros2_control_mode()
@@ -3438,14 +3721,17 @@ class PickupSupervisor(Node):
         nonblocking_loading_descent = (
             self.operation_kind == 'loading' and
             not self.loading_contact_fallback and
-            self.direct_target_z < self.retreat_start_z - self.tolerance)
+            self.direct_command_target_z <
+            self.retreat_start_z - self.tolerance)
         # The downward loading move must not occupy xarm_api's service callback:
         # force or timeout handling needs /ufactory/set_state to remain callable.
         # Its completion is monitored from live TCP Z in retreat_tick().
         request.wait = not nonblocking_loading_descent
         self.state = self.RETREATING
         self.retreat_started = time.monotonic()
-        self.retreat_target_z = self.direct_target_z
+        self.retreat_target_z = (
+            self.direct_target_z if self.operation_kind == 'transfer'
+            else self.direct_command_target_z)
         self.direct_motion_generation += 1
         generation = self.direct_motion_generation
         future = self.retreat_client.call_async(request)
@@ -3878,6 +4164,24 @@ class PickupSupervisor(Node):
                             f'z={z_error * 1000.0:.1f} mm')
                         return
             self.direct_transfer_succeeded = True
+        if (self.operation_kind == 'loading' and
+                not self.loading_contact_fallback and not self.dry_run):
+            try:
+                current_link_z = self._link_tcp_xyz()[2]
+            except ValueError as exc:
+                self._fault(
+                    f'cannot verify restored link_tcp loading target: {exc}')
+                return
+            error = current_link_z - self.direct_target_z
+            if abs(error) > self.pregrasp_z_tolerance:
+                self._fault(
+                    'linear loading stopped outside the requested link_tcp '
+                    f'pre-place height: error={error * 1000.0:+.1f} mm '
+                    f'(limit {self.pregrasp_z_tolerance * 1000.0:.1f} mm)')
+                return
+            self.get_logger().info(
+                'restored link_tcp verified at the loading target: '
+                f'error={error * 1000.0:+.1f} mm')
         if self.operation_kind == 'place':
             self.direct_place_recovery_active = False
             self.direct_place_stepping = False
@@ -4342,6 +4646,8 @@ class PickupSupervisor(Node):
         self.direct_target_z = None
         self.direct_target_pose = None
         self.direct_target_joints = None
+        self.direct_tcp_z_offset = None
+        self.direct_command_target_z = None
         self.direct_transfer_validation_samples = []
         self.direct_transfer_validation_index = 0
         self.direct_transfer_succeeded = False
@@ -4428,7 +4734,12 @@ class PickupSupervisor(Node):
             'floor_z_m': self.floor_z,
             'descent_target_z_m': self.descent_target_z,
             'retreat_target_z_m': self.retreat_target_z,
+            'direct_tcp_z_offset_m': self.direct_tcp_z_offset,
+            'direct_command_target_z_m': self.direct_command_target_z,
             'transfer_corner_height_pallet_m': self.transfer_corner_height,
+            'non_servo_speed_percent': self.motion_speed_percent,
+            'direct_cartesian_speed_mm_s': self.retreat_speed,
+            'direct_cartesian_acc_mm_s2': self.retreat_acc,
             'place_workspace_z_min_m': self.place_workspace_z_min_mm / 1000.0,
             'place_descent_timeout_sec': self.place_descent_timeout,
             'singularity_place_recovery_timeout_sec':

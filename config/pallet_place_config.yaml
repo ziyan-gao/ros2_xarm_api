@@ -31,9 +31,9 @@ pallet_pose:
 pre_place_pose:
   frame_id: pallet_frame
   position_m:
-  - 0.0
-  - 0.0
-  - 0.155
-  rotate_item_90_deg: false
+  - 0.02
+  - 0.04
+  - 0.165
+  rotate_item_90_deg: true
   keep_eef_perpendicular_to_pallet: true
   add_placed_item_obstacle: false

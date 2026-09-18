@@ -1,5 +1,6 @@
 import math
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,17 @@ def test_six_staging_slots_use_requested_flb_corners():
         (-0.125, 0.430, 0.0),
         (0.125, 0.430, 0.0),
     ])
+
+
+def test_shared_speed_percentage_scales_staging_joint_limits():
+    staging = object.__new__(StagingSlots)
+    staging.joint_max_speed = 2.14
+    staging.joint_max_acc = 10.0
+
+    staging._motion_speed(SimpleNamespace(data=[0.5, 50.0]))
+
+    assert staging.joint_speed == pytest.approx(1.07)
+    assert staging.joint_acc == pytest.approx(5.0)
 
 
 def test_store_target_aligns_unrotated_item_flb_to_slot_corner():
@@ -147,3 +159,64 @@ def test_chained_store_finishes_at_raised_waypoint_without_observation():
     assert staging.state == StagingSlots.SUCCEEDED
     assert staging.last_result == 'store completed for slot 2'
     assert staging.occupied[2]['placed_obstacle_id'] == 'placed_item_12'
+
+
+def test_staging_transfer_failure_before_motion_uses_moveit_fallback():
+    staging = object.__new__(StagingSlots)
+    staging.state = StagingSlots.TRANSFERRING_STORE
+    staging.store_transfer_phase = 'direct_executing'
+    staging.expected_store_transfer_operation_id = 12
+    staging.pickup_status = {
+        'operation_id': 12,
+        'operation_kind': 'transfer',
+        'state': 'FAULT',
+        'fault': 'joint interpolation is in collision',
+        'direct_transfer_motion_started': False,
+    }
+    captured = {}
+    staging._begin_store_moveit_fallback = lambda reason: captured.update(
+        reason=reason)
+    staging._fault = lambda reason: pytest.fail(reason)
+
+    staging._tick_store_transfer()
+
+    assert captured['reason'] == 'joint interpolation is in collision'
+
+
+def test_staging_transfer_does_not_replan_after_motion_started():
+    staging = object.__new__(StagingSlots)
+    staging.state = StagingSlots.TRANSFERRING_STORE
+    staging.store_transfer_phase = 'direct_executing'
+    staging.expected_store_transfer_operation_id = 12
+    staging.pickup_status = {
+        'operation_id': 12,
+        'operation_kind': 'transfer',
+        'state': 'FAULT',
+        'fault': 'trajectory controller aborted',
+        'direct_transfer_motion_started': True,
+    }
+    captured = {}
+    staging._begin_store_moveit_fallback = lambda reason: pytest.fail(reason)
+    staging._fault = lambda reason: captured.update(reason=reason)
+
+    staging._tick_store_transfer()
+
+    assert 'automatic MoveIt fallback is unsafe' in captured['reason']
+
+
+def test_successful_staging_loading_advances_to_safe_servo_place():
+    staging = object.__new__(StagingSlots)
+    staging.expected_store_transfer_operation_id = 21
+    staging.pickup_status = {
+        'operation_id': 21,
+        'operation_kind': 'loading',
+        'state': 'SUCCEEDED',
+        'place_fallback_used': False,
+    }
+    captured = {'started': False}
+    staging._begin_safe_servo_store = lambda: captured.update(started=True)
+    staging._fault = lambda reason: pytest.fail(reason)
+
+    staging._tick_store_loading()
+
+    assert captured['started']

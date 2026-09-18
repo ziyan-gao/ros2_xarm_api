@@ -22,7 +22,7 @@ index 451cb11..541203f 100644
  #include "xarm_planner/xarm_planner.h"
  
  namespace xarm_planner
-@@ -95,6 +95,18 @@ void XArmPlanner::publishPlan()
+@@ -95,6 +95,20 @@ void XArmPlanner::publishPlan()
      display_path_publisher_->publish(display_trajectory);
  }
  
@@ -34,7 +34,9 @@ index 451cb11..541203f 100644
 +        return false;
 +    }
 +    move_group_->setMaxVelocityScalingFactor(factor);
-+    RCLCPP_INFO(node_->get_logger(), "MoveIt velocity scaling set to %.1f%%", factor * 100.0);
++    move_group_->setMaxAccelerationScalingFactor(factor);
++    RCLCPP_INFO(node_->get_logger(),
++        "MoveIt velocity and acceleration scaling set to %.1f%%", factor * 100.0);
 +    return true;
 +}
 +

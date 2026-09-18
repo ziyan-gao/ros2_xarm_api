@@ -2,11 +2,66 @@ import json
 import math
 import time
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+def round_dimension_down_m(value_m, increment_mm=5.0):
+    """Floor a positive metric dimension to a millimetre increment."""
+    value_mm = float(value_m) * 1000.0
+    increment_mm = float(increment_mm)
+    if (not math.isfinite(value_mm) or value_mm <= 0.0 or
+            not math.isfinite(increment_mm) or increment_mm <= 0.0):
+        raise ValueError('dimension and rounding increment must be positive')
+    rounded_mm = math.floor((value_mm + 1e-9) / increment_mm) * increment_mm
+    if rounded_mm <= 0.0:
+        raise ValueError('rounded dimension must remain positive')
+    return rounded_mm / 1000.0
+
+
+def summarize_box_samples(samples):
+    """Average box samples and report their maximum measurement spreads."""
+    if not samples:
+        raise ValueError('at least one box sample is required')
+    positions = np.asarray([sample[0] for sample in samples], dtype=float)
+    quaternions = np.asarray([sample[1] for sample in samples], dtype=float)
+    dimensions = np.asarray([sample[2] for sample in samples], dtype=float)
+    if (not np.isfinite(positions).all() or
+            not np.isfinite(quaternions).all() or
+            not np.isfinite(dimensions).all() or
+            np.any(dimensions <= 0.0)):
+        raise ValueError('box samples contain invalid geometry')
+    norms = np.linalg.norm(quaternions, axis=1)
+    if np.any(norms <= 1e-9):
+        raise ValueError('box samples contain an invalid quaternion')
+    quaternions = quaternions / norms[:, None]
+
+    mean_position = positions.mean(axis=0)
+    position_spread = float(np.max(np.linalg.norm(
+        positions - mean_position, axis=1)))
+    reference = quaternions[0]
+    quaternions[np.sum(quaternions * reference, axis=1) < 0.0] *= -1.0
+    values, vectors = np.linalg.eigh(quaternions.T @ quaternions)
+    mean_quaternion = vectors[:, int(np.argmax(values))]
+    if np.dot(mean_quaternion, reference) < 0.0:
+        mean_quaternion *= -1.0
+    angular_spread = float(np.max(2.0 * np.arccos(
+        np.clip(np.abs(quaternions @ mean_quaternion), 0.0, 1.0))))
+    mean_dimensions = dimensions.mean(axis=0)
+    dimension_spread = float(np.max(np.abs(
+        dimensions - mean_dimensions)))
+    return {
+        'position': mean_position,
+        'quaternion': mean_quaternion,
+        'dimensions': mean_dimensions,
+        'position_spread_m': position_spread,
+        'angular_spread_rad': angular_spread,
+        'dimension_spread_m': dimension_spread,
+    }
 
 
 class PickupPipeline(Node):
@@ -34,7 +89,12 @@ class PickupPipeline(Node):
         self.declare_parameter('target_box_id', -1)
         self.declare_parameter('max_detection_age_sec', 0.5)
         self.declare_parameter('detection_timeout_sec', 20.0)
-        self.declare_parameter('detection_stable_frames', 3)
+        self.declare_parameter('detection_stable_frames', 20)
+        self.declare_parameter('detection_position_tolerance_m', 0.005)
+        self.declare_parameter('detection_angle_tolerance_deg', 2.0)
+        self.declare_parameter('detection_dimension_tolerance_m', 0.01)
+        self.declare_parameter('stable_box_publish_settle_sec', 0.15)
+        self.declare_parameter('xy_dimension_rounding_mm', 5.0)
         self.declare_parameter('motion_timeout_sec', 120.0)
         self.declare_parameter('pregrasp_settle_sec', 0.75)
 
@@ -44,6 +104,16 @@ class PickupPipeline(Node):
         self.max_detection_age = float(p('max_detection_age_sec'))
         self.detection_timeout = float(p('detection_timeout_sec'))
         self.detection_stable_frames = max(1, int(p('detection_stable_frames')))
+        self.detection_position_tolerance = max(
+            0.0005, float(p('detection_position_tolerance_m')))
+        self.detection_angle_tolerance = math.radians(max(
+            0.1, float(p('detection_angle_tolerance_deg'))))
+        self.detection_dimension_tolerance = max(
+            0.001, float(p('detection_dimension_tolerance_m')))
+        self.stable_box_publish_settle = max(
+            0.05, float(p('stable_box_publish_settle_sec')))
+        self.xy_dimension_rounding_mm = max(
+            0.1, float(p('xy_dimension_rounding_mm')))
         self.motion_timeout = float(p('motion_timeout_sec'))
         self.pregrasp_settle = max(0.0, float(p('pregrasp_settle_sec')))
 
@@ -55,6 +125,11 @@ class PickupPipeline(Node):
         self.pickup_status = {}
         self.refined_boxes = {}
         self.stable_detection_count = 0
+        self.detection_samples = []
+        self.detection_sample_id = None
+        self.last_detection_stamp = None
+        self.detection_spread = None
+        self.stable_box_published_at = None
         self.pending_motion = None
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
@@ -68,6 +143,8 @@ class PickupPipeline(Node):
             Float64MultiArray, '/object_info_estimation/result', 10)
         self.object_info_marker_pub = self.create_publisher(
             MarkerArray, '/object_info_estimation/markers', 10)
+        self.stable_box_pub = self.create_publisher(
+            MarkerArray, '/object_info_estimation/stable_boxes', 10)
         self.create_subscription(
             String, '/motion_coordinator/status', self.motion_status_callback, 10)
         self.create_subscription(
@@ -218,6 +295,7 @@ class PickupPipeline(Node):
         self.grasp_requested = False
         self.finalized_result_published = False
         self.stable_detection_count = 0
+        self._reset_detection_samples()
         if ready_at_contact:
             if self.estimation_only:
                 self.state = self.OBJECT_INFO_READY
@@ -338,7 +416,7 @@ class PickupPipeline(Node):
         self.state = self.IDLE
         self.fault = ''
         self.pending_motion = None
-        self.stable_detection_count = 0
+        self._reset_detection_samples()
         self.expected_motion_operation_id = None
         self.expected_pickup_operation_id = None
         self.pregrasp_succeeded_at = None
@@ -432,7 +510,7 @@ class PickupPipeline(Node):
                 self.motion_status.get('target') == 'observation'):
             self.pending_motion = None
             self.phase_started = time.monotonic()
-            self.stable_detection_count = 0
+            self._reset_detection_samples()
             self.state = self.WAIT_DETECTION
             self.publish_status()
 
@@ -440,13 +518,61 @@ class PickupPipeline(Node):
         if self._phase_elapsed() > self.detection_timeout:
             self._set_fault('timed out waiting for refined box detection')
             return
+        if self.stable_box_published_at is not None:
+            if (time.monotonic() - self.stable_box_published_at <
+                    self.stable_box_publish_settle):
+                return
+            self._start_pregrasp_plan()
+            return
         marker = self._fresh_box()
         if marker is None:
-            self.stable_detection_count = 0
             return
-        self.stable_detection_count += 1
+        stamp = (int(marker.header.stamp.sec), int(marker.header.stamp.nanosec))
+        if stamp == self.last_detection_stamp:
+            return
+        self.last_detection_stamp = stamp
+        marker_id = int(marker.id)
+        if self.detection_sample_id not in (None, marker_id):
+            self._reset_detection_samples()
+        self.detection_sample_id = marker_id
+        try:
+            sample = self._marker_sample(marker)
+        except ValueError as exc:
+            self.get_logger().warning(str(exc))
+            return
+        self.detection_samples.append(sample)
+        if len(self.detection_samples) > self.detection_stable_frames:
+            self.detection_samples.pop(0)
+        self.stable_detection_count = len(self.detection_samples)
         if self.stable_detection_count < self.detection_stable_frames:
             return
+        summary = summarize_box_samples(self.detection_samples)
+        self.detection_spread = {
+            'position_mm': summary['position_spread_m'] * 1000.0,
+            'angle_deg': math.degrees(summary['angular_spread_rad']),
+            'dimension_mm': summary['dimension_spread_m'] * 1000.0,
+        }
+        if (summary['position_spread_m'] > self.detection_position_tolerance or
+                summary['angular_spread_rad'] > self.detection_angle_tolerance or
+                summary['dimension_spread_m'] >
+                self.detection_dimension_tolerance):
+            return
+        stable_marker = self._averaged_marker(marker, summary)
+        message = MarkerArray()
+        message.markers = [stable_marker]
+        self.stable_box_pub.publish(message)
+        self.stable_box_published_at = time.monotonic()
+        self.get_logger().info(
+            'accepted %d distinct point-cloud box estimates: '
+            'position spread=%.1f mm, angle spread=%.1f deg, '
+            'dimension spread=%.1f mm' % (
+                self.detection_stable_frames,
+                self.detection_spread['position_mm'],
+                self.detection_spread['angle_deg'],
+                self.detection_spread['dimension_mm']))
+        self.publish_status()
+
+    def _start_pregrasp_plan(self):
         if not self.plan_pregrasp_client.service_is_ready():
             self._set_fault('pre-grasp planning service is unavailable')
             return
@@ -458,6 +584,59 @@ class PickupPipeline(Node):
         future = self.plan_pregrasp_client.call_async(Trigger.Request())
         future.add_done_callback(self._plan_pregrasp_completed)
         self.publish_status()
+
+    def _reset_detection_samples(self):
+        self.stable_detection_count = 0
+        self.detection_samples = []
+        self.detection_sample_id = None
+        self.last_detection_stamp = None
+        self.detection_spread = None
+        self.stable_box_published_at = None
+
+    @staticmethod
+    def _marker_sample(marker):
+        position = np.array([
+            marker.pose.position.x,
+            marker.pose.position.y,
+            marker.pose.position.z,
+        ], dtype=float)
+        quaternion = np.array([
+            marker.pose.orientation.x,
+            marker.pose.orientation.y,
+            marker.pose.orientation.z,
+            marker.pose.orientation.w,
+        ], dtype=float)
+        dimensions = np.array([
+            marker.scale.x,
+            marker.scale.y,
+            marker.scale.z,
+        ], dtype=float)
+        values = np.concatenate((position, quaternion, dimensions))
+        if not np.isfinite(values).all() or np.any(dimensions <= 0.0):
+            raise ValueError(
+                f'refined box {int(marker.id)} has invalid geometry')
+        return position, quaternion, dimensions
+
+    def _averaged_marker(self, source, summary):
+        marker = Marker()
+        marker.header.frame_id = 'link_base'
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'stable_depth_refined_boxes'
+        marker.id = int(source.id)
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        (marker.pose.position.x, marker.pose.position.y,
+         marker.pose.position.z) = map(float, summary['position'])
+        (marker.pose.orientation.x, marker.pose.orientation.y,
+         marker.pose.orientation.z, marker.pose.orientation.w) = map(
+             float, summary['quaternion'])
+        marker.scale.x, marker.scale.y, marker.scale.z = map(
+            float, summary['dimensions'])
+        marker.color.r = 0.15
+        marker.color.g = 1.0
+        marker.color.b = 0.25
+        marker.color.a = 0.65
+        return marker
 
     def _plan_pregrasp_completed(self, future):
         if self.state != self.MOVE_PREGRASP:
@@ -566,7 +745,7 @@ class PickupPipeline(Node):
     def _publish_finalized_object_info(self):
         if self.finalized_result_published:
             return
-        info = self.pickup_status.get('corrected_object')
+        info = self._rounded_corrected_object()
         if not isinstance(info, dict):
             return
         try:
@@ -622,6 +801,20 @@ class PickupPipeline(Node):
         self.object_info_marker_pub.publish(markers)
         self.finalized_result_published = True
 
+    def _rounded_corrected_object(self):
+        info = self.pickup_status.get('corrected_object')
+        if not isinstance(info, dict):
+            return info
+        result = dict(info)
+        try:
+            result['size_x_m'] = round_dimension_down_m(
+                result['size_x_m'], self.xy_dimension_rounding_mm)
+            result['size_y_m'] = round_dimension_down_m(
+                result['size_y_m'], self.xy_dimension_rounding_mm)
+        except (KeyError, TypeError, ValueError):
+            return info
+        return result
+
     def _clear_object_markers(self):
         markers = MarkerArray()
         clear = Marker()
@@ -653,13 +846,15 @@ class PickupPipeline(Node):
             'motion_target': self.motion_status.get('target'),
             'pickup_state': self.pickup_status.get('state'),
             'stable_detection_count': self.stable_detection_count,
+            'required_detection_samples': self.detection_stable_frames,
+            'detection_spread': self.detection_spread,
             'pregrasp_settling': (
                 self.state == self.MOVE_PREGRASP and
                 self.pregrasp_succeeded_at is not None),
             'estimation_only': self.estimation_only,
             'object_info_obtained': bool(
                 self.pickup_status.get('object_info_obtained')),
-            'corrected_object': self.pickup_status.get('corrected_object'),
+            'corrected_object': self._rounded_corrected_object(),
             'detected_box': box_summary,
         }, separators=(',', ':'))
         self.status_pub.publish(message)

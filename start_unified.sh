@@ -25,11 +25,10 @@ set -u
 : "${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC:=20.0}"
 : "${PLACE_SINGULARITY_STEP_M:=0.003}"
 : "${PLACE_SINGULARITY_STEP_SPEED_MM_S:=10.0}"
+: "${DIRECT_CARTESIAN_MAX_SPEED_MM_S:=200.0}"
+: "${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2:=500.0}"
 : "${RANDOM_LOADING_AUTO_START:=false}"
-: "${RANDOM_LOADING_CLEARANCE_MM:=10}"
-: "${RANDOM_LOADING_SAMPLE_FRACTION:=0.30}"
-: "${RANDOM_LOADING_COM_BOUND_RATIO:=0.20}"
-: "${TRANSFER_CORNER_HEIGHT_M:=0.47}"
+: "${RANDOM_LOADING_CONFIG_PATH:=/opt/neuromeka_bin_packing/configs/real_platform_random.yaml}"
 : "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M:=0.480}"
 : "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
 : "${RANDOM_LOADING_VISUALIZE:=true}"
@@ -41,6 +40,7 @@ set -u
 : "${DEPTH_ONLY_SUPPORT_Z_M:=0.0}"
 : "${DEPTH_ONLY_HEIGHT_OFFSET_M:=-0.02}"
 : "${OBJECT_CONTACT_REFERENCE_Z_M:=0.0}"
+: "${OBJECT_INFO_STABLE_SAMPLES:=20}"
 : "${DEPTH_ONLY_BASE_Z_MIN_M:=0.07}"
 : "${DEPTH_ONLY_BASE_Z_MAX_M:=0.30}"
 : "${DEPTH_ONLY_TCP_X_MIN_M:=0.05}"
@@ -57,6 +57,46 @@ if [[ ! -r "${RVIZ_CONFIG}" ]]; then
   echo "RViz configuration is not readable: ${RVIZ_CONFIG}" >&2
   exit 2
 fi
+
+if [[ ! -r "${RANDOM_LOADING_CONFIG_PATH}" ]]; then
+  echo "Random-loading configuration is not readable: ${RANDOM_LOADING_CONFIG_PATH}" >&2
+  exit 2
+fi
+
+# Load the random-packing geometry once and pass the same validated values to
+# both the packing node and robot-motion nodes. This keeps a changed container
+# height synchronized with the collision-clear transfer/lift height.
+random_loading_fields="$(
+  python3 -m packing.real_platform_random_config \
+    --config "${RANDOM_LOADING_CONFIG_PATH}"
+)"
+IFS=$'\t' read -r \
+  RANDOM_LOADING_CONTAINER_CSV \
+  RANDOM_LOADING_CLEARANCE_MM \
+  RANDOM_LOADING_CLEARANCE_MODE \
+  RANDOM_LOADING_SEED \
+  RANDOM_LOADING_SCAN_DOWNSCALE \
+  RANDOM_LOADING_COM_BOUND_RATIO \
+  RANDOM_LOADING_HEIGHT_TOLERANCE_MM \
+  RANDOM_LOADING_VERTICAL_FILTER_ENABLED \
+  RANDOM_LOADING_HEIGHT_RESOLUTION_MM \
+  TRANSFER_CORNER_HEIGHT_M <<< "${random_loading_fields}"
+
+if [[ -z "${RANDOM_LOADING_CONTAINER_CSV}" ||
+      -z "${RANDOM_LOADING_CLEARANCE_MM}" ||
+      -z "${RANDOM_LOADING_CLEARANCE_MODE}" ||
+      -z "${RANDOM_LOADING_SEED}" ||
+      -z "${RANDOM_LOADING_SCAN_DOWNSCALE}" ||
+      -z "${RANDOM_LOADING_COM_BOUND_RATIO}" ||
+      -z "${RANDOM_LOADING_HEIGHT_TOLERANCE_MM}" ||
+      -z "${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}" ||
+      -z "${RANDOM_LOADING_HEIGHT_RESOLUTION_MM}" ||
+      -z "${TRANSFER_CORNER_HEIGHT_M}" ]]; then
+  echo "FATAL: random-loading configuration returned incomplete startup values." >&2
+  exit 2
+fi
+RANDOM_LOADING_CONTAINER_ROS="[${RANDOM_LOADING_CONTAINER_CSV//,/, }]"
+echo "Random loading config: container=${RANDOM_LOADING_CONTAINER_ROS} mm, clearance=${RANDOM_LOADING_CLEARANCE_MM} mm (${RANDOM_LOADING_CLEARANCE_MODE}), height tolerance=${RANDOM_LOADING_HEIGHT_TOLERANCE_MM} mm, vertical filter=${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}, transfer corner height=${TRANSFER_CORNER_HEIGHT_M} m"
 
 # A non-real-time controller_manager previously missed tens of Servo-J write
 # cycles and then caught up abruptly.  Refuse to connect to the real robot if
@@ -118,7 +158,8 @@ start_required "six-slot unpacking staging coordinator" \
   ros2 run safe_servo_visualization staging_slots --ros-args \
     -p transfer_item_bottom_above_pallet_m:="${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M}"
 start_required "pickup pipeline orchestrator" \
-  ros2 run safe_servo_visualization pickup_pipeline
+  ros2 run safe_servo_visualization pickup_pipeline --ros-args \
+    -p detection_stable_frames:="${OBJECT_INFO_STABLE_SAMPLES}"
 start_required "place pipeline orchestrator" \
   ros2 run safe_servo_visualization place_pipeline
 start_required "combined PickAndPlace orchestrator" \
@@ -128,7 +169,7 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
     -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}" \
     -p place_descent_timeout_sec:="${PLACE_DESCENT_TIMEOUT_SEC}" \
-    -p direct_transfer_max_joint_delta_rad:=5.0 \
+    -p direct_transfer_max_joint_delta_rad:=3.141592653589793 \
     -p singularity_place_recovery_timeout_sec:="${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC}" \
     -p singularity_place_step_m:="${PLACE_SINGULARITY_STEP_M}" \
     -p singularity_place_step_speed_mm_s:="${PLACE_SINGULARITY_STEP_SPEED_MM_S}" \
@@ -136,6 +177,8 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p singularity_no_progress_sec:="${PLACE_SINGULARITY_NO_PROGRESS_SEC}" \
     -p post_restore_settle_sec:="${POST_RESTORE_SETTLE_SEC}" \
     -p direct_transfer_ik_timeout_sec:="${DIRECT_TRANSFER_IK_TIMEOUT_SEC}" \
+    -p direct_cartesian_max_speed_mm_s:="${DIRECT_CARTESIAN_MAX_SPEED_MM_S}" \
+    -p direct_cartesian_max_acc_mm_s2:="${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2}" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p contact_reference_z_m:="${OBJECT_CONTACT_REFERENCE_Z_M}" \
     -p place_workspace_z_min_mm:="${PLACE_WORKSPACE_Z_MIN_MM}"
@@ -163,11 +206,17 @@ start_required "incoming-item localization supervisor" \
   ros2 run safe_servo_visualization item_localization
 start_required "real-platform random stable-loading coordinator" \
   ros2 run safe_servo_visualization random_stable_loading --ros-args \
-    -p container_size_mm:="[450, 550, 450]" \
-    -p packing_height_resolution_mm:=5 \
+    -p container_size_mm:="${RANDOM_LOADING_CONTAINER_ROS}" \
+    -p packing_height_resolution_mm:="${RANDOM_LOADING_HEIGHT_RESOLUTION_MM}" \
     -p clearance_mm:="${RANDOM_LOADING_CLEARANCE_MM}" \
-    -p candidate_sample_fraction:="${RANDOM_LOADING_SAMPLE_FRACTION}" \
+    -p clearance_mode:="${RANDOM_LOADING_CLEARANCE_MODE}" \
+    -p seed:="${RANDOM_LOADING_SEED}" \
+    -p scan_downscale:="${RANDOM_LOADING_SCAN_DOWNSCALE}" \
     -p com_bound_ratio:="${RANDOM_LOADING_COM_BOUND_RATIO}" \
+    -p height_tolerance:="${RANDOM_LOADING_HEIGHT_TOLERANCE_MM}" \
+    -p vertical_loading_filter_enabled:="${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}" \
+    -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
+    -p random_loading_config_path:="${RANDOM_LOADING_CONFIG_PATH}" \
     -p auto_start_pick_place:="${RANDOM_LOADING_AUTO_START}" \
     -p visualization_enabled:="${RANDOM_LOADING_VISUALIZE}" \
     -p visualization_port:="${RANDOM_LOADING_VISUAL_PORT}"

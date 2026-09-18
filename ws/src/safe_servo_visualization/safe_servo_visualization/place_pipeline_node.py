@@ -24,10 +24,13 @@ class PlacePipeline(Node):
         super().__init__('place_pipeline')
         self.declare_parameter('motion_timeout_sec', 120.0)
         self.declare_parameter('post_loading_settle_sec', 0.75)
+        self.declare_parameter('moveit_transfer_fallback_enabled', False)
         self.motion_timeout = float(
             self.get_parameter('motion_timeout_sec').value)
         self.post_loading_settle = float(
             self.get_parameter('post_loading_settle_sec').value)
+        self.moveit_transfer_fallback_enabled = bool(
+            self.get_parameter('moveit_transfer_fallback_enabled').value)
         self.state, self.fault, self.pending_motion = self.IDLE, '', None
         self.operation_id = 0
         self.phase_started = None
@@ -205,7 +208,7 @@ class PlacePipeline(Node):
                         f'{reason}; direct motion had already started, so '
                         'automatic MoveIt fallback is unsafe')
                 else:
-                    self._begin_moveit_transfer_fallback(reason)
+                    self._handle_direct_transfer_failure(reason)
             elif (state == 'SUCCEEDED' and
                   self.supervisor_status.get('direct_transfer_succeeded')):
                 self._accept_direct_transfer()
@@ -218,6 +221,11 @@ class PlacePipeline(Node):
             return
         state = self.motion_status.get('state')
         if state == 'PREPARED' and self.pending_motion == 'transfer_preparing':
+            if self.motion_status.get(
+                    'keep_eef_perpendicular_to_pallet', False):
+                self.get_logger().info(
+                    'EEF-perpendicular target selected; using deterministic '
+                    'joint interpolation to the perpendicular transfer pose')
             self._begin_direct_joint_transfer()
         elif state == 'PLANNED' and self.pending_motion == 'transfer':
             self.pending_motion = 'transfer_executing'
@@ -228,7 +236,7 @@ class PlacePipeline(Node):
 
     def _begin_direct_joint_transfer(self):
         if not self.start_joint_transfer.service_is_ready():
-            self._begin_moveit_transfer_fallback(
+            self._handle_direct_transfer_failure(
                 'deterministic joint-transfer service is unavailable')
             return
         self.pending_motion = 'direct_joint_starting'
@@ -245,19 +253,29 @@ class PlacePipeline(Node):
         try:
             result = future.result()
         except Exception as exc:
-            self._begin_moveit_transfer_fallback(
+            self._handle_direct_transfer_failure(
                 f'MoveIt/KDL transfer start failed after {elapsed:.3f} s: '
                 f'{exc}')
             return
         if result is None or not result.success:
             message = 'no response' if result is None else result.message
-            self._begin_moveit_transfer_fallback(
+            self._handle_direct_transfer_failure(
                 f'MoveIt/KDL transfer rejected after {elapsed:.3f} s: '
                 f'{message}')
             return
         self.pending_motion = 'direct_joint_executing'
         self.get_logger().info(
             f'MoveIt/KDL transfer request accepted in {elapsed:.3f} s')
+
+    def _handle_direct_transfer_failure(self, reason):
+        if reason.startswith('KINEMATIC_REJECTED:'):
+            self._fault(reason)
+            return
+        if self.moveit_transfer_fallback_enabled:
+            self._begin_moveit_transfer_fallback(reason)
+            return
+        self._fault(
+            f'{reason}; automatic MoveIt transfer fallback is disabled')
 
     def _begin_moveit_transfer_fallback(self, reason):
         if not self.plan_transfer.service_is_ready():
@@ -469,6 +487,8 @@ class PlacePipeline(Node):
                 'place_fallback_reason', ''),
             'transfer_fallback_used': self.transfer_fallback_used,
             'transfer_fallback_reason': self.transfer_fallback_reason,
+            'moveit_transfer_fallback_enabled': (
+                self.moveit_transfer_fallback_enabled),
             'attached_item_id': self.scene_status.get('attached_item_id', ''),
             'pallet_status': self.pallet_status,
         }, separators=(',', ':'))

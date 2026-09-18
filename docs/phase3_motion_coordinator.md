@@ -44,10 +44,13 @@ active.
 UFACTORY's planner defaults to a fixed velocity scale. The Docker build applies
 `patches/xarm_planner_low_speed.patch` as a 0.10 startup fallback and
 `patches/xarm_planner_runtime_speed.patch` so the panel's unified non-servo
-speed slider can update MoveIt's velocity scaling before planning. The slider
-is capped at 0.30, the upstream vendor default; acceleration scaling remains at
-the conservative 0.10 limit. The same slider controls local direct Cartesian
-service velocity but does not alter safe-servo descent speed.
+speed slider can update MoveIt's velocity and acceleration scaling before
+planning. The 5..100% slider maps directly to MoveIt's 0.05..1.00 scaling
+range. The same slider proportionally controls local direct Cartesian motion
+against the commissioned `200 mm/s`, `500 mm/s^2` defaults and controls the
+joint-transfer envelope, but does not alter safe-servo descent speed. Override
+the Cartesian envelope through `DIRECT_CARTESIAN_MAX_SPEED_MM_S` and
+`DIRECT_CARTESIAN_MAX_ACCEL_MM_S2` in `.env`.
 
 Rebuild the image before testing Phase 3:
 

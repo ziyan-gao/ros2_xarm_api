@@ -24,11 +24,17 @@ The intended cycle is:
 
 Use safe servo only for short vertical contact searches near an item or placement
 surface. The automatic cycle uses the UFACTORY Cartesian service for local
-vertical lift, loading, and retreat segments. Elevated free-space transfer
-first uses MoveIt/KDL IK followed by collision-checked joint interpolation;
-RRTConnect remains the fallback. Return-to-observation uses normal MoveIt
-planning. The pipeline never executes an unchecked joint interpolation or a
-long Cartesian transfer.
+vertical lift, loading, and retreat segments. With **Keep EEF perpendicular to
+pallet** selected, the transfer target keeps the configured perpendicular
+orientation. Elevated free-space transfer uses MoveIt/KDL IK followed by
+collision-checked joint interpolation. Periodic axes use their nearest
+equivalent angle, and any IK branch requiring more than 180 degrees on one
+joint is rejected. Automatic RRTConnect fallback is disabled by default; an
+invalid direct path stops the cycle before robot motion. The checkbox constrains
+the target orientation, not
+every intermediate orientation along the joint interpolation. Return to the
+observation pose uses normal MoveIt planning. The pipeline never executes an
+unchecked joint interpolation or a long Cartesian transfer.
 
 Only one command source may control the robot at a time. Switching between MoveIt trajectory execution and SDK servo mode must be explicit, and the previous motion must be stopped and confirmed complete first.
 
@@ -40,13 +46,19 @@ not change safe-servo descent speed. The slider is a percentage of the
 application's commissioned envelope:
 
 ```text
-MoveIt velocity scaling = slider_percent * 0.003  (1.5% .. 30%)
-Cartesian service speed = slider_percent mm/s    (5 .. 100 mm/s)
+MoveIt velocity/acceleration scaling = slider_percent / 100  (5% .. 100%)
+Cartesian service speed = 200 * slider_percent / 100 mm/s
+Cartesian service acceleration = 500 * slider_percent / 100 mm/s^2
+Direct joint speed limit = 2.14 * slider_percent / 100 rad/s
+Direct joint acceleration = 10.0 * slider_percent / 100 rad/s^2
 ```
 
-For example, 30% selects 9% MoveIt velocity scaling and 30 mm/s linear-service
-motion. MoveIt acceleration scaling remains at the conservative configured
-limit.
+For example, with the default commissioned envelope, 30% selects 30% MoveIt
+velocity and acceleration scaling, 60 mm/s and 150 mm/s^2 linear-service
+motion, and a 0.642 rad/s deterministic joint-transfer limit. The Cartesian
+maximums are configured by `DIRECT_CARTESIAN_MAX_SPEED_MM_S` and
+`DIRECT_CARTESIAN_MAX_ACCEL_MM_S2`. Safe-servo contact descent remains
+independently limited.
 
 ### Save taught configurations as joint positions
 
@@ -439,15 +451,21 @@ configured stable-sample requirement has passed.
 **Estimate Object Info** uses the existing pickup motion path without enabling
 the vacuum. It first guarantees the saved observation pose (the motion
 coordinator skips execution when the measured joints are already within
-0.02 rad), waits for a stable refined box, moves to the 30 mm pre-grasp, and
-uses safe-servo to touch the top face. At confirmed contact it latches:
+0.02 rad), then collects 20 distinct timestamped depth-refined box estimates.
+It averages their pose and dimensions and accepts them only when maximum
+position, orientation, and dimension spreads remain within 5 mm, 2 degrees,
+and 10 mm respectively. Re-reading one cached marker does not increase the
+sample count. The averaged box is used for the 30 mm pre-grasp, after which
+safe-servo touches the top face. At confirmed contact it latches:
 
 ```text
 height = contact_tcp_z - empty_table_contact_tcp_z
 center_z = empty_table_contact_tcp_z + height / 2
 ```
 
-The depth-derived X/Y center, X/Y dimensions, and yaw are retained. The panel
+The depth-derived X/Y center and yaw are retained. Final X/Y dimensions are
+rounded downward to the 5 mm grid (`149 -> 145`, `136 -> 135`, `131 -> 130`)
+while contact-derived Z remains unmodified at this stage. The panel
 shows `OBTAINED` only while the TCP remains at that measured contact pose with
 the vacuum off. The corrected geometry is published on
 `/object_info_estimation/result` and visualized by the **Contact Corrected

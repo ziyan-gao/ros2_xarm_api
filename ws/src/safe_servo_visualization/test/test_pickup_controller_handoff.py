@@ -328,6 +328,7 @@ def test_c52_during_place_descent_stops_servo_and_preserves_item():
     supervisor.c52_retreat_active = False
     supervisor.c52_clear_attempts = 0
     supervisor.c52_tcp_snapshot = None
+    supervisor.direct_tcp_z_offset = 0.024
 
     supervisor._begin_c52_interruption()
 

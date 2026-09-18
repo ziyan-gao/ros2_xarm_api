@@ -136,6 +136,21 @@ def test_direct_transfer_uses_absolute_xarm_pose_and_firmware_ik_fallback():
     assert supervisor.fault == ''
 
 
+def test_motion_slider_scales_direct_cartesian_speed_and_acceleration():
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.direct_cartesian_max_speed = 200.0
+    supervisor.direct_cartesian_max_acc = 500.0
+    supervisor.direct_transfer_max_joint_speed = 2.14
+    supervisor.get_logger = lambda: FakeLogger()
+
+    supervisor.motion_speed_config_callback(
+        SimpleNamespace(data=[0.5, 50.0]))
+
+    assert supervisor.motion_speed_percent == pytest.approx(50.0)
+    assert supervisor.retreat_speed == pytest.approx(100.0)
+    assert supervisor.retreat_acc == pytest.approx(250.0)
+
+
 def test_direct_transfer_requires_tcp_to_reach_the_requested_xyz():
     supervisor = object.__new__(PickupSupervisor)
     supervisor.operation_kind = 'transfer'
@@ -218,6 +233,7 @@ def test_validated_joint_line_executes_through_trajectory_controller():
         supervisor.direct_target_joints,
     ]
     supervisor.direct_transfer_ik_timeout = 2.0
+    supervisor.direct_transfer_max_joint_speed = 2.14
     supervisor.direct_transfer_joint_acc = 0.7
     supervisor.retreat_speed = 75.0
     supervisor.trajectory_controller = 'uf850_traj_controller'
@@ -247,6 +263,36 @@ def test_validated_joint_line_executes_through_trajectory_controller():
     assert supervisor.direct_transfer_motion_started is True
     goal_handle.result_future.callback(goal_handle.result_future)
     assert completed == [True]
+
+
+def test_joint_transfer_uses_full_model_limits_at_one_hundred_percent():
+    duration, speed, acceleration, fraction = (
+        PickupSupervisor._joint_transfer_timing(
+            max_delta=3.0,
+            operator_percent=100.0,
+            maximum_speed=2.14,
+            maximum_acceleration=10.0,
+        ))
+
+    assert fraction == pytest.approx(1.0)
+    assert speed == pytest.approx(2.14)
+    assert acceleration == pytest.approx(10.0)
+    assert duration == pytest.approx(1.875 * 3.0 / 2.14)
+
+
+def test_joint_transfer_speed_slider_scales_velocity_and_acceleration():
+    duration, speed, acceleration, fraction = (
+        PickupSupervisor._joint_transfer_timing(
+            max_delta=3.0,
+            operator_percent=50.0,
+            maximum_speed=2.14,
+            maximum_acceleration=10.0,
+        ))
+
+    assert fraction == pytest.approx(0.5)
+    assert speed == pytest.approx(1.07)
+    assert acceleration == pytest.approx(5.0)
+    assert duration == pytest.approx(1.875 * 3.0 / 1.07)
 
 
 def _completed_direct_joint_transfer(actual_joints):
@@ -296,10 +342,13 @@ def test_direct_joint_transfer_rejects_large_joint_feedback_error():
 
 def _direct_loading_supervisor():
     supervisor = object.__new__(PickupSupervisor)
+    supervisor.robot_error = 0
     supervisor.operation_kind = 'loading'
     supervisor.loading_contact_fallback = False
     supervisor.direct_target_pose = None
     supervisor.direct_target_z = 0.300
+    supervisor.direct_tcp_z_offset = 0.0
+    supervisor.direct_command_target_z = 0.300
     supervisor.retreat_start_z = 0.470
     supervisor.retreat_speed = 75.0
     supervisor.retreat_acc = 200.0
@@ -332,12 +381,47 @@ def test_downward_loading_service_is_nonblocking_so_stop_remains_callable():
     assert supervisor.state == PickupSupervisor.RETREATING
 
 
+def test_loading_converts_link_tcp_target_to_sdk_tcp_before_direct_motion():
+    supervisor = _direct_loading_supervisor()
+    supervisor.direct_target_z = 0.235
+    supervisor.retreat_start_z = 0.480
+    supervisor.direct_tcp_z_offset = 0.024
+
+    supervisor._send_direct_retreat()
+
+    request = supervisor.retreat_client.requests[-1]
+    assert request.relative is True
+    assert request.pose[:3] == pytest.approx([0.0, 0.0, -269.0])
+    assert supervisor.direct_command_target_z == pytest.approx(0.211)
+    assert supervisor.retreat_target_z == pytest.approx(0.211)
+
+
+def test_loading_does_not_stop_at_unconverted_link_tcp_z():
+    supervisor = _direct_loading_supervisor()
+    supervisor.direct_target_z = 0.235
+    supervisor.direct_tcp_z_offset = 0.024
+    supervisor.direct_command_target_z = 0.211
+    supervisor.state = PickupSupervisor.RETREATING
+    supervisor.retreat_started = time.monotonic()
+    supervisor.pre_descent_wait_callback = None
+    supervisor.mode_wait_target = None
+    # This is the old, incorrect stopping point: SDK Z equals the requested
+    # link_tcp Z, leaving link_tcp approximately 24 mm too high.
+    supervisor._direct_mode_tcp_xyz = lambda: (0.4, -0.2, 0.235)
+
+    supervisor.retreat_tick()
+
+    assert supervisor.state == PickupSupervisor.RETREATING
+    assert supervisor.set_state_client.requests == []
+
+
 def test_nonblocking_loading_reaching_target_restores_ros_control():
     supervisor = _direct_loading_supervisor()
     supervisor.state = PickupSupervisor.RETREATING
     supervisor.retreat_started = time.monotonic()
     supervisor.pre_descent_wait_callback = None
     supervisor.mode_wait_target = None
+    supervisor.direct_command_target_z = 0.300
     supervisor._direct_mode_tcp_xyz = lambda: (0.4, -0.2, 0.3005)
     restored = []
     supervisor._restore_ros2_control_mode = lambda: restored.append(True)
@@ -449,6 +533,7 @@ def _direct_joint_failure_pipeline(motion_started):
         SimpleNamespace(success=True, message='planning'))
     pipeline.transfer_fallback_used = False
     pipeline.transfer_fallback_reason = ''
+    pipeline.moveit_transfer_fallback_enabled = False
     pipeline.phase_started = time.monotonic()
     pipeline.get_logger = lambda: FakeLogger()
     pipeline.fault = ''
@@ -456,8 +541,19 @@ def _direct_joint_failure_pipeline(motion_started):
     return pipeline
 
 
-def test_moveit_kdl_ik_failure_before_motion_falls_back_to_rrtconnect():
+def test_moveit_kdl_ik_failure_faults_when_planning_fallback_is_disabled():
     pipeline = _direct_joint_failure_pipeline(False)
+
+    pipeline._tick_transfer()
+
+    assert pipeline.transfer_fallback_used is False
+    assert pipeline.plan_transfer.requests == []
+    assert 'automatic MoveIt transfer fallback is disabled' in pipeline.fault
+
+
+def test_moveit_kdl_ik_failure_can_use_explicitly_enabled_rrt_fallback():
+    pipeline = _direct_joint_failure_pipeline(False)
+    pipeline.moveit_transfer_fallback_enabled = True
 
     pipeline._tick_transfer()
 
@@ -465,6 +561,32 @@ def test_moveit_kdl_ik_failure_before_motion_falls_back_to_rrtconnect():
     assert pipeline.transfer_fallback_used is True
     assert len(pipeline.plan_transfer.requests) == 1
     assert pipeline.fault == ''
+
+
+def test_perpendicular_transfer_uses_direct_joint_interpolation():
+    pipeline = object.__new__(PlacePipeline)
+    pipeline.pending_motion = 'transfer_preparing'
+    pipeline.expected_motion_operation_id = 4
+    pipeline.motion_status = {
+        'state': 'PREPARED',
+        'target': 'transfer',
+        'operation_id': 4,
+        'keep_eef_perpendicular_to_pallet': True,
+    }
+    pipeline.supervisor_status = {'operation_id': 9}
+    pipeline.plan_transfer = FakeClient(
+        SimpleNamespace(success=True, message='planning'))
+    pipeline.start_joint_transfer = FakeClient(
+        SimpleNamespace(success=True, message='direct'))
+    pipeline.phase_started = time.monotonic()
+    pipeline.get_logger = lambda: FakeLogger()
+    pipeline._fault = lambda reason: setattr(pipeline, 'fault', reason)
+
+    pipeline._tick_transfer()
+
+    assert pipeline.pending_motion == 'direct_joint_starting'
+    assert len(pipeline.start_joint_transfer.requests) == 1
+    assert pipeline.plan_transfer.requests == []
 
 
 def test_direct_joint_execution_failure_does_not_auto_fallback():

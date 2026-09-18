@@ -1,12 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
-
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray, String
-from std_srvs.srv import SetBool, Trigger
 
 from packing.real_platform_loading import (
     NoStableLoadingPosition,
@@ -14,6 +9,10 @@ from packing.real_platform_loading import (
 )
 from packing.threejs_visualization import ThreeLiveServer, ThreeVisualizationBuilder
 from packing_env.visualization.config import DEFAULT_VISUAL_CONFIG
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray, String
+from std_srvs.srv import SetBool, Trigger
 
 
 def round_up_to_increment(value, increment):
@@ -27,6 +26,20 @@ def round_up_to_increment(value, increment):
     return float(int(math.ceil(value / increment)) * increment)
 
 
+def round_down_to_increment(value, increment):
+    """Return a positive millimetre value rounded downward to an increment."""
+    value = float(value)
+    increment = int(increment)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError('dimension must be finite and positive')
+    if increment <= 0:
+        raise ValueError('rounding increment must be positive')
+    result = float(int(math.floor((value + 1e-9) / increment)) * increment)
+    if result <= 0.0:
+        raise ValueError('rounded dimension must remain positive')
+    return result
+
+
 class RandomStableLoadingNode(Node):
     """Bridge real item dimensions to stable pallet-frame loading targets."""
 
@@ -34,7 +47,7 @@ class RandomStableLoadingNode(Node):
     NODE_NAME = 'random_stable_loading'
     API_PREFIX = '/random_stable_loading'
     DEFAULT_VISUALIZATION_PORT = 8765
-    DEFAULT_CLEARANCE_MM = 10
+    DEFAULT_CLEARANCE_MM = 20
     DEFAULT_SEED = 101
     VISUALIZATION_DIRECTORY = '/tmp/random_stable_loading_visualization'
     LOADING_LABEL = 'stable random loading'
@@ -43,23 +56,30 @@ class RandomStableLoadingNode(Node):
         return RealPlatformRandomLoader(
             container_size=container_size,
             clearance_mm=int(self.get_parameter('clearance_mm').value),
+            clearance_mode=str(self.get_parameter('clearance_mode').value),
             seed=int(self.get_parameter('seed').value),
             scan_downscale=int(self.get_parameter('scan_downscale').value),
-            candidate_sample_fraction=float(
-                self.get_parameter('candidate_sample_fraction').value),
             com_bound_ratio=float(
                 self.get_parameter('com_bound_ratio').value),
+            height_tolerance=float(
+                self.get_parameter('height_tolerance').value),
+            vertical_loading_filter_enabled=bool(self.get_parameter(
+                'vertical_loading_filter_enabled').value),
         )
 
     def __init__(self):
         super().__init__(self.NODE_NAME)
         self.declare_parameter('container_size_mm', [450, 550, 450])
         self.declare_parameter('clearance_mm', self.DEFAULT_CLEARANCE_MM)
+        self.declare_parameter('clearance_mode', 'one_sided')
         self.declare_parameter('seed', self.DEFAULT_SEED)
         self.declare_parameter('scan_downscale', 2)
-        self.declare_parameter('candidate_sample_fraction', 0.3)
         self.declare_parameter('com_bound_ratio', 0.2)
+        self.declare_parameter('height_tolerance', 0.0)
+        self.declare_parameter('vertical_loading_filter_enabled', True)
         self.declare_parameter('packing_height_resolution_mm', 5)
+        self.declare_parameter('transfer_corner_height_m', 0.47)
+        self.declare_parameter('random_loading_config_path', '')
         self.declare_parameter('auto_start_pick_place', False)
         self.declare_parameter('continuous_loading_enabled', False)
         self.declare_parameter('localization_timeout_sec', 180.0)
@@ -75,6 +95,12 @@ class RandomStableLoadingNode(Node):
             int(value) for value in
             self.get_parameter('container_size_mm').value)
         self.loader = self._build_loader(container_size)
+        self.transfer_corner_height = float(
+            self.get_parameter('transfer_corner_height_m').value)
+        if self.transfer_corner_height <= 0.0:
+            raise ValueError('transfer_corner_height_m must be positive')
+        self.random_loading_config_path = str(
+            self.get_parameter('random_loading_config_path').value)
 
         self.auto_start = bool(
             self.get_parameter('auto_start_pick_place').value)
@@ -105,6 +131,8 @@ class RandomStableLoadingNode(Node):
         self.abort_started = None
         self.start_request_pending = False
         self.planning_future = None
+        self.rejected_loading_poses = set()
+        self.retrying_carried_item = False
         self.planning_worker = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix='stable_loading')
         self.visualization_server = None
@@ -138,6 +166,8 @@ class RandomStableLoadingNode(Node):
 
         self.pick_place_client = self.create_client(
             Trigger, '/pick_place_pipeline/start')
+        self.retry_place_client = self.create_client(
+            Trigger, '/pick_place_pipeline/retry_place')
         self.pick_place_abort_client = self.create_client(
             Trigger, '/pick_place_pipeline/abort')
         self.pick_place_reset_client = self.create_client(
@@ -175,13 +205,18 @@ class RandomStableLoadingNode(Node):
 
     def _log_ready(self, container_size):
         self.get_logger().info(
-            'random stable loading ready: container=%s mm, clearance=%d mm, '
-            'vertical_filter=true, sample_fraction=%.2f, '
-            'com_bound_ratio=%.2f, auto_start=%s' % (
+            'random stable loading ready: container=%s mm, clearance=%d mm (%s), '
+            'vertical_filter=%s, selection=random_at_minimum_z, '
+            'com_bound_ratio=%.2f, height_tolerance=%.1f mm, '
+            'transfer_corner_height=%.3f m, '
+            'auto_start=%s' % (
                 container_size,
                 self.loader.clearance_mm,
-                self.loader.candidate_sample_fraction,
+                self.loader.clearance_mode,
+                str(self.loader.vertical_loading_filter_enabled).lower(),
                 self.loader.com_bound_ratio,
+                self.loader.height_tolerance,
+                self.transfer_corner_height,
                 self.auto_start))
 
     def _start_visualization(self):
@@ -221,6 +256,7 @@ class RandomStableLoadingNode(Node):
                     [] if pending_item is None else [pending_item]),
                 show_anchor=True,
                 show_ems=False,
+                virtual_boxes=True,
             )
             self.visualization_server.push(frame)
         except Exception as exc:
@@ -256,13 +292,15 @@ class RandomStableLoadingNode(Node):
                 f'invalid item dimensions: {measured_dimensions_mm}')
             return
         dimensions_mm = (
-            measured_dimensions_mm[0],
-            measured_dimensions_mm[1],
+            round_down_to_increment(measured_dimensions_mm[0], 5),
+            round_down_to_increment(measured_dimensions_mm[1], 5),
             round_up_to_increment(
                 measured_dimensions_mm[2],
                 self.packing_height_resolution_mm),
         )
         self.state = 'PLANNING'
+        self.rejected_loading_poses = set()
+        self.retrying_carried_item = False
         self.localization_started = None
         self.fault = ''
         self.last_result = ''
@@ -274,8 +312,10 @@ class RandomStableLoadingNode(Node):
         )
         self.get_logger().info(
             'planning stable target for item %d, dimensions=(%d, %d, %d) mm; '
+            'measured XY=(%.1f, %.1f) mm rounded downward to 5 mm and '
             'measured Z %.1f mm rounded upward to %.1f mm on the ROS side' % (
                 item_id, *(int(round(value)) for value in dimensions_mm),
+                measured_dimensions_mm[0], measured_dimensions_mm[1],
                 measured_dimensions_mm[2], dimensions_mm[2]))
         self.publish_status()
 
@@ -398,6 +438,11 @@ class RandomStableLoadingNode(Node):
             return
         pipeline_state = self.pipeline_status.get('state')
         if pipeline_state == 'FAULT':
+            reason = self.pipeline_status.get('fault', 'PickAndPlace failed')
+            if (self.NODE_NAME == 'random_stable_loading' and
+                    reason.startswith('KINEMATIC_REJECTED:')):
+                self._reselect_loading_pose(reason)
+                return
             self._set_fault(
                 self.pipeline_status.get('fault', 'PickAndPlace failed'))
         elif pipeline_state == 'SUCCEEDED':
@@ -414,7 +459,8 @@ class RandomStableLoadingNode(Node):
             if self.abort_requested:
                 self._finish_abort()
                 return
-            self._discard_object_info_at_contact()
+            if not self.retrying_carried_item:
+                self._discard_object_info_at_contact()
             self._set_fault(str(exc))
             return
         if self.abort_requested:
@@ -423,10 +469,35 @@ class RandomStableLoadingNode(Node):
         self._accept_planning_result(pending)
 
     def _plan_item(self, *, item_id, dimensions_mm):
+        options = {}
+        if self.NODE_NAME == 'random_stable_loading':
+            options['excluded_placements'] = getattr(self, 'rejected_loading_poses', ())
         return self.loader.plan(
             item_id=item_id,
             dimensions_mm=dimensions_mm,
+            **options,
         )
+
+    def _reselect_loading_pose(self, reason):
+        pending = self.loader.pending
+        if pending is None:
+            self._set_fault('kinematic rejection has no matching pending item')
+            return
+        self.rejected_loading_poses.add(
+            self.loader.placement_key(pending.placement))
+        self.loader.discard_pending(pending.sequence_id)
+        self.retrying_carried_item = True
+        self.target_acknowledged = False
+        self.cycle_auto_start = True
+        self.state = 'PLANNING'
+        self.get_logger().warning(
+            f'excluding loading target {pending.sequence_id}: {reason}; '
+            'sampling another pose for the carried item')
+        self._push_visualization('Kinematically rejected target removed')
+        self.planning_future = self.planning_worker.submit(
+            self._plan_item, item_id=pending.item_id,
+            dimensions_mm=tuple(pending.raw_dim.raw()))
+        self.publish_status()
 
     def _accept_planning_result(self, pending):
         self.state = 'WAITING_TARGET_ACK'
@@ -437,14 +508,19 @@ class RandomStableLoadingNode(Node):
         self.publish_status()
 
     def _log_pending(self, pending):
+        physical_flb = pending.placement.physical_flb
         self.get_logger().info(
-            'selected target %d: stable=%d, vertical=%d, sampled=%d, '
-            'corner=(%d, %d, %d) mm, rotate_90=%s, '
+            'selected target %d: stable=%d, vertical=%d, min_z_pool=%d, '
+            'physical_corner=(%d, %d, %d) mm, '
+            'virtual_corner=(%d, %d, %d) mm, rotate_90=%s, '
             'virtual_dim=(%d, %d, %d) mm' % (
                 pending.sequence_id,
                 pending.stable_candidate_count,
                 pending.vertical_candidate_count,
-                pending.sampled_candidate_count,
+                pending.minimum_z_candidate_count,
+                physical_flb.x,
+                physical_flb.y,
+                physical_flb.z,
                 pending.placement.flb.x,
                 pending.placement.flb.y,
                 pending.placement.flb.z,
@@ -619,9 +695,10 @@ class RandomStableLoadingNode(Node):
             self._set_fault(
                 f'robot succeeded but packing-state commit failed: {exc}')
             return
+        physical_flb = getattr(placed, 'True_FLB', placed.FLB)
         self.last_result = (
             f'committed item {pending.item_id} at '
-            f'({placed.FLB.x}, {placed.FLB.y}, {placed.FLB.z}) mm')
+            f'({physical_flb.x}, {physical_flb.y}, {physical_flb.z}) mm')
         continue_loading = (
             self.continuous_loading_enabled and self.continuous_run_active)
         self.state = 'IDLE'
@@ -696,7 +773,9 @@ class RandomStableLoadingNode(Node):
         return self._start_pick_place(response)
 
     def _start_pick_place(self, response=None):
-        if not self.pick_place_client.service_is_ready():
+        client = (self.retry_place_client if getattr(self, 'retrying_carried_item', False)
+                  else self.pick_place_client)
+        if not client.service_is_ready():
             if response is not None:
                 response.message = 'PickAndPlace service is unavailable'
             return response
@@ -710,7 +789,7 @@ class RandomStableLoadingNode(Node):
             self.pipeline_status.get('operation_id', 0)) + 1
         self.state = 'STARTING'
         self.start_request_pending = True
-        future = self.pick_place_client.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(self._start_completed)
         if response is not None:
             response.success = True
@@ -827,6 +906,8 @@ class RandomStableLoadingNode(Node):
                 None if pending is None else pending.sequence_id),
             'pending_item_id': None if pending is None else pending.item_id,
             'target_acknowledged': self.target_acknowledged,
+            'kinematically_rejected_candidates': len(self.rejected_loading_poses),
+            'retrying_carried_item': self.retrying_carried_item,
         }
         self._extend_status(payload, pending)
         message = String()
@@ -836,12 +917,29 @@ class RandomStableLoadingNode(Node):
     def _extend_status(self, payload, pending):
         payload.update({
             'selection_pipeline': (
-                'stable_then_vertical_then_random_subset_then_min_xyz_sum'),
-            'candidate_sample_fraction': self.loader.candidate_sample_fraction,
+                'stable_then_vertical_then_random_at_minimum_z'
+                if self.loader.vertical_loading_filter_enabled else
+                'stable_then_random_at_minimum_z'),
+            'vertical_loading_filter_enabled': (
+                self.loader.vertical_loading_filter_enabled),
+            'candidate_sampling_enabled': False,
             'com_bound_ratio': self.loader.com_bound_ratio,
+            'height_tolerance_mm': self.loader.height_tolerance,
+            'container_size_mm': list(self.loader.container_size),
+            'clearance_mm': self.loader.clearance_mm,
+            'clearance_mode': self.loader.clearance_mode,
+            'transfer_corner_height_m': self.transfer_corner_height,
+            'random_loading_config_path': (
+                self.random_loading_config_path or None),
         })
         if pending is not None:
+            physical_flb = pending.placement.physical_flb
             payload['target_corner_mm'] = [
+                physical_flb.x,
+                physical_flb.y,
+                physical_flb.z,
+            ]
+            payload['virtual_corner_mm'] = [
                 pending.placement.flb.x,
                 pending.placement.flb.y,
                 pending.placement.flb.z,
@@ -854,8 +952,11 @@ class RandomStableLoadingNode(Node):
                 pending.stable_candidate_count)
             payload['vertical_candidate_count'] = (
                 pending.vertical_candidate_count)
+            payload['minimum_z_candidate_count'] = (
+                pending.minimum_z_candidate_count)
+            # Keep older panels functional until they are rebuilt.
             payload['sampled_candidate_count'] = (
-                pending.sampled_candidate_count)
+                pending.minimum_z_candidate_count)
 
     def destroy_node(self):
         self.planning_worker.shutdown(wait=False, cancel_futures=True)

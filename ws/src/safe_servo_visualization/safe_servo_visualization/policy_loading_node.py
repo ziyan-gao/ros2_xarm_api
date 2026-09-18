@@ -250,8 +250,18 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             'policy_device', str(config.get('device', 'cpu')))
         self.declare_parameter(
             'k_placement', int(config.get('k_placement', 80)))
-        self.declare_parameter(
-            'height_tolerance', float(config.get('height_tolerance', 0.0)))
+        # The random-loading base class owns this shared parameter declaration.
+        # Mirror the policy YAML into that existing DOUBLE parameter instead of
+        # declaring it again in this derived node.
+        configured_height_tolerance = float(
+            config.get('height_tolerance', 0.0))
+        result = self.set_parameters([
+            rclpy.parameter.Parameter(
+                'height_tolerance', value=configured_height_tolerance),
+        ])[0]
+        if not result.successful:
+            raise ValueError(
+                'could not apply policy height_tolerance: ' + result.reason)
         self.declare_parameter(
             'remove_inscribed_ems',
             bool(config.get('remove_inscribed_ems', False)))
@@ -742,8 +752,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
 
     def _accept_planning_result(self, pending):
         if not isinstance(pending, PendingPhysicalOperation):
-            self.placed_ids_before_operation = set(
-                self.scene_status.get('placed_item_ids') or [])
+            self.placed_ids_before_operation = self._scene_placed_item_ids()
             result = super()._accept_planning_result(pending)
             if self.simulation_enabled:
                 self.target_acknowledged = True
@@ -840,8 +849,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             return
         self.active_operation = operation
         self.target_acknowledged = False
-        self.placed_ids_before_operation = set(
-            self.scene_status.get('placed_item_ids') or [])
+        self.placed_ids_before_operation = self._scene_placed_item_ids()
         self.last_result = (
             f'plan {operation.plan_id}, operation '
             f'{operation.step_index + 1}/{operation.step_count}: '
@@ -906,6 +914,11 @@ class PolicyLoadingNode(RandomStableLoadingNode):
     @staticmethod
     def _item_key(item):
         return tuple(map(int, item.to_key()))
+
+    def _scene_placed_item_ids(self):
+        """Return collision-backed and visual-only placed-item IDs."""
+        return set(self.scene_status.get('placed_item_ids') or []).union(
+            self.scene_status.get('placed_item_visual_ids') or [])
 
     def _start_holding_retrieve(self, operation):
         key = self._item_key(operation.source_item)
@@ -1154,7 +1167,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
                     self.waiting_removed_obstacle = ''
                     self._publish_pallet_retrieval_target(operation)
                 return
-            current = set(self.scene_status.get('placed_item_ids') or [])
+            current = self._scene_placed_item_ids()
             if self.waiting_removed_obstacle not in current:
                 self.placed_obstacle_ids.pop(
                     self._item_key(operation.source_item), None)
@@ -1323,7 +1336,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
     def _update_pending_obstacle_mapping(self):
         if self.pending_obstacle_key is None:
             return
-        current = set(self.scene_status.get('placed_item_ids') or [])
+        current = self._scene_placed_item_ids()
         new_ids = current - self.placed_ids_before_operation
         if not new_ids:
             return

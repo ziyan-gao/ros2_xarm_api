@@ -1,13 +1,13 @@
 import math
-from types import SimpleNamespace
 import time
+from types import SimpleNamespace
 
-import pytest
 from geometry_msgs.msg import Pose
-from std_msgs.msg import Float64MultiArray
+import pytest
 
 from safe_servo_visualization.motion_coordinator_node import MotionCoordinator
 from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
+from std_msgs.msg import Float64MultiArray
 
 
 def _coordinator(*, rotate_item_90=False):
@@ -216,6 +216,42 @@ def test_retrieval_target_accepts_rearrangement_id_and_object_yaw():
         0.72)
     assert coordinator.staging_retrieve_target['size'] == pytest.approx(
         (0.22, 0.17, 0.12))
+
+
+def test_staging_store_transfer_uses_normal_transfer_status_contract():
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.staging_store_transfer_target = None
+    coordinator.state = MotionCoordinator.IDLE
+    coordinator.operation_id = 7
+    coordinator.target = None
+    coordinator.transfer_context = ''
+    coordinator.transfer_tcp_pose = None
+    coordinator.pre_place_tcp_pose = None
+    coordinator.nominal_transfer_corner_z = 0.47
+    coordinator.fault = ''
+    coordinator.cancel_requested = False
+    coordinator.pause_requested = False
+    coordinator._require_fresh_joint_state = lambda *_args: True
+    coordinator._set_state = lambda state, fault='': setattr(
+        coordinator, 'state', state)
+    message = Float64MultiArray()
+    message.data = [
+        4.0, -0.125, 0.430, 0.480,
+        1.0, 0.0, 0.0, 0.0,
+        0.110,
+    ]
+
+    coordinator.staging_store_transfer_target_callback(message)
+    response = SimpleNamespace(success=False, message='')
+    coordinator.prepare_staging_store_transfer_callback(None, response)
+
+    assert response.success
+    assert coordinator.state == MotionCoordinator.PREPARED
+    assert coordinator.target == 'transfer'
+    assert coordinator.transfer_context == 'staging_store'
+    assert coordinator.transfer_tcp_pose.position.x == pytest.approx(-0.125)
+    assert coordinator.transfer_tcp_pose.position.z == pytest.approx(0.480)
+    assert coordinator.pre_place_tcp_pose.position.z == pytest.approx(0.110)
 
 
 def test_pallet_retrieval_pregrasp_uses_straight_cartesian_plan():

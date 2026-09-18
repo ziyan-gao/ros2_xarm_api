@@ -32,6 +32,8 @@ class PickPlacePipeline(Node):
         self.reset_place = self.create_client(Trigger, '/place_pipeline/reset')
         self.create_service(Trigger, '/pick_place_pipeline/start', self.start)
         self.create_service(
+            Trigger, '/pick_place_pipeline/retry_place', self.retry_place)
+        self.create_service(
             Trigger, '/pick_place_pipeline/start_pick_only',
             self.start_pick_only)
         self.create_service(Trigger, '/pick_place_pipeline/abort', self.abort)
@@ -74,6 +76,25 @@ class PickPlacePipeline(Node):
         response.message = (
             'Pick-only cycle started' if self.pick_only else
             'PickAndPlace started')
+        return response
+
+    def retry_place(self, _request, response):
+        if (self.state != 'FAULT' or
+                not self.fault.startswith('KINEMATIC_REJECTED:')):
+            response.message = 'retry requires a pre-motion kinematic rejection'
+            return response
+        if not self.start_place.service_is_ready():
+            response.message = 'place pipeline is unavailable'
+            return response
+        self.operation_id += 1
+        self.state, self.fault = 'PLACING', ''
+        self.started = time.monotonic()
+        self.expected_place_id = int(self.place_status.get('operation_id', 0)) + 1
+        future = self.start_place.call_async(Trigger.Request())
+        future.add_done_callback(lambda done: self._start_done(done, 'place'))
+        response.success = True
+        response.message = 'retrying placement of the carried item'
+        self.publish_status()
         return response
 
     def _start_done(self, future, label):

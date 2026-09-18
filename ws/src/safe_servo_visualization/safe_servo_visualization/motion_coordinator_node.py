@@ -36,6 +36,8 @@ class MotionCoordinator(Node):
             'pregrasp_snapshot_file',
             '/workspace/config/verified_pregrasp_snapshot.json')
         self.declare_parameter('refined_boxes_topic', '/pointcloud_detection/boxes')
+        self.declare_parameter(
+            'stable_boxes_topic', '/object_info_estimation/stable_boxes')
         self.declare_parameter('target_box_id', -1)
         self.declare_parameter('pregrasp_clearance_m', 0.03)
         self.declare_parameter('max_detection_age_sec', 0.5)
@@ -73,6 +75,7 @@ class MotionCoordinator(Node):
         self.pause_requested = False
         self.operation_id = 0
         self.refined_boxes = {}
+        self.stable_refined_boxes = {}
         self.pre_place_pose = None
         self.pre_place_pose_time = None
         self.attached_item_geometry = None
@@ -86,6 +89,8 @@ class MotionCoordinator(Node):
         self.place_target_xyz = None
         self.planned_pregrasp = None
         self.staging_retrieve_target = None
+        self.staging_store_transfer_target = None
+        self.transfer_context = ''
         self.last_joint_state_time = None
         self.latest_joint_positions = {}
         self._restore_pregrasp_snapshot()
@@ -111,6 +116,9 @@ class MotionCoordinator(Node):
             MarkerArray, str(p('refined_boxes_topic')),
             self.refined_boxes_callback, 10)
         self.create_subscription(
+            MarkerArray, str(p('stable_boxes_topic')),
+            self.stable_boxes_callback, 10)
+        self.create_subscription(
             PoseStamped, '/pallet_localization/pre_place_pose',
             self.pre_place_pose_callback, 10)
         self.create_subscription(
@@ -127,6 +135,9 @@ class MotionCoordinator(Node):
         self.create_subscription(
             Float64MultiArray, '/staging_slots/retrieve_target',
             self.staging_retrieve_target_callback, 10)
+        self.create_subscription(
+            Float64MultiArray, '/staging_slots/store_transfer_target',
+            self.staging_store_transfer_target_callback, 10)
 
         self.create_service(
             Trigger, '/motion_coordinator/plan_observation',
@@ -139,6 +150,9 @@ class MotionCoordinator(Node):
         self.create_service(
             Trigger, '/motion_coordinator/prepare_transfer',
             self.prepare_transfer_callback)
+        self.create_service(
+            Trigger, '/motion_coordinator/prepare_staging_store_transfer',
+            self.prepare_staging_store_transfer_callback)
         self.create_service(
             Trigger, '/motion_coordinator/plan_transfer',
             self.plan_transfer_callback)
@@ -291,6 +305,7 @@ class MotionCoordinator(Node):
                     self.transfer_tcp_pose.orientation.w]),
             'nominal_transfer_corner_z_m': self.nominal_transfer_corner_z,
             'transfer_corner_height_pallet_m': self.transfer_corner_height,
+            'transfer_context': self.transfer_context,
             'rotate_item_90': self.rotate_item_90,
             'keep_eef_perpendicular_to_pallet': self.keep_eef_perpendicular,
             'placement_corner_correction_xyz_m':
@@ -309,6 +324,15 @@ class MotionCoordinator(Node):
                     marker.header.frame_id == 'link_base'):
                 boxes[int(marker.id)] = marker
         self.refined_boxes = boxes
+
+    def stable_boxes_callback(self, message):
+        boxes = {}
+        for marker in message.markers:
+            if (marker.ns == 'stable_depth_refined_boxes' and
+                    marker.action == Marker.ADD and
+                    marker.header.frame_id == 'link_base'):
+                boxes[int(marker.id)] = marker
+        self.stable_refined_boxes = boxes
 
     def pre_place_pose_callback(self, message):
         if message.header.frame_id != 'link_base':
@@ -439,6 +463,8 @@ class MotionCoordinator(Node):
         return self._plan_place_pose(response, transfer=False)
 
     def plan_transfer_callback(self, _request, response):
+        if self.transfer_context == 'staging_store':
+            return self._plan_cached_staging_transfer(response)
         return self._plan_place_pose(response, transfer=True)
 
     def prepare_transfer_callback(self, _request, response):
@@ -470,6 +496,7 @@ class MotionCoordinator(Node):
             return response
         self.operation_id += 1
         self.target = 'transfer'
+        self.transfer_context = 'pallet'
         self.fault = ''
         self.cancel_requested = self.pause_requested = False
         self._set_state(self.PREPARED)
@@ -478,6 +505,113 @@ class MotionCoordinator(Node):
             'Prepared direct-joint transfer target at '
             f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
             f'{pose.position.z:.3f}] m; operation_id={self.operation_id}')
+        return response
+
+    def staging_store_transfer_target_callback(self, message):
+        """Cache a raised staging transfer pose and its vertical pre-place Z."""
+        if len(message.data) < 9:
+            self.get_logger().warning(
+                'ignored incomplete staging store transfer target')
+            return
+        values = tuple(map(float, message.data[:9]))
+        if not all(math.isfinite(value) for value in values):
+            self.get_logger().warning(
+                'ignored non-finite staging store transfer target')
+            return
+        slot = int(round(values[0]))
+        quaternion = values[4:8]
+        quaternion_norm = math.sqrt(sum(value * value for value in quaternion))
+        if slot < 0 or slot >= 6 or quaternion_norm < 1e-6:
+            self.get_logger().warning(
+                'ignored invalid staging store slot or TCP quaternion')
+            return
+        if values[8] >= values[3] - 0.005:
+            self.get_logger().warning(
+                'ignored staging pre-place target without vertical clearance')
+            return
+        self.staging_store_transfer_target = {
+            'slot': slot,
+            'transfer_xyz': values[1:4],
+            'quaternion': tuple(value / quaternion_norm
+                                for value in quaternion),
+            'pre_place_z': values[8],
+            'received_at': time.monotonic(),
+        }
+
+    def prepare_staging_store_transfer_callback(self, _request, response):
+        """Expose a staging waypoint through the normal transfer interface."""
+        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
+            return response
+        if not self._require_fresh_joint_state(
+                response, 'prepare staging store transfer'):
+            return response
+        target = self.staging_store_transfer_target
+        if target is None or time.monotonic() - target['received_at'] > 2.0:
+            response.message = 'fresh staging store transfer target is unavailable'
+            return response
+        transfer = Pose()
+        (transfer.position.x, transfer.position.y, transfer.position.z) = (
+            target['transfer_xyz'])
+        (transfer.orientation.x, transfer.orientation.y,
+         transfer.orientation.z, transfer.orientation.w) = target['quaternion']
+        pre_place = Pose()
+        pre_place.position.x = transfer.position.x
+        pre_place.position.y = transfer.position.y
+        pre_place.position.z = float(target['pre_place_z'])
+        pre_place.orientation = transfer.orientation
+        self.transfer_tcp_pose = transfer
+        self.pre_place_tcp_pose = pre_place
+        self.nominal_transfer_corner_z = None
+        self.operation_id += 1
+        self.target = 'transfer'
+        self.transfer_context = 'staging_store'
+        self.fault = ''
+        self.cancel_requested = self.pause_requested = False
+        self._set_state(self.PREPARED)
+        response.success = True
+        response.message = (
+            f'Prepared staging slot {target["slot"]} transfer at '
+            f'[{transfer.position.x:.3f}, {transfer.position.y:.3f}, '
+            f'{transfer.position.z:.3f}] m; vertical pre-place Z '
+            f'{pre_place.position.z:.3f} m; operation_id={self.operation_id}')
+        return response
+
+    def _plan_cached_staging_transfer(self, response):
+        """Plan a MoveIt fallback for a prepared staging-store target."""
+        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
+            return response
+        if not self._require_fresh_joint_state(
+                response, 'plan staging store transfer'):
+            return response
+        if self.transfer_tcp_pose is None or self.pre_place_tcp_pose is None:
+            response.message = 'prepared staging transfer poses are unavailable'
+            return response
+        planner = (
+            self.constrained_pose_plan_client
+            if self.keep_eef_perpendicular else self.pose_plan_client)
+        if not planner.service_is_ready():
+            response.message = 'xArm staging transfer planning service is unavailable'
+            return response
+        pose = self.transfer_tcp_pose
+        self.operation_id += 1
+        request_id = self.operation_id
+        self.target = 'transfer'
+        self.planned_pregrasp = None
+        self._clear_pregrasp_snapshot()
+        self.cancel_requested = self.pause_requested = False
+        self._set_state(self.PLANNING)
+        request = PlanPose.Request()
+        request.target = pose
+        future = planner.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._plan_completed(request_id, completed))
+        response.success = True
+        response.message = (
+            'Planning collision-aware staging transfer fallback at '
+            f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
+            f'{pose.position.z:.3f}] m; operation_id={request_id}')
         return response
 
     def _calculate_place_poses(self):
@@ -616,15 +750,29 @@ class MotionCoordinator(Node):
         )
 
     def _select_refined_box(self):
+        stable_boxes = getattr(self, 'stable_refined_boxes', {})
         if self.target_box_id >= 0:
+            stable = stable_boxes.get(self.target_box_id)
+            if stable is not None and self._marker_is_fresh(stable):
+                return stable
             marker = self.refined_boxes.get(self.target_box_id)
             if marker is None:
                 raise ValueError(f'refined box id {self.target_box_id} is unavailable')
             return marker
+        fresh_stable = [
+            marker for marker in stable_boxes.values()
+            if self._marker_is_fresh(marker)]
+        if len(fresh_stable) == 1:
+            return fresh_stable[0]
         if len(self.refined_boxes) != 1:
             raise ValueError(
                 'exactly one refined box is required; set target_box_id to select one')
         return next(iter(self.refined_boxes.values()))
+
+    def _marker_is_fresh(self, marker):
+        age = (self.get_clock().now() - rclpy.time.Time.from_msg(
+            marker.header.stamp)).nanoseconds * 1e-9
+        return -0.05 <= age <= self.max_detection_age
 
     def _make_pregrasp_pose(self, box):
         stamp = box.header.stamp
@@ -1077,6 +1225,7 @@ class MotionCoordinator(Node):
             return response
         self.operation_id += 1
         self.target = None
+        self.transfer_context = ''
         self.planned_pregrasp = None
         self._clear_pregrasp_snapshot()
         self.cancel_requested = False

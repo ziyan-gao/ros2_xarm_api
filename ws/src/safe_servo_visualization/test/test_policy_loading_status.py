@@ -213,3 +213,31 @@ def test_simulation_start_samples_without_object_estimation_service():
     assert result.success
     assert node.continuous_run_active
     assert 'cardboard item 4' in result.message
+
+
+def test_scene_placed_item_ids_include_visual_only_markers():
+    node = object.__new__(PolicyLoadingNode)
+    node.scene_status = {
+        'placed_item_ids': ['placed_item_2'],
+        'placed_item_visual_ids': ['placed_item_2', 'placed_item_5'],
+    }
+
+    assert node._scene_placed_item_ids() == {
+        'placed_item_2', 'placed_item_5'}
+
+
+def test_pending_policy_item_maps_to_new_visual_only_marker():
+    node = object.__new__(PolicyLoadingNode)
+    item_key = (1, 20, 30, 40, 100, 120, 80)
+    node.pending_obstacle_key = item_key
+    node.placed_ids_before_operation = {'placed_item_2'}
+    node.scene_status = {
+        'placed_item_ids': [],
+        'placed_item_visual_ids': ['placed_item_2', 'placed_item_7'],
+    }
+    node.placed_obstacle_ids = {}
+
+    node._update_pending_obstacle_mapping()
+
+    assert node.placed_obstacle_ids[item_key] == 'placed_item_7'
+    assert node.pending_obstacle_key is None
