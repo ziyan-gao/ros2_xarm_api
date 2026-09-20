@@ -13,8 +13,15 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from .continuous_return import ContinuousReturn
+from .continuous_pick import ContinuousPick
 from .cartesian_failure_diagnostics import CartesianFailureDiagnostics
 from .smooth_transport import smooth_and_sample
+from .transport_alternatives import TransportAlternatives
+from .sdk_transport import SdkTransport
+from .transport_path import pickup_needs_observation, grid_pick_waypoints
+from .transport_alternatives import waypoint_candidates
+from .transport_reuse import TransportReuse
+from .staged_transport_timing import StagedTransportTiming
 
 
 def cartesian_timing_issue(trajectory, required_joints):
@@ -51,91 +58,13 @@ def cartesian_timing_issue(trajectory, required_joints):
     return problem
 
 
-def quaternion(q):
-    q = np.asarray(q, dtype=float)
-    if q.shape != (4,) or not np.isfinite(q).all() or np.linalg.norm(q) < 1e-8:
-        raise ValueError('invalid transport orientation')
-    return q / np.linalg.norm(q)
+from .transport_path import (
+    quaternion, rotate, slerp, item_bottom_offset, transport_waypoints, vertical_retreat_waypoints,
+    pick_waypoints,
+)
 
 
-def rotate(q, v):
-    q = quaternion(q)
-    v = np.asarray(v, dtype=float)
-    return v + 2 * np.cross(q[:3], np.cross(q[:3], v) + q[3] * v)
-
-
-def slerp(a, b, u):
-    a, b = quaternion(a), quaternion(b)
-    dot = float(a @ b)
-    if dot < 0:
-        b, dot = -b, -dot
-    if dot > 0.9995:
-        return quaternion(a + u * (b - a))
-    angle = math.acos(np.clip(dot, -1, 1))
-    return (math.sin((1-u)*angle)*a + math.sin(u*angle)*b) / math.sin(angle)
-
-
-def item_bottom_offset(q, scene):
-    if scene is None:
-        return 0.0  # Empty-tool return: clearance is specified for the TCP.
-    size = np.asarray(scene['attached_item_size_m'], dtype=float)
-    center = np.asarray(scene['attached_item_center_in_tcp_m'], dtype=float)
-    iq = scene['attached_item_orientation_in_tcp_xyzw']
-    if size.shape != (3,) or center.shape != (3,) or not np.isfinite([size, center]).all() or np.any(size <= 0):
-        raise ValueError('invalid carried-item geometry')
-    return min(rotate(q, center + rotate(iq, size * np.array([x,y,z]) / 2))[2]
-               for x in (-1,1) for y in (-1,1) for z in (-1,1))
-
-
-def transport_waypoints(start, start_q, end, end_q, clearance_z, scene,
-                        radius=0.04, step=0.005, allow_tilt_change=False):
-    """C2 rounded corners above the item-bottom clearance, vertical end legs.
-
-    Yaw changes only on the elevated straight segment. A 2 mm extra margin
-    covers numerical sampling of the carried-item orientation envelope.
-    """
-    start, end = np.asarray(start, float), np.asarray(end, float)
-    start_q, end_q = quaternion(start_q), quaternion(end_q)
-    if not np.isfinite([*start, *end, clearance_z, radius, step]).all() or radius <= 0 or step <= 0:
-        raise ValueError('invalid continuous transport geometry')
-    if not allow_tilt_change and float(rotate(start_q, [0,0,1]) @ rotate(end_q, [0,0,1])) < math.cos(math.radians(2)):
-        raise ValueError('pickup and placement tool tilt differ by more than 2 degrees')
-    delta = end[:2] - start[:2]
-    distance = float(np.linalg.norm(delta))
-    if distance < 0.01:
-        raise ValueError('insufficient lateral distance for a rounded transfer')
-    direction = np.array([* (delta / distance), 0.0])
-    r = min(radius, distance / 4)
-    bottom = min(item_bottom_offset(slerp(start_q, end_q, u), scene)
-                 for u in np.linspace(0, 1, 101))
-    safe_z = max(float(clearance_z) - bottom + 0.002, start[2], end[2])
-    high_z = safe_z + r
-    a = np.array([*start[:2], safe_z])
-    b = a + direction*r + np.array([0,0,r])
-    d = np.array([*end[:2], safe_z])
-    c = d - direction*r + np.array([0,0,r])
-    samples = []
-    def line(p, q, qa, qb):
-        angle = 2*math.acos(min(1, abs(float(quaternion(qa) @ quaternion(qb)))))
-        count = max(1, math.ceil(np.linalg.norm(q-p)/step), math.ceil(angle/0.025))
-        for u in np.linspace(0, 1, count+1)[1:]:
-            samples.append((p+(q-p)*u, slerp(qa, qb, u**3*(10-15*u+6*u*u))))
-    def bend(p, q, incoming, outgoing, orientation):
-        controls = [p, p+incoming*r/4, p+incoming*r/2,
-                    q-outgoing*r/2, q-outgoing*r/4, q]
-        for u in np.linspace(0, 1, max(4, math.ceil(2*r/step))+1)[1:]:
-            position = sum(math.comb(5,i)*(1-u)**(5-i)*u**i*v
-                           for i,v in enumerate(controls))
-            samples.append((position, orientation))
-    line(start, a, start_q, start_q)
-    bend(a, b, np.array([0,0,1]), direction, start_q)
-    line(b, c, start_q, end_q)
-    bend(c, d, direction, np.array([0,0,-1]), end_q)
-    line(d, end, end_q, end_q)
-    return samples, safe_z, high_z
-
-
-class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
+class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, TransportAlternatives, ContinuousPick, CartesianFailureDiagnostics, ContinuousReturn):
     TRANSPORT_PLANNING = 'TRANSPORT_PLANNING'
     TRANSPORT_VALIDATING = 'TRANSPORT_VALIDATING'
     TRANSPORT_EXECUTING = 'TRANSPORT_EXECUTING'
@@ -146,12 +75,22 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                         CartesianFailureDiagnostics.TRANSPORT_DIAGNOSING}
 
     def _init_continuous_transport(self):
+        self._init_transport_reuse()
         self._init_continuous_return()
+        self._init_transport_alternatives()
+        self._init_sdk_transport()
+        self.transport_is_pick = False
+        self.pick_path_restoring = False
+        self.pick_path_completed = False
+        self.pick_path_target_id = None
         self.transport_fk = self.create_client(GetPositionFK, '/compute_fk')
         self.transport_cartesian = self.create_client(GetCartesianPath, '/compute_cartesian_path')
         self.create_service(Trigger, '/pickup_supervisor/start_continuous_transport',
                             self.start_continuous_transport)
+        self.create_service(Trigger, '/pickup_supervisor/start_continuous_transport_chained',
+                            self.start_continuous_transport_chained)
         self.create_service(Trigger, '/pickup_supervisor/grasp_and_hold', self.grasp_and_hold_callback)
+        self.create_service(Trigger, '/pickup_supervisor/start_pick_waypoints', self.start_pick_waypoints)
         self.declare_parameter('continuous_transport_blend_radius_m', 0.04)
         self.transport_radius = float(self.get_parameter('continuous_transport_blend_radius_m').value)
         self.declare_parameter('continuous_transport_max_joint_jerk_rad_s3', 10.0)
@@ -188,6 +127,12 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             self.get_logger().error(f'continuous transport cannot read robot limits: {exc}')
 
     def start_continuous_transport(self, _request, response):
+        return self._start_continuous_transport(response, return_to_observation=True)
+
+    def start_continuous_transport_chained(self, _request, response):
+        return self._start_continuous_transport(response, return_to_observation=False)
+
+    def _start_continuous_transport(self, response, return_to_observation):
         if self.state in self.ACTIVE or self.manual_gripper_pending:
             response.message = 'supervisor is busy'
             return response
@@ -198,8 +143,8 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             return response
         if (not self.pallet_locked or not self.planning_scene_status.get('attached_item_id') or
                 self.motion_status.get('state') != 'PREPARED' or
-                self.motion_status.get('transfer_context') != 'pallet'):
-            response.message = 'continuous transport requires a prepared pallet target and attached item'
+                self.motion_status.get('transfer_context') not in ('pallet', 'staging_store')):
+            response.message = 'continuous transport requires a prepared destination and attached item'
             return response
         now = time.monotonic()
         if (self.last_joint_state_time is None or now-self.last_joint_state_time > self.status_timeout or
@@ -218,12 +163,31 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             response.message = 'joint trajectory controller unavailable'
             return response
         self.operation_id += 1
+        self.transport_is_pick = False
         self.transport_is_return = False
+        self.transport_route_attempt = 0
+        self.staged_timing_used = False
+        self.staged_timing_active = False
+        self.transport_slot_yaw_flipped = False
+        self.verified_slot_transfer_target = None
+        self.transport_slot_yaw_deadline = now + 5.0
+        self.alternative_observation = None
+        self.alternative_candidate_index = 0
+        self.alternative_diagnostic_pending = False
+        self.transport_alternative_deadline = None
+        self.raised_pre_place_offset_m = 0.
+        self.raised_pre_place_ready = None
+        self.raised_retreat_pose = None
+        self.pallet_release_rpy_rad = None
+        self.raised_place_hold_on_failure = False
+        self.transport_route_generation = getattr(self, 'transport_route_generation', 0) + 1
+        self.return_to_observation = return_to_observation
         self.continuous_return_completed = False
         self.continuous_return_target_id = (
-            self.motion_status.get('operation_id') if self.continuous_return_enabled else None)
+            self.motion_status.get('operation_id') if (
+                self.continuous_return_enabled or not return_to_observation) else None)
         self.operation_kind = 'loading'
-        self.staging_place_active = False
+        self.staging_place_active = self.motion_status.get('transfer_context') == 'staging_store'
         self.contact_detected = False
         self.fault = ''
         self.post_retreat_fault = ''
@@ -232,10 +196,13 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
         self.loading_contact_fallback = False
         self.direct_transfer_succeeded = False
         self.direct_transfer_motion_started = False
+        self.transport_sdk_candidate = False
         self.transfer_goal_handle = None
         self.transport_started = now
         self.transport_seed = tuple(self.latest_joint_positions)
         self.transport_target = dict(self.motion_status)
+        self.transport_via_observation = self._uses_buffer_route(
+            self.transport_target, getattr(self, 'active_pickup_snapshot', None))
         self.transport_scene = dict(self.planning_scene_status)
         self.transport_feedback_time = 0.0
         self.transport_descent_time = None
@@ -252,8 +219,10 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
 
     def _transport_guard(self, callback):
         operation = self.operation_id
+        generation = getattr(self, 'transport_route_generation', 0)
         return lambda future: callback(future) if (
-            operation == self.operation_id and self.state in self.TRANSPORT_STATES) else None
+            operation == self.operation_id and self.state in self.TRANSPORT_STATES and
+            generation == getattr(self, 'transport_route_generation', 0)) else None
 
     def _transport_fk_request(self, joints, callback):
         req = GetPositionFK.Request()
@@ -280,17 +249,60 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             start, q = self._transport_pose(future.result())
             end = self.transport_target['pre_place_tcp_xyz_m']
             end_q = self.transport_target['transfer_tcp_quaternion_xyzw']
+            if (not getattr(self, 'transport_is_return', False) and
+                    not getattr(self, 'transport_is_pick', False) and
+                    self.transport_target.get('transfer_context') == 'staging_store' and
+                    abs(float(quaternion(q) @ quaternion(end_q))) < math.cos(math.radians(.5)/2)):
+                self._fault('slot-store TCP orientation changed since capture; prepare a fresh store target')
+                return
             clearance = float(self.transport_target['transport_corner_clearance_z_m'])
-            samples, self.transport_safe_z, self.transport_high_z = transport_waypoints(
-                start, q, end, end_q, clearance, self.transport_scene, self.transport_radius,
-                allow_tilt_change=getattr(self, 'transport_is_return', False))
-            if self.transport_high_z > self.servo_bounds_mm[5]/1000:
+            if getattr(self, 'transport_is_pick', False):
+                end = np.array(end, dtype=float).copy()
+                end[2] += getattr(self, 'raised_pick_offset_m', 0.)
+                observation = getattr(self, 'pick_observation_xyz', None)
+                source = (self.transport_target.get('planned_pregrasp') or {}).get('pickup_source')
+                if not pickup_needs_observation(start, end, source):
+                    observation = None
+                self.pick_cross_area = observation is not None
+                self.get_logger().info('pickup route: ' + (
+                    'cross-area via observation-side rail' if observation is not None else
+                    'same-area overhead approach; no observation detour'))
+                samples, self.transport_safe_z, self.transport_high_z = pick_waypoints(
+                    start, q, end, end_q, clearance, self.transport_radius,
+                    observation_xyz=observation)
+                if observation is not None and getattr(self, 'pick_grid_index', -1) >= 0:
+                    candidate = waypoint_candidates()[self.pick_grid_index]
+                    samples, self.transport_safe_z, self.transport_high_z = grid_pick_waypoints(
+                        start, q, end, end_q, clearance, observation, candidate,
+                        rail_x=-.350 if getattr(self, 'pick_grid_rail', 0) else None,
+                        yaw_direction=getattr(self, 'pick_grid_direction', 1))
+                    self.get_logger().info(f'cross-area pickup grid candidate {self.pick_grid_index}: {candidate}')
+            elif getattr(self, 'transport_is_return', False) and not getattr(self, 'return_to_observation', True):
+                # Empty-tool handoff is vertical, not a rounded lateral route.
+                samples, end = vertical_retreat_waypoints(start, q, clearance)
+                end_q = q
+                self.transport_safe_z = self.transport_high_z = end[2]
+            else:
+                samples, self.transport_safe_z, self.transport_high_z = transport_waypoints(
+                    start, q, end, end_q, clearance, self.transport_scene, self.transport_radius,
+                    allow_tilt_change=getattr(self, 'transport_is_return', False))
+            if self.transport_high_z > self._transport_ceiling():
                 raise ValueError('blended transport exceeds the configured workspace ceiling')
             self.transport_start_xyz = start
             self.transport_start_q = q
+            self.return_collision_column_open = True
+            self.return_collision_previous_z = float(start[2])
             self.transport_end = np.array(end)
             self.transport_end_q = quaternion(end_q)
             self.transport_clearance = clearance
+            if self._try_reuse_transport(future):
+                return
+            if (getattr(self, 'transport_via_observation', False) and
+                    not getattr(self, 'transport_is_pick', False) and
+                    not getattr(self, 'transport_is_return', False)):
+                if not self._try_transport_alternative('buffer transfer route', observation_first=True):
+                    self._fault('buffer transfer could not start its required observation-side route')
+                return
             req = GetCartesianPath.Request()
             req.header.frame_id = 'link_base'
             req.group_name = self.planning_group
@@ -298,7 +310,7 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             req.start_state.is_diff = True
             req.start_state.joint_state.name = list(self.arm_joint_names)
             req.start_state.joint_state.position = list(self.transport_seed)
-            if getattr(self, 'transport_is_return', False):
+            if getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None:
                 # Solve backward from the taught observation joints, then
                 # reverse the trajectory. This anchors the exact final branch.
                 req.start_state.joint_state.position = list(self.return_goal_joints)
@@ -309,7 +321,10 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                 (pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w) = map(float, orientation)
                 req.waypoints.append(pose)
             req.max_step = 0.005
-            req.avoid_collisions = True
+            # A released item's contact at the retreat start must not reject
+            # the whole return. Final timed-path validation below still checks
+            # every state outside the initial empty-tool vertical column.
+            req.avoid_collisions = not getattr(self, 'transport_is_return', False)
             req.jump_threshold = 0.0
             scale = max(0.05, min(1.0, self.motion_speed_percent/100))
             req.max_velocity_scaling_factor = scale
@@ -332,11 +347,13 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             if not 0 <= result.fraction <= 1.:
                 raise ValueError('Cartesian fraction is outside [0, 1]')
             if result.fraction < 1-1e-6:
+                if self._try_pick_grid():
+                    return
                 self._diagnose_partial_path(result)
                 return
             trajectory = result.solution.joint_trajectory
             timing_issue = cartesian_timing_issue(trajectory, self.arm_joint_names)
-            if getattr(self, 'transport_is_return', False):
+            if getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None:
                 if len(trajectory.points) < 2:
                     raise ValueError('empty return trajectory')
                 total = (trajectory.points[-1].time_from_start.sec +
@@ -382,15 +399,17 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                         point.velocities = [0.0] * len(self.arm_joint_names)
                 previous, previous_t = values,t
             trajectory.joint_names = list(self.arm_joint_names)
-            if getattr(self, 'transport_is_return', False):
+            if getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None:
                 if max(abs(a-b) for a,b in zip(trajectory.points[-1].positions,self.return_goal_joints)) > 1e-4:
                     raise ValueError('return path does not reach the saved observation joint configuration')
             if timing_issue is not None:
                 reason = f'MoveIt Cartesian timing unavailable: {timing_issue}'
                 if self._fallback_staged_return(reason):
                     return
-                # Outbound: keep the item held and stop. Do not invent zero
-                # derivatives or blindly execute the raw geometric path.
+                if self._fallback_staged_transport_timing(reason):
+                    return
+                # No applicable retry: hold/fault. Never fabricate timing for
+                # an untimed geometric path or retry an execution failure.
                 raise ValueError(reason)
             scale = max(0.05, min(1.0, self.motion_speed_percent/100))
             timing = {}
@@ -413,12 +432,15 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                 f'{worst["derivative"]} joint={worst["joint"]} interval={worst["segment"]}; '
                 f'joint jerk cap={jerk_cap}; predicted peak jerk={timing["peak_jerk"]:.3f} rad/s^3')
             self.transport_check_index = 0
+            self._begin_reuse_recording(trajectory)
             self.state = self.TRANSPORT_VALIDATING
             self.get_logger().info(
                 f'validating {len(self.transport_checks)} timed transport states; '
                 f'item-bottom clearance Z={self.transport_clearance:.3f} m')
             self._transport_validate_next()
         except ValueError as exc:
+            if self._reuse_fallback(str(exc)):
+                return
             if str(exc).startswith('controller interpolation exceeds'):
                 self._fault(f'KINEMATIC_REJECTED: {exc}')
                 return
@@ -429,6 +451,8 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             # loading pose is unreachable. Stop instead of exhausting targets.
             self._fault(f'continuous transport trajectory validation failed: {exc}')
         except Exception as exc:
+            if self._reuse_fallback(str(exc)):
+                return
             self._fault(f'continuous transport planning failed: {exc}')
 
     def _transport_validate_next(self):
@@ -436,6 +460,35 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             self._transport_execute()
             return
         joints, _ = self.transport_checks[self.transport_check_index]
+        if getattr(self, 'transport_is_return', False):
+            self._transport_fk_request(joints, self._return_collision_classified)
+            return
+        self._transport_check_collision(joints)
+
+    def _return_collision_classified(self, future):
+        try:
+            xyz, q = self._transport_pose(future.result())
+            empty = (not (self.transport_scene or {}).get('attached_item_id') and
+                     not self.planning_scene_status.get('attached_item_id'))
+            vertical = (
+                getattr(self, 'return_collision_column_open', False) and empty and
+                np.linalg.norm(xyz[:2]-self.transport_start_xyz[:2]) <= .0001 and
+                xyz[2] >= self.return_collision_previous_z-.0001 and
+                xyz[2] <= self.transport_high_z+.0001 and
+                abs(float(q @ self.transport_start_q)) >= math.cos(.001/2))
+            if vertical:
+                self.return_collision_previous_z = max(self.return_collision_previous_z, float(xyz[2]))
+                self._transport_geometry_checked(future)
+            else:
+                # Once rotation/lateral/downward travel begins, never reopen
+                # the exemption, even if a later sample crosses the column.
+                self.return_collision_column_open = False
+                joints, _ = self.transport_checks[self.transport_check_index]
+                self._transport_check_collision(joints)
+        except Exception as exc:
+            self._fault(f'return collision-phase classification failed: {exc}')
+
+    def _transport_check_collision(self, joints):
         # A continuous Cartesian path may legitimately move an axis more than
         # pi from its initial angle. Absolute joint limits are checked on the
         # controller spline above; still collision-check every sampled state.
@@ -453,7 +506,13 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             if result is None:
                 raise ValueError('state validation returned no response')
             if not result.valid:
-                self._fault('KINEMATIC_REJECTED: timed continuous transport is in collision or violates constraints')
+                reason = 'KINEMATIC_REJECTED: timed continuous transport is in collision or violates constraints'
+                if self._reuse_fallback(reason):
+                    return
+                if self._try_pick_grid():
+                    return
+                if not self._try_transport_alternative(reason) and not self._try_sdk_transport(reason):
+                    self._fault(reason)
                 return
             joints,_ = self.transport_checks[self.transport_check_index]
             self._transport_fk_request(joints, self._transport_geometry_checked)
@@ -466,18 +525,37 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             _,t = self.transport_checks[self.transport_check_index]
             # The Servo XY box is a local descent region, not the free-space
             # transfer workspace. Do not apply it to the complete transfer.
-            if xyz[2] > self.servo_bounds_mm[5]/1000:
-                self._fault('KINEMATIC_REJECTED: timed transport exceeds workspace ceiling')
+            if xyz[2] > self._transport_ceiling():
+                self._transport_reject_geometry('timed transport exceeds workspace ceiling')
                 return
             near_start = np.linalg.norm(xyz[:2]-self.transport_start_xyz[:2]) <= 0.003
             near_end = np.linalg.norm(xyz[:2]-self.transport_end[:2]) <= 0.003
             if not near_start and not near_end:
                 if xyz[2]+item_bottom_offset(q,self.transport_scene) < self.transport_clearance-0.001:
-                    self._fault('KINEMATIC_REJECTED: timed transport cuts below item-bottom clearance')
+                    self._transport_reject_geometry('timed transport cuts below item-bottom clearance')
                     return
-            if not getattr(self, 'transport_is_return', False) and float(rotate(q,[0,0,1]) @ rotate(self.transport_end_q,[0,0,1])) < math.cos(math.radians(2.5)):
-                self._fault('KINEMATIC_REJECTED: timed transport violates tool tilt tolerance')
-                return
+            if getattr(self, 'transport_is_pick', False):
+                # At low Z only the two vertical columns are allowed. Each
+                # column retains its own orientation; reorientation is aloft.
+                if xyz[2] < self.transport_safe_z - .001:
+                    references = ([self.transport_start_q] if near_start else []) + (
+                        [self.transport_end_q] if near_end else [])
+                    if not references or max(abs(float(q @ ref)) for ref in references) < math.cos(math.radians(2.5)/2):
+                        if self._reuse_fallback('pickup approach changes XY/orientation below clearance'):
+                            return
+                        self._fault('KINEMATIC_REJECTED: pickup approach changes XY/orientation below clearance')
+                        return
+            elif not getattr(self, 'transport_is_return', False):
+                # Allow free overhead orientation, but never use the source/
+                # destination column exemption to rotate a low carried item.
+                # Check actual rotated corners, not just the nominal TCP plane.
+                bottom = xyz[2] + item_bottom_offset(q, self.transport_scene)
+                if bottom < self.transport_clearance - .001:
+                    references = ([self.transport_start_q] if near_start else []) + (
+                        [self.transport_end_q] if near_end else [])
+                    if not references or max(abs(float(q @ ref)) for ref in references) < math.cos(math.radians(2.5)/2):
+                        self._transport_reject_geometry('timed transport rotates a carried item below clearance')
+                        return
             if near_end and xyz[2] < self.transport_high_z-0.001 and self.transport_descent_time is None:
                 # Include the end of the downward bend even when pre-place
                 # is so high that the straight descent leg has zero length.
@@ -485,12 +563,45 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             if self.transport_check_index == len(self.transport_checks)-1:
                 if (np.linalg.norm(xyz-self.transport_end) > 0.003 or
                         abs(float(q @ self.transport_end_q)) < math.cos(math.radians(0.5)/2)):
+                    if self._reuse_fallback('timed path does not finish at the pre-place pose'):
+                        return
                     self._fault('KINEMATIC_REJECTED: timed path does not finish at the pre-place pose')
                     return
+            self._record_reuse_pose(t, xyz, q)
             self.transport_check_index += 1
             self._transport_validate_next()
         except Exception as exc:
             self._fault(f'continuous transport geometry check failed: {exc}')
+
+    def _transport_reject_geometry(self, detail):
+        reason = 'KINEMATIC_REJECTED: ' + detail
+        if self._reuse_fallback(reason):
+            return
+        if self._try_pick_grid():
+            return
+        if not self._try_transport_alternative(reason) and not self._try_sdk_transport(reason):
+            self._fault(reason)
+
+    def _grid_deadline_tick(self, now):
+        if (self.state in (self.TRANSPORT_PLANNING, self.TRANSPORT_DIAGNOSING) and
+                not getattr(self, 'direct_transfer_motion_started', False) and
+                getattr(self, 'transfer_goal_handle', None) is None):
+            if (getattr(self, 'transport_is_pick', False) and
+                    getattr(self, 'pick_cross_area', False) and
+                    now >= (getattr(self, 'pick_grid_deadline', None) or math.inf)):
+                if not self._try_pick_grid():
+                    self.transport_route_generation += 1
+                    self._fault('cross-area pickup grids exhausted; no motion executed')
+                return True
+            if (not getattr(self, 'transport_is_pick', False) and
+                    not getattr(self, 'transport_is_return', False) and
+                    getattr(self, 'transport_route_attempt', 0) == 1 and
+                    now >= getattr(self, 'alternative_grid_deadline', math.inf)):
+                if not self._try_transport_alternative('grid deadline reached'):
+                    self.transport_route_generation += 1
+                    self._fault('cross-area transfer grids exhausted; item remains held')
+                return True
+        return False
 
     def _transport_execute(self):
         now = time.monotonic()
@@ -506,6 +617,12 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
         if max(abs(a-b) for a,b in zip(self.latest_joint_positions,self.transport_seed)) > 0.01:
             self._fault('robot moved during continuous transport planning')
             return
+        if getattr(self, 'transport_sdk_candidate', False):
+            self._sdk_begin_execution()
+            return
+        if self._reuse_is_active():
+            self.get_logger().info('cross-frame cache accepted after full validation; executing reconnected path')
+            self.reuse_active = False
         self.state = self.TRANSPORT_EXECUTING
         self.transport_execution_started = time.monotonic()
         goal = FollowJointTrajectory.Goal()
@@ -519,6 +636,8 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
             if operation == self.operation_id else None)
         future.add_done_callback(lambda f: self._transport_goal_received(f, operation))
         label = 'retreat/observation return' if getattr(self, 'transport_is_return', False) else 'lift/transfer/descent'
+        if getattr(self, 'transport_is_pick', False):
+            label = 'empty-tool pickup approach (lift/overhead/pre-pick)'
         self.get_logger().info(f'executing continuous {label} in {self.transport_duration:.2f} s')
 
     def _transport_goal_received(self, future, operation):
@@ -532,6 +651,7 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                 raise ValueError('controller rejected continuous trajectory')
             self.transfer_goal_handle = handle
             self.direct_transfer_motion_started = True
+            self._mark_reuse_execution()
             handle.get_result_async().add_done_callback(self._transport_guard(self._transport_result))
         except Exception as exc:
             self._fault(f'continuous transport action failed: {exc}')
@@ -577,6 +697,8 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
                 detail += f'; observation joint error={self.transport_verify_joint_error:.4f} rad'
             disposition = ('item already released; return remains incomplete'
                            if getattr(self, 'transport_is_return', False) else 'item remains held')
+            if getattr(self, 'transport_is_pick', False):
+                disposition = 'empty-tool approach incomplete; contact pickup blocked'
             self._fault(f'continuous transport final-pose verification timed out: {detail}; {disposition}')
             return
         sample = getattr(self, 'transport_joint_sample_time', None)
@@ -602,18 +724,48 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
         if now-self.transport_verify_sample > self.status_timeout:
             return  # A delayed service response cannot authorize descent.
         try:
-            xyz,_ = self._transport_pose(future.result())
+            xyz,q = self._transport_pose(future.result())
             self.transport_verify_error = float(np.linalg.norm(xyz-self.transport_end))
             if self.transport_verify_error > 0.01:
                 return  # Allow bounded settling; do not relax the tolerance.
-            if getattr(self, 'transport_is_return', False):
-                self.transport_verify_joint_error = max(
-                    abs(a-b) for a,b in zip(self.transport_verify_joints,self.return_goal_joints))
-                if self.transport_verify_joint_error > self.direct_transfer_joint_tolerance:
+            if getattr(self, 'transport_is_pick', False):
+                if abs(float(q @ self.transport_end_q)) < math.cos(math.radians(2.5)/2):
                     return
+                if getattr(self, 'raised_pick_offset_m', 0.) > 0:
+                    if self.transport_verify_error > .002:
+                        return
+                    self.raised_pick_ready = dict(
+                        target_id=self.transport_target['operation_id'],
+                        retrieval_target_id=self.transport_target['planned_pregrasp']['retrieval_target_id'],
+                        xyz=list(self.transport_end),
+                        original_z=float(self.transport_target['pre_place_tcp_xyz_m'][2]))
+                self.pick_path_completed = True
+            elif getattr(self, 'transport_is_return', False):
+                if self.return_goal_joints is not None:
+                    self.transport_verify_joint_error = max(
+                        abs(a-b) for a,b in zip(self.transport_verify_joints,self.return_goal_joints))
+                    if self.transport_verify_joint_error > self.direct_transfer_joint_tolerance:
+                        return
                 self.continuous_return_completed = True
             else:
+                if (getattr(self, 'transport_target', {}).get('transfer_context') == 'staging_store' and
+                        abs(float(q @ self.transport_end_q)) < math.cos(math.radians(2.5)/2)):
+                    return  # Require settled orientation before acknowledging slot transfer.
                 self.direct_transfer_succeeded = True
+                if getattr(self, 'raised_pre_place_offset_m', 0.) > 0:
+                    if self.transport_verify_error > .002 or abs(float(q @ self.transport_end_q)) < math.cos(.005/2):
+                        self.direct_transfer_succeeded = False
+                        return
+                    self.raised_pre_place_ready = dict(
+                        target_id=self.transport_target.get('operation_id'),
+                        xyz=list(self.transport_end),
+                        original_z=float(self.transport_target['pre_place_tcp_xyz_m'][2]),
+                        item_id=self.transport_scene.get('attached_item_id'))
+                if getattr(self, 'transport_target', {}).get('transfer_context') == 'staging_store':
+                    self.verified_slot_transfer_target = dict(self.transport_target)
+                    self.verified_slot_transfer_target['pre_place_tcp_xyz_m'] = list(self.transport_end)
+                    self.verified_slot_transfer_target['transfer_tcp_quaternion_xyzw'] = list(self.transport_end_q)
+            self._remember_overhead_path()
             self.direct_target_z = float(self.transport_end[2])
             self.state = self.SUCCEEDED
             self.get_logger().info(
@@ -634,6 +786,11 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
         delta = abs(force_z-self.transport_contact_baseline)
         self.transport_force_count = self.transport_force_count+1 if delta >= self.place_force_threshold else 0
         if self.transport_force_count < self.loading_contact_confirm_samples:
+            return
+        if getattr(self, 'transport_is_pick', False):
+            # Contact before pre-pick is unexpected, not placement success.
+            # _fault cancels the trajectory; never grasp or run release fallback.
+            self._fault('unexpected force contact during pickup approach; descent blocked')
             return
         if self.transfer_goal_handle is None:
             self._fault('cannot cancel continuous transport on contact')
@@ -661,6 +818,20 @@ class ContinuousTransport(CartesianFailureDiagnostics, ContinuousReturn):
         now = time.monotonic()
         if self.robot_error not in (None,0):
             self._fault(f'xArm error {self.robot_error} during continuous transport')
+            return True
+        if self._reuse_tick(now):
+            return True
+        if self._grid_deadline_tick(now):
+            return True
+        deadline = getattr(self, 'transport_alternative_deadline', None)
+        if self._try_slot_yaw_flip(now):
+            return True
+        if (deadline is not None and not self.direct_transfer_motion_started and
+                not getattr(self, 'transport_is_pick', False) and
+                not getattr(self, 'transport_is_return', False) and
+                self.state in (self.TRANSPORT_PLANNING, self.TRANSPORT_VALIDATING,
+                               self.TRANSPORT_DIAGNOSING) and now >= deadline):
+            self._fault('KINEMATIC_REJECTED: transport alternatives exceeded planning budget; item remains held')
             return True
         if self.state == self.TRANSPORT_DIAGNOSING:
             if now > self.transport_diagnostic_deadline:

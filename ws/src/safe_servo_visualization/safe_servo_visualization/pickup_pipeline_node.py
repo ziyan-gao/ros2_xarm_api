@@ -204,6 +204,15 @@ class PickupPipeline(Node):
             self.pickup_status = json.loads(message.data)
         except (TypeError, ValueError):
             self.pickup_status = {}
+        if (self.state == self.OBJECT_INFO_READY and
+                self.pickup_status.get('operation_kind') == 'pick_approach' and
+                not self.pickup_status.get('object_info_obtained')):
+            # The known-item approach owns departure from the measured box.
+            # Only clear the obsolete latch/visual; do not send retreat/reset.
+            self.state = self.IDLE
+            self.finalized_result_published = False
+            self._clear_object_markers()
+            self.publish_status()
 
     def refined_boxes_callback(self, message):
         boxes = {}
@@ -777,6 +786,11 @@ class PickupPipeline(Node):
                 float(info['size_x_m']), float(info['size_y_m']),
                 float(info['size_z_m']),
             ]
+            # Optional reporting-only extension. Preserve the original eleven
+            # motion/planning fields and the displayed box shape unchanged.
+            measured = self.pickup_status['corrected_object']
+            result.data.extend(float(measured[key]) for key in
+                               ('size_x_m', 'size_y_m', 'size_z_m'))
         except (KeyError, TypeError, ValueError):
             self._set_fault('contact-corrected object information is incomplete')
             return

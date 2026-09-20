@@ -17,11 +17,29 @@ class CartesianFailureDiagnostics:
     TRANSPORT_DIAGNOSING = 'TRANSPORT_DIAGNOSING'
 
     def _diagnostic_finish(self, detail):
-        self._fault(f'{self.transport_partial_reason}; diagnostic: {detail}')
+        reason = f'{self.transport_partial_reason}; diagnostic: {detail}'
+        if getattr(self, 'alternative_diagnostic_pending', False):
+            self.alternative_diagnostic_pending = False
+            self._alternative_failed(reason)
+            return
+        raised_pick = getattr(self, '_try_raised_pick_path', None)
+        if raised_pick is not None and raised_pick(reason):
+            return
+        fallback = getattr(self, '_try_transport_alternative', None)
+        if fallback is None or not fallback(reason):
+            self._fault(reason)
 
-    def _diagnose_partial_path(self, result):
+    def _diagnose_partial_path(self, result, alternative=False):
+        self.alternative_diagnostic_pending = alternative
+        self.transport_partial_fraction = result.fraction
+        self.transport_partial_probe_xyz = None
+        self.transport_partial_probe_frame = None
         self.transport_partial_reason = (
             f'KINEMATIC_REJECTED: continuous transport path reaches {result.fraction:.1%}')
+        if alternative:
+            self.transport_partial_reason = (
+                f'KINEMATIC_REJECTED: {self.alternative_segment_label} '
+                f'reaches {result.fraction:.1%}')
         request = getattr(self, 'transport_cartesian_request', None)
         if request is None or not request.waypoints:
             self._diagnostic_finish('request snapshot unavailable')
@@ -36,7 +54,10 @@ class CartesianFailureDiagnostics:
                         max(0, int(result.fraction * len(request.waypoints))))
             pose = request.waypoints[index]
             xyz = pose.position
-            direction = 'reverse return' if getattr(self, 'transport_is_return', False) else 'outbound'
+            self.transport_partial_probe_xyz = (xyz.x, xyz.y, xyz.z)
+            self.transport_partial_probe_frame = request.header.frame_id
+            direction = ('reverse return' if getattr(self, 'return_goal_joints', None) is not None
+                         else 'vertical return') if getattr(self, 'transport_is_return', False) else 'outbound'
             self.get_logger().warning(
                 f'partial Cartesian {direction}: target={self.transport_target.get("operation_id")}, '
                 f'probing waypoint {index+1}/{len(request.waypoints)} near failed interval '
@@ -66,6 +87,9 @@ class CartesianFailureDiagnostics:
             result = future.result()
             if result is None or result.error_code.val != 1:
                 code = None if result is None else result.error_code.val
+                escape = getattr(self, '_try_return_ik_escape', None)
+                if code == -31 and escape is not None and escape():
+                    return
                 self._diagnostic_finish(
                     f'IK probe returned code={code}; cause unresolved '
                     '(IK seed/timeout, reachability or limits); no collision diagnosis')

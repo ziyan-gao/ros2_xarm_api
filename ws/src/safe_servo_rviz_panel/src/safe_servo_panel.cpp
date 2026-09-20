@@ -675,7 +675,204 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
       applyPalletConfig();
     });
 
+  auto * test_group = new QGroupBox("Single-item PickAndPlace tests (real robot)", this);
+  auto * test_layout = new QVBoxLayout(test_group);
+  auto * test_help = new QLabel(
+    "Start with an empty pallet and slot 0. Disable/reset both loaders. "
+    "Manual buttons run one step. Random test reuses one item, or two with floor-only mode, choosing valid operations "
+    "and empty slots, and stops on any fault. Keep the workspace clear.", this);
+  test_help->setWordWrap(true);
+  test_layout->addWidget(test_help);
+  test_confirm_ = new QCheckBox("Enable deliberate real-robot test commands", this);
+  test_layout->addWidget(test_confirm_);
+  test_two_items_ = new QCheckBox("Two-item floor-only test (no stacking)", this);
+  test_two_items_->setEnabled(false);
+  test_two_items_->setToolTip("Enable on an empty/reset test. Load item 1, present item 2 and start again. Then randomly pack/unpack/repack either item.");
+  test_layout->addWidget(test_two_items_);
+  connect(test_two_items_, &QCheckBox::toggled, this, [this](bool checked) {
+    if (!test_two_items_client_ || !test_two_items_client_->service_is_ready()) {
+      const QSignalBlocker blocker(test_two_items_);
+      test_two_items_->setChecked(!checked);
+      return;
+    }
+    test_mode_pending_ = true;
+    test_two_items_->setEnabled(false);
+    test_pack_unpack_only_->setEnabled(false);
+    test_buttons_[6]->setEnabled(false);
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = checked;
+    test_two_items_client_->async_send_request(request,
+      [this, checked](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        bool success = false;
+        QString message;
+        try {
+          auto result = future.get();
+          success = result->success;
+          message = QString::fromStdString(result->message);
+        } catch (const std::exception & error) {message = error.what();}
+        QMetaObject::invokeMethod(this, [this, checked, success, message]() {
+          test_mode_pending_ = false;
+          const QSignalBlocker blocker(test_two_items_);
+          test_two_items_->setChecked(success ? checked : !checked);
+          test_status_label_->setText(message);
+        }, Qt::QueuedConnection);
+      });
+  });
+  test_pack_unpack_only_ = new QCheckBox("Random test: pack / unpack only (no repack)", this);
+  test_pack_unpack_only_->setEnabled(false);
+  test_pack_unpack_only_->setToolTip(
+    "Pack a new item once if needed, then alternate pallet -> random empty slot "
+    "and recorded slot -> random pallet target. Manual buttons are unchanged.");
+  test_layout->addWidget(test_pack_unpack_only_);
+  connect(test_pack_unpack_only_, &QCheckBox::toggled, this, [this](bool checked) {
+    if (!test_mode_client_ || !test_mode_client_->service_is_ready()) {
+      const QSignalBlocker blocker(test_pack_unpack_only_);
+      test_pack_unpack_only_->setChecked(!checked);
+      test_status_label_->setText("Test mode service unavailable; setting not changed");
+      return;
+    }
+    test_mode_pending_ = true;
+    test_pack_unpack_only_->setEnabled(false);
+    test_buttons_[6]->setEnabled(false);
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = checked;
+    test_mode_client_->async_send_request(request,
+      [this, checked](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
+        bool success = false;
+        QString message;
+        try {
+          const auto result = future.get();
+          success = result->success;
+          message = QString::fromStdString(result->message);
+        } catch (const std::exception & error) {
+          message = QString("Test mode request failed: %1").arg(error.what());
+        }
+        QMetaObject::invokeMethod(this, [this, checked, success, message]() {
+          test_mode_pending_ = false;
+          const QSignalBlocker blocker(test_pack_unpack_only_);
+          test_pack_unpack_only_->setChecked(success ? checked : !checked);
+          test_status_label_->setText(message);
+          // A fresh coordinator status re-enables controls and confirms mode.
+        }, Qt::QueuedConnection);
+      });
+  });
+  const char * labels[] = {
+    "1. New item -> random pallet", "2. Unpack -> test slot -> overhead",
+    "3. Recorded slot -> random pallet", "4. Repack on pallet (new random position)",
+    "Abort test (keep gripper state)", "Reset test bookkeeping",
+    "Start random robustness test", "Stop random test after current step"};
+  for (size_t i = 0; i < test_buttons_.size(); ++i) {
+    test_buttons_[i] = new VisibleTextButton(labels[i], this);
+    test_buttons_[i]->setEnabled(false);
+    test_layout->addWidget(test_buttons_[i]);
+    connect(test_buttons_[i], &QPushButton::clicked, this, [this, i]() {runPickPlaceTest(i);});
+  }
+  test_status_label_ = new QLabel("Test coordinator: unavailable", this);
+  test_status_label_->setWordWrap(true);
+  test_layout->addWidget(test_status_label_);
+  layout->addWidget(test_group);
+  test_conflicting_groups_ = {random_loading_group, policy_loading_group, pickup_group,
+    place_group, staging_group, motion_group, manual_group, pallet_group,
+    box_estimation_group, nullptr};
+  test_stale_timer_ = new QTimer(this);
+  test_stale_timer_->setSingleShot(true);
+  connect(test_stale_timer_, &QTimer::timeout, this, [this]() {
+    test_two_items_->setEnabled(false);
+    test_pack_unpack_only_->setEnabled(false);
+    for (auto * button : test_buttons_) {button->setEnabled(false);}
+    // Abort remains available as a best-effort request if telemetry was lost.
+    test_buttons_[4]->setEnabled(true);
+    test_status_label_->setText("Test status stale: do not start another motion. Stop/reconcile first.");
+  });
+  connect(test_confirm_, &QCheckBox::toggled, this, [this](bool) {
+    if (!test_last_status_.isEmpty() && test_stale_timer_->isActive()) {
+      updatePickPlaceTest(test_last_status_);
+    }
+  });
   layout->addStretch();
+}
+
+void SafeServoPanel::runPickPlaceTest(size_t index)
+{
+  if (index == 6 && test_mode_pending_) {return;}
+  auto client = test_clients_[index];
+  if (!client || !client->service_is_ready()) {
+    test_status_label_->setText("Test service unavailable; no request sent");
+    return;
+  }
+  for (size_t i = 0; i < 4; ++i) {test_buttons_[i]->setEnabled(false);}
+  test_buttons_[6]->setEnabled(false);
+  client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>(),
+    [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+      const auto result = future.get();
+      const QString text = QString::fromStdString(result->message);
+      QMetaObject::invokeMethod(this, [this, text]() {
+        test_status_label_->setText(text);
+      }, Qt::QueuedConnection);
+    });
+}
+
+void SafeServoPanel::updatePickPlaceTest(const QString & payload)
+{
+  const auto json = QJsonDocument::fromJson(payload.toUtf8()).object();
+  if (!json.contains("state")) {return;}
+  test_last_status_ = payload;
+  test_stale_timer_->start(3000);
+  const auto state = json.value("state").toString();
+  const bool automatic = json.value("random_active").toBool();
+  const bool busy = automatic || (state != "IDLE" && state != "READY" && state != "FAULT");
+  if (!test_mode_pending_) {
+    const QSignalBlocker two_blocker(test_two_items_);
+    test_two_items_->setChecked(json.value("two_item_mode").toBool());
+    const QSignalBlocker blocker(test_pack_unpack_only_);
+    test_pack_unpack_only_->setChecked(json.value("random_pack_unpack_only").toBool());
+  }
+  test_pack_unpack_only_->setEnabled(!busy && !test_mode_pending_ &&
+    json.contains("random_pack_unpack_only"));
+  test_two_items_->setEnabled(!busy && !test_mode_pending_ && state == "IDLE" &&
+    json.contains("two_item_mode"));
+  const auto allowed = json.value("allowed").toObject();
+  const auto blocked = json.value("blocked").toObject();
+  const char * steps[] = {"pack_new", "unpack", "pack_slot", "repack"};
+  for (size_t i = 0; i < 4; ++i) {
+    test_buttons_[i]->setEnabled(!automatic && !json.value("two_item_mode").toBool() &&
+      test_confirm_->isChecked() && allowed.value(steps[i]).toBool());
+    test_buttons_[i]->setToolTip(blocked.value(steps[i]).toString());
+  }
+  test_buttons_[4]->setEnabled(busy);
+  test_buttons_[5]->setEnabled(!busy && test_confirm_->isChecked());
+  test_buttons_[6]->setEnabled(!busy && !test_mode_pending_ && test_confirm_->isChecked() &&
+    json.value("random_start_allowed").toBool());
+  test_buttons_[7]->setEnabled(automatic);
+  // Recovery controls are available again after a latched fault.
+  for (auto * group : test_conflicting_groups_) {
+    if (group) {group->setEnabled(!busy);}
+  }
+  const auto downstream = json.value("downstream").toObject();
+  test_status_label_->setText(
+    QString("Step: %1 | Phase: %2 (%3 s)\nLast confirmed location: %4\n"
+    "Supervisor: %5 | Motion: %6 | Staging: %7\n%8")
+    .arg(json.value("step").toString(), state)
+    .arg(json.value("phase_elapsed_sec").toDouble(), 0, 'f', 1)
+    .arg(json.value("location").toString(), downstream.value("supervisor").toString(),
+      downstream.value("motion").toString(), downstream.value("staging").toString(),
+      json.value("fault").toString()) +
+    QString("\nRandom test: %1/%2 completed | slot %3\n%4\nSeed: %5")
+    .arg(json.value("random_completed").toInt()).arg(json.value("random_max_steps").toInt())
+    .arg(json.value("selected_test_slot").toInt()).arg(json.value("random_message").toString())
+    .arg(json.value("random_seed").toVariant().toString()));
+  if (json.value("two_item_mode").toBool()) {
+    QString inventory("\nTwo-item inventory:");
+    const auto items = json.value("test_items").toObject();
+    for (auto it = items.begin(); it != items.end(); ++it) {
+      const auto entry = it.value().toObject();
+      inventory += QString("\nItem %1: %2").arg(it.key(), entry.value("location").toString());
+      if (entry.value("location").toString() == "slot") {
+        inventory += QString(" %1").arg(entry.value("record").toObject().value("slot_id").toInt());
+      }
+    }
+    test_status_label_->setText(test_status_label_->text() + inventory);
+  }
 }
 
 void SafeServoPanel::onInitialize()
@@ -686,6 +883,23 @@ void SafeServoPanel::onInitialize()
     return;
   }
   node_ = abstraction->get_raw_node();
+  const char * test_services[] = {"pack_new", "unpack", "pack_slot", "repack", "abort", "reset",
+    "start_random", "stop_random"};
+  for (size_t i = 0; i < test_clients_.size(); ++i) {
+    test_clients_[i] = node_->create_client<std_srvs::srv::Trigger>(
+      std::string("/pick_place_test/") + test_services[i]);
+  }
+  test_mode_client_ = node_->create_client<std_srvs::srv::SetBool>(
+    "/pick_place_test/set_random_pack_unpack_only");
+  test_two_items_client_ = node_->create_client<std_srvs::srv::SetBool>(
+    "/pick_place_test/set_two_item_mode");
+  test_status_sub_ = node_->create_subscription<std_msgs::msg::String>(
+    "/pick_place_test/status", 10, [this](std_msgs::msg::String::SharedPtr msg) {
+      const QString payload = QString::fromStdString(msg->data);
+      QMetaObject::invokeMethod(this, [this, payload]() {
+        updatePickPlaceTest(payload);
+      }, Qt::QueuedConnection);
+    });
   config_pub_ = node_->create_publisher<std_msgs::msg::Float64MultiArray>(
     "/safe_servo/config", 10);
   motion_speed_config_pub_ =

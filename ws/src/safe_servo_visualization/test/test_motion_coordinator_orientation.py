@@ -218,6 +218,17 @@ def test_retrieval_target_accepts_rearrangement_id_and_object_yaw():
         (0.22, 0.17, 0.12))
 
 
+def test_buffer_retrieval_preserves_recorded_grasp_transform():
+    coordinator = object.__new__(MotionCoordinator)
+    grasp = [.01, -.02, .06, 1., 0., 0., 0.]
+    message = Float64MultiArray(data=[
+        2., .4, .2, .3, math.pi, 0., .5,
+        .22, .17, .12, .03, .5, .72, 1., *grasp])
+    coordinator.staging_retrieve_target_callback(message)
+    assert coordinator.staging_retrieve_target['recorded_grasp'] == grasp
+    assert coordinator.staging_retrieve_target['object_yaw'] == .5
+
+
 def test_staging_store_transfer_uses_normal_transfer_status_contract():
     coordinator = object.__new__(MotionCoordinator)
     coordinator.staging_store_transfer_target = None

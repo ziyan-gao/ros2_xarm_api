@@ -19,9 +19,12 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 from xarm_msgs.msg import RobotMsg
 from xarm_msgs.srv import Call, MoveJoint, SetInt16
+from .pick_place_workflow import pick_and_place
+from .pick_path_client import PickPathClient
+from .slot_inspection import SlotInspection
 
 
-class StagingSlots(Node):
+class StagingSlots(SlotInspection, Node):
     """Store and retrieve carried boxes in six fixed robot-base slots."""
 
     IDLE = 'IDLE'
@@ -35,6 +38,8 @@ class StagingSlots(Node):
     SETTLING_STORE = 'SETTLING_STORE'
     PLACING_STORE = 'PLACING_STORE'
     PREPARING_RETRIEVAL = 'PREPARING_RETRIEVAL'
+    PLANNING_RETRIEVAL_APPROACH = 'PLANNING_RETRIEVAL_APPROACH'
+    EXECUTING_RETRIEVAL_APPROACH = 'EXECUTING_RETRIEVAL_APPROACH'
     PLANNING_RETRIEVAL = 'PLANNING_RETRIEVAL'
     EXECUTING_RETRIEVAL = 'EXECUTING_RETRIEVAL'
     SETTLING_RETRIEVAL = 'SETTLING_RETRIEVAL'
@@ -45,11 +50,15 @@ class StagingSlots(Node):
     FAULT = 'FAULT'
 
     ACTIVE = {
+        SlotInspection.INSPECTION_FK, SlotInspection.INSPECTION_MOVE,
+        SlotInspection.INSPECTION_DEPTH,
+        SlotInspection.INSPECTION_CHECK,
         PREPARING_STORE_TRANSFER, TRANSFERRING_STORE, LOADING_STORE,
         SOLVING_STORE_IK, PREPARING_DIRECT, MOVING_DIRECT,
         RESTORING_CONTROL, SETTLING_STORE, PLACING_STORE, PREPARING_RETRIEVAL,
         PLANNING_RETRIEVAL, EXECUTING_RETRIEVAL, SETTLING_RETRIEVAL,
         PICKING_RETRIEVAL,
+        PLANNING_RETRIEVAL_APPROACH, EXECUTING_RETRIEVAL_APPROACH,
         PLANNING_OBSERVATION, EXECUTING_OBSERVATION,
     }
 
@@ -63,6 +72,7 @@ class StagingSlots(Node):
         self.declare_parameter('slot_surface_z_m', 0.0)
         self.declare_parameter('pre_pick_clearance_m', 0.030)
         self.declare_parameter('transfer_item_bottom_above_pallet_m', 0.480)
+        self.declare_parameter('configured_container_clearance_m', 0.470)
         self.declare_parameter('base_frame', 'link_base')
         self.declare_parameter('pallet_frame', 'pallet_frame')
         self.declare_parameter('retrieval_settle_sec', 0.25)
@@ -103,8 +113,8 @@ class StagingSlots(Node):
         self.slot_size = float(p('slot_size_m'))
         self.surface_z = float(p('slot_surface_z_m'))
         self.clearance = float(p('pre_pick_clearance_m'))
-        self.transfer_item_bottom_above_pallet = float(
-            p('transfer_item_bottom_above_pallet_m'))
+        self.transfer_item_bottom_above_pallet = max(float(
+            p('transfer_item_bottom_above_pallet_m')), float(p('configured_container_clearance_m')))
         self.base_frame = str(p('base_frame'))
         self.pallet_frame = str(p('pallet_frame'))
         self.retrieval_settle = max(0.0, float(p('retrieval_settle_sec')))
@@ -209,6 +219,7 @@ class StagingSlots(Node):
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._init_inspection()
 
         self.status_pub = self.create_publisher(String, '/staging_slots/status', 10)
         self.marker_pub = self.create_publisher(
@@ -258,6 +269,9 @@ class StagingSlots(Node):
             SetInt16, '/planning_scene_obstacles/remove_placed_item')
         self.plan_staging_pregrasp = self.create_client(
             Trigger, '/motion_coordinator/plan_staging_pregrasp')
+        self.plan_staging_approach = self.create_client(
+            Trigger, '/motion_coordinator/plan_staging_approach')
+        self.pick_path = PickPathClient(self, self._fault)
         self.prepare_staging_store_transfer = self.create_client(
             Trigger, '/motion_coordinator/prepare_staging_store_transfer')
         self.start_joint_transfer = self.create_client(
@@ -274,6 +288,12 @@ class StagingSlots(Node):
             Trigger, '/motion_coordinator/execute')
         self.start_pickup = self.create_client(
             Trigger, '/pickup_supervisor/start')
+        self.start_pickup_hold = self.create_client(
+            Trigger, '/pickup_supervisor/start_for_transport')
+        self.start_transport = self.create_client(
+            Trigger, '/pickup_supervisor/start_continuous_transport')
+        self.start_transport_chained = self.create_client(
+            Trigger, '/pickup_supervisor/start_continuous_transport_chained')
         self.start_staging_place = self.create_client(
             Trigger, '/pickup_supervisor/start_staging_place')
         self.enable_servo = self.create_client(SetBool, '/safe_servo/enable')
@@ -284,10 +304,33 @@ class StagingSlots(Node):
             self.store_chained_callback)
         self.create_service(
             Trigger, '/staging_slots/retrieve', self.retrieve_callback)
+        self.create_service(
+            Trigger, '/staging_slots/retrieve_chained', self.retrieve_chained_callback)
         self.create_service(Trigger, '/staging_slots/reset', self.reset_callback)
+        self.abort_supervisor = self.create_client(Trigger, '/pickup_supervisor/abort')
+        self.cancel_motion = self.create_client(Trigger, '/motion_coordinator/cancel')
+        self.abort_latched = False
+        self.create_service(Trigger, '/staging_slots/abort', self.abort_callback)
+        for topic in ('/random_stable_loading/status', '/policy_loading/status'):
+            self.create_subscription(String, topic, self._container_clearance_status, 10)
         self.create_timer(0.05, self.tick)
         self.create_timer(0.5, self.publish_status)
         self.publish_status()
+
+    def _container_clearance_status(self, message):
+        try:
+            status = json.loads(message.data)
+            size = status.get('container_size_mm')
+            if not isinstance(size, (list, tuple)) or len(size) != 3:
+                return
+            height = max(float(size[2])/1000.0 + .02,
+                         float(status.get('transfer_corner_height_m') or 0.))
+            if math.isfinite(height) and height > 0:
+                # Never lower the clearance during an active/chained operation.
+                self.transfer_item_bottom_above_pallet = max(
+                    self.transfer_item_bottom_above_pallet, height)
+        except (TypeError, ValueError):
+            return
 
     def _make_slots(self):
         nx = round((self.slot_x_max - self.slot_x_min) / self.slot_size)
@@ -364,14 +407,17 @@ class StagingSlots(Node):
             self.selected_retrieve_slot = int(message.data)
             self.publish_status()
 
-    def _busy_reason(self):
+    def _busy_reason(self, *, allow_contact=False):
+        if getattr(self, 'abort_latched', False):
+            return 'staging abort latched; stop/reconcile and reset before another operation'
         if self.state in self.ACTIVE:
             return f'staging operation active in {self.state}'
         motion_state = self.motion_status.get('state')
         if motion_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
             return f'MoveIt coordinator active in {motion_state}'
         pickup_state = self.pickup_status.get('state')
-        if pickup_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+        if (pickup_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT') and
+                not (allow_contact and pickup_state == 'AWAITING_GRASP')):
             return f'pickup supervisor active in {pickup_state}'
         return ''
 
@@ -432,17 +478,24 @@ class StagingSlots(Node):
 
     def _store_target(self, slot, geometry):
         size_x, size_y, size_z = geometry['size']
-        if size_x > self.slot_size + 1e-9 or size_y > self.slot_size + 1e-9:
+        tcp_q = geometry.get('store_tcp_q')
+        if tcp_q is None:
+            tcp_q = self._quat_inverse(geometry['orientation'])
+        object_q = self._quat_multiply(tcp_q, geometry['orientation'])
+        roll, pitch, yaw = self._rpy_from_quaternion(object_q)
+        if max(abs(roll), abs(pitch)) > math.radians(2.5):
+            raise ValueError('fixed-orientation slot placement requires a level item (within 2.5 degrees)')
+        # Bound all rotated corners, including small measured tilt. Align the
+        # footprint minimum X/Y and lowest corner with the slot origin.
+        corners = [self._quat_rotate((sx*size_x/2, sy*size_y/2, sz*size_z/2), object_q)
+                   for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+        low = [min(p[i] for p in corners) for i in range(3)]
+        extent = [max(p[i] for p in corners)-low[i] for i in range(3)]
+        if extent[0] > self.slot_size + 1e-9 or extent[1] > self.slot_size + 1e-9:
             raise ValueError(
-                f'item footprint {size_x*1000:.0f}x{size_y*1000:.0f} mm '
-                f'does not fit the unrotated 250x250 mm slot')
-        object_q = (0.0, 0.0, 0.0, 1.0)
-        tcp_q = self._quat_multiply(
-            object_q, self._quat_inverse(geometry['orientation']))
-        object_center = (
-            slot[0] + size_x/2.0,
-            slot[1] + size_y/2.0,
-            slot[2] + size_z/2.0)
+                f'item footprint {extent[0]*1000:.0f}x{extent[1]*1000:.0f} mm '
+                f'does not fit the 250x250 mm slot at its current orientation')
+        object_center = tuple(slot[i]-low[i] for i in range(3))
         tcp_to_center = self._quat_rotate(geometry['center'], tcp_q)
         tcp_xyz = tuple(
             object_center[index] - tcp_to_center[index] for index in range(3))
@@ -497,15 +550,30 @@ class StagingSlots(Node):
             return response
         try:
             geometry = self._attached_geometry()
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame, 'link_tcp', rclpy.time.Time())
+            stamp = transform.header.stamp
+            age = self.get_clock().now().nanoseconds*1e-9 - (stamp.sec + stamp.nanosec*1e-9)
+            if not math.isfinite(age) or not 0 <= age <= self.status_timeout:
+                raise ValueError('current TCP orientation TF is stale; cannot freeze slot-store orientation')
+            q = transform.transform.rotation
+            raw = (q.x, q.y, q.z, q.w)
+            norm = math.sqrt(sum(v*v for v in raw))
+            if not math.isfinite(norm) or norm < 1e-9:
+                raise ValueError('invalid current TCP orientation')
+            geometry['store_tcp_q'] = tuple(v/norm for v in raw)
             target = self._store_target(self.slots[slot_index], geometry)
             pallet_origin_z = self._pallet_origin_z()
-        except ValueError as exc:
+        except (ValueError, TransformException) as exc:
             response.message = str(exc)
             return response
         if not self.prepare_staging_store_transfer.service_is_ready():
             response.message = 'staging transfer preparation service is unavailable'
             return response
         self.operation = 'store'
+        self.expected_store_place_operation_id = None
+        self.expected_store_transfer_operation_id = None
+        self.workflow = pick_and_place('carried', 'slot', return_to_observation=bool(return_to_observation))
         self.return_to_observation = bool(return_to_observation)
         self.active_slot = slot_index
         self.direct_phase = ''
@@ -535,7 +603,15 @@ class StagingSlots(Node):
         transfer_target.data = [
             float(slot_index), target[0], target[1], target_transfer_z,
             *transfer_quaternion, pre_place[2],
+            pallet_origin_z + self.transfer_item_bottom_above_pallet,
         ]
+        # Recompute TCP XY for the same slot corner: an off-centre grasp must
+        # not simply rotate about the old TCP and move the box outside its slot.
+        x, y, z, w = geometry['store_tcp_q']
+        flipped_q = (-y, x, w, -z)
+        flipped = self._store_target(self.slots[slot_index], {**geometry, 'store_tcp_q': flipped_q})
+        self.pending_record['yaw180_target_tcp_pose'] = flipped
+        transfer_target.data.extend([*flipped[:2], flipped[2] + self.clearance, *flipped_q])
         self.store_transfer_target_pub.publish(transfer_target)
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
@@ -553,7 +629,7 @@ class StagingSlots(Node):
         response.message = (
             f'storing attached item in slot {slot_index} at FLB '
             f'{tuple(round(v*1000) for v in self.slots[slot_index])} mm; '
-            'using validated new-item transfer logic; item yaw fixed to 0 deg; '
+            'using validated transfer logic; holding current TCP orientation; '
             f'item bottom={self.transfer_item_bottom_above_pallet*1000:.0f} mm '
             'above pallet; '
             f'{completion_route}'
@@ -582,6 +658,64 @@ class StagingSlots(Node):
         if result is None or not result.success:
             message = 'no response' if result is None else result.message
             self._fault(f'staging transfer preparation rejected: {message}')
+
+    def _begin_store_continuous_transfer(self):
+        client = self.start_transport if self.return_to_observation else self.start_transport_chained
+        if not client.service_is_ready():
+            self._fault('shared continuous transport service is unavailable')
+            return
+        self.state = self.TRANSFERRING_STORE
+        self.store_transfer_phase = 'continuous'
+        self.expected_store_transfer_operation_id = int(self.pickup_status.get('operation_id', 0)) + 1
+        self.placed_ids_before_store = set(self.scene_status.get('placed_item_ids') or [])
+        future = client.call_async(Trigger.Request())
+        future.add_done_callback(self._request_accepted)
+
+    def _tick_store_continuous_transfer(self):
+        if int(self.pickup_status.get('operation_id', -1)) != self.expected_store_transfer_operation_id:
+            return
+        if self.pickup_status.get('transport_slot_yaw_flipped') and self.pending_record:
+            self.pending_record['target_tcp_pose'] = self.pending_record['yaw180_target_tcp_pose']
+            self.pending_record['pre_place_tcp_z'] = self.pending_record['target_tcp_pose'][2] + self.clearance
+        state = self.pickup_status.get('state')
+        if state == 'FAULT':
+            reason = self.pickup_status.get('fault', 'continuous staging transfer failed')
+            # Chained pickups start at contact, not at the old elevated start.
+            # A direct fallback to the slot waypoint could sweep the held box
+            # through neighbours. Keep it held; do not skip the required lift.
+            self._fault(reason)
+            return
+        if state != 'SUCCEEDED':
+            return
+        if self.pickup_status.get('place_fallback_used'):
+            self._complete_safe_servo_store()
+            return
+        if not self.pickup_status.get('direct_transfer_succeeded'):
+            self._fault('staging continuous transfer completion was not verified')
+            return
+        if int(self.motion_status.get('operation_id', -1)) != self.expected_motion_operation_id:
+            self._fault('staging target changed during continuous transfer')
+            return
+        if self.store_transfer_phase == 'continuous':
+            if not self.accept_direct_transfer.service_is_ready():
+                self._fault('continuous staging handoff acknowledgement unavailable')
+                return
+            self.store_transfer_phase = 'continuous_accepting'
+            self.store_continuous_ack = False
+            expected = self.expected_store_transfer_operation_id
+            def accepted(future):
+                if self.state != self.TRANSFERRING_STORE or expected != self.expected_store_transfer_operation_id:
+                    return
+                try:
+                    response = future.result()
+                    if response is None or not response.success:
+                        raise ValueError('continuous staging handoff rejected')
+                    self.store_continuous_ack = True
+                except Exception as exc:
+                    self._fault(str(exc))
+            self.accept_direct_transfer.call_async(Trigger.Request()).add_done_callback(accepted)
+        elif self.store_continuous_ack and self.motion_status.get('state') == 'SUCCEEDED':
+            self._begin_safe_servo_store()
 
     def _begin_store_direct_transfer(self):
         if not self.start_joint_transfer.service_is_ready():
@@ -711,7 +845,13 @@ class StagingSlots(Node):
         self._deactivate_controllers()
 
     def retrieve_callback(self, _request, response):
-        reason = self._busy_reason()
+        return self._retrieve(response, return_to_observation=True)
+
+    def retrieve_chained_callback(self, _request, response):
+        return self._retrieve(response, return_to_observation=False)
+
+    def _retrieve(self, response, return_to_observation):
+        reason = self._busy_reason(allow_contact=True)
         if reason:
             response.message = reason
             return response
@@ -734,23 +874,32 @@ class StagingSlots(Node):
                 f'slot {slot_index} has no valid planning-scene obstacle ID')
             return response
         self.operation = 'retrieve'
+        self.return_to_observation = return_to_observation
         self.active_slot = slot_index
         self.state = self.PREPARING_RETRIEVAL
         self.fault = ''
         self.last_result = ''
         self.phase_started = time.monotonic()
-        if record.get('obstacle_removed'):
-            self._publish_retrieval_target()
+        if getattr(self, 'inspection_enabled', False):
+            self._begin_slot_inspection()
         else:
-            self.waiting_removed_id = placed_id
-            request = SetInt16.Request()
-            request.data = int(match.group(1))
-            future = self.remove_staged_obstacle.call_async(request)
-            future.add_done_callback(self._staged_obstacle_removed)
+            self._begin_retrieval_removal()
         response.success = True
         response.message = f'retrieval requested for staging slot {slot_index}'
         self.publish_status()
         return response
+
+    def _begin_retrieval_removal(self):
+        record = self.occupied[self.active_slot]
+        self.state = self.PREPARING_RETRIEVAL
+        if record.get('obstacle_removed'):
+            self._publish_retrieval_target()
+        else:
+            self.waiting_removed_id = record['placed_obstacle_id']
+            request = SetInt16.Request()
+            request.data = int(re.fullmatch(r'placed_item_(\d+)', self.waiting_removed_id).group(1))
+            future = self.remove_staged_obstacle.call_async(request)
+            future.add_done_callback(self._staged_obstacle_removed)
 
     def _staged_obstacle_removed(self, future):
         if self.state != self.PREPARING_RETRIEVAL:
@@ -769,21 +918,31 @@ class StagingSlots(Node):
         # to plan through the former target-object volume.
         self.occupied[self.active_slot]['obstacle_removed'] = True
 
-    def _publish_retrieval_target(self):
+    def _publish_retrieval_target(self, *, overhead=True):
         record = self.occupied[self.active_slot]
         pose = record['release_tcp_pose']
         contact_reference_z = self._retrieval_contact_reference_z(record)
+        try:
+            approach_z = max(self._pallet_origin_z() + self.transfer_item_bottom_above_pallet,
+                              contact_reference_z + self.clearance + .02)
+        except ValueError as exc:
+            self._fault(str(exc))
+            return
         target = Float64MultiArray()
         target.data = [
             float(self.active_slot),
             pose[0] / 1000.0, pose[1] / 1000.0, contact_reference_z,
             pose[3], pose[4], pose[5],
-            *record['size'], self.clearance,
+            *record['size'], self.clearance, float(record.get('object_yaw', 0.0)), approach_z, 1.0,
         ]
+        if 'center' in record and 'orientation' in record:
+            target.data.extend([*record['center'], *record['orientation']])
         self.retrieve_target_pub.publish(target)
-        self.state = self.PLANNING_RETRIEVAL
+        self.state = self.PLANNING_RETRIEVAL_APPROACH if overhead else self.PLANNING_RETRIEVAL
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
+        if overhead:
+            self.pick_path.reset(self.expected_motion_operation_id)
         # Let the target subscription run before invoking the planning service.
         timer = self.create_timer(0.15, self._request_retrieval_plan)
         self._one_shot_timer = timer
@@ -804,12 +963,15 @@ class StagingSlots(Node):
 
     def _request_retrieval_plan(self):
         self._one_shot_timer.cancel()
-        if self.state != self.PLANNING_RETRIEVAL:
+        if self.state not in (self.PLANNING_RETRIEVAL, self.PLANNING_RETRIEVAL_APPROACH,
+                              self.INSPECTION_MOVE):
             return
-        if not self.plan_staging_pregrasp.service_is_ready():
+        client = (self.pick_path.prepare if self.state in (self.PLANNING_RETRIEVAL_APPROACH, self.INSPECTION_MOVE)
+                  else self.plan_staging_pregrasp)
+        if not client.service_is_ready():
             self._fault('staging pre-pick planning service is unavailable')
             return
-        future = self.plan_staging_pregrasp.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(self._request_accepted)
 
     def _request_accepted(self, future):
@@ -930,6 +1092,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._controllers_deactivated)
 
     def _controllers_deactivated(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -941,6 +1105,8 @@ class StagingSlots(Node):
         self._deactivate_hardware()
 
     def _deactivate_hardware(self):
+        if getattr(self, 'abort_latched', False):
+            return
         if not self.set_hardware.service_is_ready():
             self._fault('hardware lifecycle service is unavailable')
             return
@@ -952,6 +1118,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._hardware_deactivated)
 
     def _hardware_deactivated(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -964,6 +1132,8 @@ class StagingSlots(Node):
         self._begin_mode_wait(0, 'staging direct joint motion', self._send_next_joint)
 
     def _begin_mode_wait(self, target, label, callback):
+        if getattr(self, 'abort_latched', False):
+            return
         self.mode_wait_target = int(target)
         self.mode_wait_label = label
         self.mode_wait_callback = callback
@@ -1037,6 +1207,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._mode_set)
 
     def _mode_set(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception:
@@ -1054,6 +1226,8 @@ class StagingSlots(Node):
         self.mode_wait_command_pending = False
 
     def _send_next_joint(self):
+        if getattr(self, 'abort_latched', False):
+            return
         if not self.motion_queue:
             if self.direct_phase == 'approach_to_servo':
                 self._restore_control()
@@ -1064,6 +1238,8 @@ class StagingSlots(Node):
         self._send_joint_target(angles)
 
     def _send_joint_target(self, angles):
+        if getattr(self, 'abort_latched', False):
+            return
         if not self.move_joint.service_is_ready():
             self._fault('ufactory set_servo_angle service is unavailable')
             return
@@ -1095,6 +1271,8 @@ class StagingSlots(Node):
         self._send_next_joint()
 
     def _restore_control(self):
+        if getattr(self, 'abort_latched', False):
+            return
         self.state = self.RESTORING_CONTROL
         if not self.list_hardware.service_is_ready():
             self._fault('hardware-list service is unavailable during restore')
@@ -1103,6 +1281,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._restore_hardware_received)
 
     def _restore_hardware_received(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -1133,6 +1313,8 @@ class StagingSlots(Node):
             f'{component.state.label}')
 
     def _restore_hardware_inactive(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -1149,6 +1331,8 @@ class StagingSlots(Node):
             self._activate_hardware)
 
     def _activate_hardware(self):
+        if getattr(self, 'abort_latched', False):
+            return
         request = SetHardwareComponentState.Request()
         request.name = self.hardware_component
         request.target_state.id = State.PRIMARY_STATE_ACTIVE
@@ -1157,6 +1341,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._hardware_activated)
 
     def _hardware_activated(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -1169,6 +1355,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._restore_controllers_received)
 
     def _restore_controllers_received(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -1190,6 +1378,8 @@ class StagingSlots(Node):
         future.add_done_callback(self._controllers_restored)
 
     def _controllers_restored(self, future):
+        if getattr(self, 'abort_latched', False):
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -1201,10 +1391,14 @@ class StagingSlots(Node):
         self._wait_for_joint_states()
 
     def _wait_for_joint_states(self):
+        if getattr(self, 'abort_latched', False):
+            return
         self.restore_wait_sequence = self.joint_state_sequence
         self.restore_wait_deadline = time.monotonic() + self.joint_state_ready_timeout
 
     def _restore_tick(self):
+        if getattr(self, 'abort_latched', False):
+            return
         if self.restore_wait_sequence is None:
             return
         if (self.joint_state_sequence >=
@@ -1266,27 +1460,55 @@ class StagingSlots(Node):
         match = re.fullmatch(r'placed_item_(\d+)', str(item_id))
         return int(match.group(1)) if match else -1
 
-    def _complete_safe_servo_store(self):
+    def _record_confirmed_store_release(self):
+        """Commit inventory on release/detach, independently of retreat success."""
+        if self.pending_record is None:
+            return False
+        expected = (self.expected_store_place_operation_id or
+                    self.expected_store_transfer_operation_id)
+        if expected is None or self.pickup_status.get('operation_id') != expected:
+            return False
         release = self.pickup_status.get('release_tcp_pose_mm_rad')
-        if not isinstance(release, (list, tuple)) or len(release) != 6:
-            self._fault('safe-servo placement completed without a release TCP pose')
-            return
+        if (not isinstance(release, (list, tuple)) or len(release) != 6 or
+                not all(isinstance(v, (int, float)) and math.isfinite(v) for v in release) or
+                self.scene_status.get('attached_item_id')):
+            return False
         new_ids = set(self.scene_status.get('placed_item_ids') or []) - (
             self.placed_ids_before_store)
-        if not new_ids:
-            # Planning-scene status can arrive just after supervisor success.
-            return
-        placed_id = max(new_ids, key=self._placed_item_sort_key)
+        # A sampled release TCP alone is not proof of release: it is captured
+        # before the vacuum command. Require the new detached scene item too.
+        if len(new_ids) != 1:
+            return False
+        placed_id = next(iter(new_ids))
         self.pending_record['release_tcp_pose'] = tuple(map(float, release))
+        object_q = self._quat_multiply(
+            self._quaternion_from_rpy(*release[3:]), self.pending_record['orientation'])
+        self.pending_record['object_yaw'] = self._rpy_from_quaternion(object_q)[2]
+        self.pending_record['object_orientation_xyzw'] = object_q
         self.pending_record['placement_result'] = str(
             self.pickup_status.get('place_fallback_reason') or
             'safe-servo force contact')
         self.pending_record['placed_obstacle_id'] = str(placed_id)
         slot = int(self.pending_record['slot'])
         self.occupied[slot] = dict(self.pending_record)
+        return True
+
+    def _complete_safe_servo_store(self):
+        if not self._record_confirmed_store_release():
+            # Scene acknowledgement can arrive after supervisor completion.
+            return
         self.pending_record = None
         self.expected_store_place_operation_id = None
-        if self.return_to_observation:
+        if not self.return_to_observation and not (
+                self.pickup_status.get('continuous_return_completed') and
+                self.pickup_status.get('return_to_observation') is False):
+            # Preserve the released item's record, but do not authorize the
+            # next operation until its overhead handoff has been confirmed.
+            self._fault('chained staging placement did not confirm its overhead handoff')
+            return
+        if (self.return_to_observation and not (
+                self.pickup_status.get('continuous_return_completed') and
+                self.pickup_status.get('return_to_observation', True))):
             self._begin_observation()
         else:
             self._finish_operation()
@@ -1316,8 +1538,12 @@ class StagingSlots(Node):
         future.add_done_callback(self._request_accepted)
 
     def tick(self):
+        if self.operation == 'store' and self.state in (
+                self.TRANSFERRING_STORE, self.PLACING_STORE, self.FAULT):
+            self._record_confirmed_store_release()
         self._mode_tick()
         self._restore_tick()
+        self._inspection_tick()
         if self.state in self.ACTIVE and self.phase_started is not None and (
                 time.monotonic() - self.phase_started > self.motion_timeout * 3.0):
             self._fault(f'staging operation timed out in {self.state}')
@@ -1328,7 +1554,7 @@ class StagingSlots(Node):
             if (self._motion_matches() and
                     self.motion_status.get('target') == 'transfer' and
                     self.motion_status.get('state') == 'PREPARED'):
-                self._begin_store_direct_transfer()
+                self._begin_store_continuous_transfer()
         elif self.state == self.TRANSFERRING_STORE:
             self._tick_store_transfer()
         elif self.state == self.LOADING_STORE:
@@ -1336,7 +1562,7 @@ class StagingSlots(Node):
         elif self.state == self.SETTLING_STORE:
             self._settle_store()
         elif self.state == self.PLACING_STORE:
-            if int(self.pickup_status.get('operation_id', -1)) < int(
+            if int(self.pickup_status.get('operation_id', -1)) != int(
                     self.expected_store_place_operation_id or 0):
                 return
             place_state = self.pickup_status.get('state')
@@ -1350,6 +1576,13 @@ class StagingSlots(Node):
                     set(self.scene_status.get('placed_item_ids') or [])):
                 self.waiting_removed_id = ''
                 self._publish_retrieval_target()
+        elif self.state == self.PLANNING_RETRIEVAL_APPROACH:
+            if self.pick_path.tick(self.motion_status, self.pickup_status):
+                self.state = self.SETTLING_RETRIEVAL
+                self.retrieval_settle_started = time.monotonic()
+                self.retrieval_settle_after_sequence = self.servo_status_sequence
+                self.retrieval_last_checked_sequence = self.servo_status_sequence
+                self.retrieval_converged_samples = 0
         elif self.state == self.PLANNING_RETRIEVAL:
             if not self._motion_matches():
                 return
@@ -1375,9 +1608,14 @@ class StagingSlots(Node):
             if pickup_state == 'FAULT':
                 self._fault(self.pickup_status.get('fault', 'slot pickup failed'))
             elif pickup_state == 'SUCCEEDED':
+                if not self.scene_status.get('attached_item_id'):
+                    return  # Grasp success must be accompanied by attachment.
                 slot = self.active_slot
                 self.occupied.pop(slot, None)
-                self._begin_observation()
+                if getattr(self, 'return_to_observation', True):
+                    self._begin_observation()
+                else:
+                    self._finish_operation()
         elif self.state == self.PLANNING_OBSERVATION:
             if not self._motion_matches():
                 return
@@ -1392,6 +1630,9 @@ class StagingSlots(Node):
 
     def _tick_store_transfer(self):
         phase = self.store_transfer_phase
+        if phase in ('continuous', 'continuous_accepting'):
+            self._tick_store_continuous_transfer()
+            return
         if phase in ('direct_starting', 'direct_executing'):
             if int(self.pickup_status.get('operation_id', -1)) < int(
                     self.expected_store_transfer_operation_id or 0):
@@ -1517,13 +1758,15 @@ class StagingSlots(Node):
             return
         if not self._settle_tcp(snapshot, 'retrieval pre-pick'):
             return
-        if not self.start_pickup.service_is_ready():
+        client = (self.start_pickup if getattr(self, 'return_to_observation', True)
+                  else self.start_pickup_hold)
+        if not client.service_is_ready():
             self._fault('pickup supervisor service is unavailable')
             return
         self.state = self.PICKING_RETRIEVAL
         self.expected_pickup_operation_id = int(
             self.pickup_status.get('operation_id', 0)) + 1
-        future = self.start_pickup.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(self._request_accepted)
 
     @staticmethod
@@ -1545,6 +1788,10 @@ class StagingSlots(Node):
             *(value * 1000.0 for value in errors))
 
     def _fault(self, reason):
+        if getattr(self, 'abort_latched', False):
+            return
+        if hasattr(self, 'pick_path'):
+            self.pick_path.cancel(stop=True)
         if self.state == self.FAULT:
             return
         self.motion_queue = []
@@ -1581,6 +1828,7 @@ class StagingSlots(Node):
             response.message = f'cannot reset while active in {self.state}'
             return response
         self.state = self.IDLE
+        self.abort_latched = False
         self.operation = ''
         self.fault = ''
         self.pending_fault = ''
@@ -1597,6 +1845,33 @@ class StagingSlots(Node):
         self.publish_status()
         return response
 
+    def abort_callback(self, _request, response):
+        if self.state not in self.ACTIVE:
+            response.message = 'no active staging operation'
+            return response
+        # Do not restore/activate controllers automatically after an abort.
+        # In particular, no late callback may schedule the next direct move.
+        self.abort_latched = True
+        self.motion_queue = []
+        self.ik_targets = []
+        self.ik_solutions = []
+        self.motion_pending = False
+        self.pick_path.cancel(stop=True)
+        for name in ('_one_shot_timer', '_staging_place_timer', '_store_transfer_timer'):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.cancel()
+        self._clear_mode_wait()
+        self._final_fault('staging aborted; occupied records retained; reconcile physical item')
+        for client in (self.abort_supervisor, self.cancel_motion):
+            if client.service_is_ready():
+                client.call_async(Trigger.Request())
+        if self.set_state.service_is_ready():
+            self.set_state.call_async(SetInt16.Request(data=3))
+        response.success = True
+        response.message = 'staging stop requested; no release or automatic retreat'
+        return response
+
     def publish_status(self):
         message = String()
         message.data = json.dumps({
@@ -1606,6 +1881,10 @@ class StagingSlots(Node):
             'last_result': self.last_result,
             'selected_store_slot': self.selected_store_slot,
             'selected_retrieve_slot': self.selected_retrieve_slot,
+            'inspection_enabled': getattr(self, 'inspection_enabled', False),
+            'inspection_backoff_mm': getattr(self, 'inspection_backoff', .1)*1000,
+            'inspection_progress': (getattr(self, 'inspection_reason', '')
+                                    if self.state == self.INSPECTION_DEPTH else ''),
             'transfer_item_bottom_above_pallet_mm': (
                 self.transfer_item_bottom_above_pallet * 1000.0),
             'return_to_observation': self.return_to_observation,
@@ -1620,6 +1899,12 @@ class StagingSlots(Node):
                     'item_id': (
                         self.occupied[index]['item_id']
                         if index in self.occupied else ''),
+                    'obstacle_id': (
+                        self.occupied[index].get('placed_obstacle_id', '')
+                        if index in self.occupied else ''),
+                    'size_m': (
+                        list(self.occupied[index]['size'])
+                        if index in self.occupied else None),
                 }
                 for index, corner in enumerate(self.slots)
             ],

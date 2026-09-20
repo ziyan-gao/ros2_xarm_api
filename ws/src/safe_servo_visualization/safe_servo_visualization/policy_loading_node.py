@@ -22,6 +22,11 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from xarm_msgs.srv import SetInt16
 
 from .random_stable_loading_node import RandomStableLoadingNode
+from .pick_place_workflow import pick_and_place
+from .pick_path_client import PickPathClient
+from .pallet_item_record import pallet_record, retrieval_values
+from .policy_result_recorder import PolicyResultRecorder
+from packing.real_platform_policy_config import PolicyGeometryConfig
 
 
 class PolicyLoadingNode(RandomStableLoadingNode):
@@ -47,6 +52,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
 
     def __init__(self):
         super().__init__()
+        self.result_recorder = PolicyResultRecorder(
+            self.result_directory, self.result_config)
+        self.loader.planning_observer = self._record_result
+        self.get_logger().info(f'Policy results JSON: {self.result_recorder.path}')
         self.declare_parameter('pallet_unpack_approach_height_m', 0.47)
         self.declare_parameter('simulation_enabled', False)
         self.declare_parameter('simulation_fixed_descent_m', 0.030)
@@ -54,8 +63,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.declare_parameter('simulation_incoming_x_m', 0.35)
         self.declare_parameter('simulation_incoming_y_m', 0.0)
         self.declare_parameter('simulation_support_z_m', 0.0)
-        self.pallet_unpack_approach_height = float(
-            self.get_parameter('pallet_unpack_approach_height_m').value)
+        self.pallet_unpack_approach_height = max(float(
+            self.get_parameter('pallet_unpack_approach_height_m').value),
+            self.transfer_corner_height)
         minimum_approach_height = self.loader.container_size[2] / 1000.0 + 0.02
         if (self.pallet_unpack_approach_height <
                 minimum_approach_height - 1e-9):
@@ -70,6 +80,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.place_status = {}
         self.staging_status = {}
         self.holding_slots = {}
+        self.pallet_records = {}
         self.placed_obstacle_ids = {}
         self.active_operation = None
         self.active_slot = None
@@ -148,15 +159,22 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.execute_motion_client = self.create_client(
             Trigger, '/motion_coordinator/execute')
         self.start_supervisor_pick_client = self.create_client(
-            Trigger, '/pickup_supervisor/start')
+            Trigger, '/pickup_supervisor/start_for_transport')
+        self.pick_path = PickPathClient(self, self._set_fault)
         self.start_place_client = self.create_client(
-            Trigger, '/place_pipeline/start')
+            Trigger, '/place_pipeline/start_continuous_chained')
+        self.start_place_return_client = self.create_client(
+            Trigger, '/place_pipeline/start_continuous')
+        self.pick_place_chained_client = self.create_client(
+            Trigger, '/pick_place_pipeline/start_chained')
         self.abort_place_client = self.create_client(
             Trigger, '/place_pipeline/abort')
         self.staging_store_client = self.create_client(
             Trigger, '/staging_slots/store_chained')
+        self.staging_store_return_client = self.create_client(
+            Trigger, '/staging_slots/store')
         self.staging_retrieve_client = self.create_client(
-            Trigger, '/staging_slots/retrieve')
+            Trigger, '/staging_slots/retrieve_chained')
         self.remove_placed_obstacle_client = self.create_client(
             SetInt16, '/planning_scene_obstacles/remove_placed_item')
         self.simulation_ik_client = self.create_client(
@@ -180,6 +198,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
 
     def plan_only_callback(self, _request, response):
         """Estimate the item and publish a policy target without grasping it."""
+        issue = self._empty_inventory_conflict()
+        if issue:
+            response.success, response.message = False, issue
+            return response
         if self.simulation_enabled:
             if self.state != 'IDLE' or self.loader.pending is not None:
                 response.message = (
@@ -237,8 +259,27 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             OmegaConf.load(config_path), resolve=True)
         if not isinstance(config, dict):
             raise TypeError(f'policy config must be a mapping: {config_path}')
+        geometry = PolicyGeometryConfig.from_mapping(config)
+        # YAML is authoritative, including when an old launch still passes 20.
+        clearance_result = self.set_parameters([
+            rclpy.parameter.Parameter('clearance_mm', value=geometry.clearance_mm),
+        ])[0]
+        if not clearance_result.successful:
+            raise ValueError('could not apply policy YAML clearance: ' + clearance_result.reason)
+        config = dict(config, effective_clearance_mm=geometry.clearance_mm,
+                      effective_xy_resolution_mm=geometry.xy_resolution_mm)
+        self.result_config = config
+        result_directory = Path(str(config.get('results_directory', 'results/policy_loading'))).expanduser()
+        self.result_directory = (result_directory if result_directory.is_absolute()
+                                 else config_path.parent.parent / result_directory)
         container_size = self._configured_container_size(
             config, fallback=container_size)
+        transfer_height = self._configured_transfer_height(config, container_size)
+        height_result = self.set_parameters([
+            rclpy.parameter.Parameter('transfer_corner_height_m', value=transfer_height),
+        ])[0]
+        if not height_result.successful:
+            raise ValueError('could not apply policy transfer height: ' + height_result.reason)
         self.rearrangement_enabled = bool(
             config.get('enable_rearrangement', False))
         checkpoint = Path(str(config['checkpoint'])).expanduser()
@@ -255,6 +296,14 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         # declaring it again in this derived node.
         configured_height_tolerance = float(
             config.get('height_tolerance', 0.0))
+        configured_com_bound_ratio = float(config.get('com_bound_ratio', 0.2))
+        if not 0.0 < configured_com_bound_ratio <= 1.0:
+            raise ValueError('policy com_bound_ratio must be in (0, 1]')
+        com_result = self.set_parameters([
+            rclpy.parameter.Parameter('com_bound_ratio', value=configured_com_bound_ratio),
+        ])[0]
+        if not com_result.successful:
+            raise ValueError('could not apply policy com_bound_ratio: ' + com_result.reason)
         result = self.set_parameters([
             rclpy.parameter.Parameter(
                 'height_tolerance', value=configured_height_tolerance),
@@ -288,10 +337,12 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.declare_parameter(
             'target_util', float(config.get('target_util', 0.7)))
         return RealPlatformPolicyLoader(
+            com_bound_ratio=configured_com_bound_ratio,
             checkpoint_path=str(self.get_parameter('checkpoint_path').value),
             device=str(self.get_parameter('policy_device').value),
             container_size=container_size,
-            clearance_mm=int(self.get_parameter('clearance_mm').value),
+            clearance_mm=geometry.clearance_mm,
+            xy_resolution_mm=geometry.xy_resolution_mm,
             height_tolerance=float(
                 self.get_parameter('height_tolerance').value),
             seed=int(self.get_parameter('seed').value),
@@ -316,6 +367,13 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         )
 
     @staticmethod
+    def _configured_transfer_height(config, container_size):
+        margin = float(config.get('transfer_clearance_mm', 20.0))
+        if not math.isfinite(margin) or margin < 20.0:
+            raise ValueError('policy transfer_clearance_mm must be finite and at least 20 mm')
+        return (float(container_size[2]) + margin) / 1000.0
+
+    @staticmethod
     def _configured_container_size(config, fallback):
         values = config.get('container_size', fallback)
         try:
@@ -333,11 +391,12 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         del container_size
         self.get_logger().info(
             'policy loading ready: container=%s mm, MCTS/A*=%s, '
-            'clearance=%d mm, height_tolerance=%.1f mm, checkpoint=%s, '
+            'clearance=%d mm, XY resolution=%d mm, height_tolerance=%.1f mm, checkpoint=%s, '
             'device=%s' % (
                 self.loader.container_size,
                 self.rearrangement_enabled,
                 self.loader.clearance_mm,
+                self.loader.xy_resolution_mm,
                 self.loader.height_tolerance,
                 self.loader.checkpoint_path,
                 getattr(self.loader.agent, 'device', self.loader.device),
@@ -743,12 +802,19 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self._set_fault(
                 f'simulated motion {label!r} has invalid completion action')
 
-    def _plan_item(self, *, item_id, dimensions_mm):
+    def _plan_item(self, *, item_id, dimensions_mm, measured_dimensions_mm=None):
+        self._record_result('planning_requested', dict(
+            item_id=int(item_id), dimensions_mm=list(map(float, dimensions_mm)),
+            measured_dimensions_mm=(None if measured_dimensions_mm is None else
+                                    list(map(float, measured_dimensions_mm))),
+            rearrangement_enabled=self.rearrangement_enabled))
         if self.rearrangement_enabled:
             return self.loader.plan_with_rearrangement(
-                item_id=item_id, dimensions_mm=dimensions_mm)
-        return super()._plan_item(
-            item_id=item_id, dimensions_mm=dimensions_mm)
+                item_id=item_id, dimensions_mm=dimensions_mm,
+                measured_dimensions_mm=measured_dimensions_mm)
+        return self.loader.plan(
+            item_id=item_id, dimensions_mm=dimensions_mm,
+            measured_dimensions_mm=measured_dimensions_mm)
 
     def _accept_planning_result(self, pending):
         if not isinstance(pending, PendingPhysicalOperation):
@@ -773,6 +839,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self._begin_rearrangement_operation()
 
     def start_loading_callback(self, request, response):
+        issue = self._empty_inventory_conflict()
+        if issue:
+            response.success, response.message = False, issue
+            return response
         if self.state == 'PLAN_READY' and self.loader.rearrangement is not None:
             self.rearrangement_auto_execute = True
             self.continuous_run_active = self.continuous_loading_enabled
@@ -822,12 +892,34 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         return super()._discard_object_info_at_contact()
 
     def _start_continuous_localization(self):
+        issue = self._empty_inventory_conflict()
+        if issue:
+            self._set_fault(issue)
+            return
         if not self.simulation_enabled:
             return super()._start_continuous_localization()
         try:
             self._sample_cardboard_simulation_item(auto_start=True)
         except (RuntimeError, TypeError, ValueError) as exc:
             self._set_fault(f'cardboard simulation sampling failed: {exc}')
+
+    def _empty_inventory_conflict(self):
+        """Do not plan an empty pallet over known scene objects after a reset.
+
+        This is a consistency guard, not physical inventory reconstruction.
+        Buffered objects in an active rearrangement are handled by its ledger.
+        """
+        if getattr(self, 'simulation_enabled', False):
+            return ''
+        scene = getattr(self, 'scene_status', {})
+        ids = set(scene.get('placed_item_ids') or []).union(
+            scene.get('placed_item_visual_ids') or [])
+        env = getattr(self.loader, 'env', None)
+        if env is not None and not env.container.placed_items and ids:
+            return ('policy pallet inventory is empty but the scene contains placed items: '
+                    + ', '.join(sorted(ids)) +
+                    '; reconcile physical pallet, policy and scene before starting')
+        return ''
 
     def target_applied_callback(self, message):
         operation = self.active_operation
@@ -848,6 +940,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self._finish_rearrangement_plan()
             return
         self.active_operation = operation
+        self.workflow = self._operation_workflow(operation)
         self.target_acknowledged = False
         self.placed_ids_before_operation = self._scene_placed_item_ids()
         self.last_result = (
@@ -866,20 +959,20 @@ class PolicyLoadingNode(RandomStableLoadingNode):
                 completion='rearrangement',
                 label=f'{operation.kind} from {operation.source}')
             return
-        # Object-info estimation leaves the TCP at contact. Before an unpack
-        # or holding-item operation, retreat without grasping; the incoming
-        # item will be re-estimated when its pack operation is reached.
-        if (operation.source != 'incoming' and
-                self.pickup_status.get('state') == 'OBJECT_INFO_READY'):
-            if not self.object_info_discard_client.service_is_ready():
-                self._set_fault('object-info retreat service is unavailable')
-                return
-            self.state = 'REARRANGE_RETREAT_INCOMING'
-            future = self.object_info_discard_client.call_async(Trigger.Request())
-            future.add_done_callback(
-                lambda done: self._service_response(done, 'object-info retreat'))
-            return
+        # Known-source pick_waypoints lifts directly away from contact. Do
+        # not send the old discard/observation detour before unpack/retrieve.
         self._prepare_rearrangement_operation(operation)
+
+    @staticmethod
+    def _operation_workflow(operation):
+        source = 'slot' if operation.source == 'holding' else operation.source
+        # Known sources resolve their recorded geometry through existing adapters.
+        return pick_and_place(
+            source, 'slot' if operation.kind == 'unpack' else 'pallet',
+            pre_pick_pose=operation.source_item if source != 'incoming' else None,
+            # Slot stores finish at a raised handoff, not at observation.
+            return_to_observation=(operation.kind != 'unpack' and
+                                   operation.step_index + 1 == operation.step_count))
 
     def _prepare_rearrangement_operation(self, operation):
         if operation.has_target:
@@ -901,13 +994,16 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self._set_fault(f'unsupported operation source {operation.source!r}')
 
     def _start_incoming_operation(self):
-        if not self.pick_place_client.service_is_ready():
+        workflow = getattr(self, 'workflow', None)
+        client = (self.pick_place_chained_client if workflow is not None and
+                  not workflow.return_to_observation else self.pick_place_client)
+        if not client.service_is_ready():
             self._set_fault('PickAndPlace service is unavailable')
             return
         self.expected_pipeline_operation_id = int(
             self.pipeline_status.get('operation_id', 0)) + 1
         self.state = 'REARRANGE_INCOMING'
-        future = self.pick_place_client.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(
             lambda done: self._service_response(done, 'incoming PickAndPlace'))
 
@@ -996,45 +1092,20 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             1.0 - 2.0 * (y*y + z*z))
 
     def _pallet_item_retrieval_message(self, operation):
-        item = operation.source_item
+        record = self.pallet_records.get(self._item_key(operation.source_item))
+        if record is None:
+            raise ValueError('missing physical pallet placement record; reconcile inventory before unpack/repack')
         try:
             transform = self.tf_buffer.lookup_transform(
                 'link_base', 'pallet_frame', rclpy.time.Time())
         except TransformException as exc:
             raise ValueError(f'live pallet transform is unavailable: {exc}')
-        translation = transform.transform.translation
-        rotation = transform.transform.rotation
-        pallet_q = (rotation.x, rotation.y, rotation.z, rotation.w)
-        local_top_center = (
-            (item.FLB.x + item.Dim.dx / 2.0) / 1000.0,
-            (item.FLB.y + item.Dim.dy / 2.0) / 1000.0,
-            (item.FLB.z + item.Dim.dz) / 1000.0,
-        )
-        offset = self._quat_rotate(local_top_center, pallet_q)
-        local_approach = (
-            local_top_center[0],
-            local_top_center[1],
-            self.pallet_unpack_approach_height,
-        )
-        approach_offset = self._quat_rotate(local_approach, pallet_q)
-        center = (
-            translation.x + offset[0],
-            translation.y + offset[1],
-            translation.z + offset[2],
-        )
-        yaw = self._yaw_from_quaternion(pallet_q)
+        t = transform.transform.translation
+        q = transform.transform.rotation
         message = Float64MultiArray()
-        message.data = [
-            float(operation.sequence_id),
-            center[0], center[1], center[2],
-            math.pi, 0.0, yaw,
-            item.Dim.dx / 1000.0,
-            item.Dim.dy / 1000.0,
-            item.Dim.dz / 1000.0,
-            0.030,
-            yaw,
-            translation.z + approach_offset[2],
-        ]
+        message.data = retrieval_values(
+            record, operation.sequence_id, (t.x, t.y, t.z),
+            (q.x, q.y, q.z, q.w), self.pallet_unpack_approach_height)
         return message
 
     def _publish_pallet_retrieval_target(self, operation):
@@ -1047,9 +1118,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.state = 'REARRANGE_PLAN_APPROACH'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
+        self.pick_path.reset(self.expected_motion_operation_id)
         self._defer_service(
-            self.plan_retrieval_approach_client,
-            'above-container pallet approach planning')
+            self.pick_path.prepare, 'known-item pickup-path preparation')
 
     def _plan_pallet_pregrasp(self, operation):
         try:
@@ -1068,9 +1139,13 @@ class PolicyLoadingNode(RandomStableLoadingNode):
 
     def _defer_service(self, client, label, delay=0.15):
         holder = {}
+        expected_state = self.state
+        expected_operation = self.active_operation
 
         def invoke():
             holder['timer'].cancel()
+            if self.state != expected_state or self.active_operation is not expected_operation:
+                return
             if not client.service_is_ready():
                 self._set_fault(f'{label} service is unavailable')
                 return
@@ -1107,16 +1182,22 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.staging_store_selection_pub.publish(Int32(data=slot))
         self.state = 'REARRANGE_STORE'
         self.staging_seen_active = False
-        self._defer_service(self.staging_store_client, 'staging store')
+        workflow = getattr(self, 'workflow', None)
+        client = (self.staging_store_return_client if workflow is not None and
+                  workflow.return_to_observation else self.staging_store_client)
+        self._defer_service(client, 'staging store')
 
     def _start_place_only(self):
-        if not self.start_place_client.service_is_ready():
+        workflow = getattr(self, 'workflow', None)
+        client = (self.start_place_return_client if workflow is not None and
+                  workflow.return_to_observation else self.start_place_client)
+        if not client.service_is_ready():
             self._set_fault('place pipeline service is unavailable')
             return
         self.expected_place_operation_id = int(
             self.place_status.get('operation_id', 0)) + 1
         self.state = 'REARRANGE_PLACE'
-        future = self.start_place_client.call_async(Trigger.Request())
+        future = client.call_async(Trigger.Request())
         future.add_done_callback(
             lambda done: self._service_response(done, 'rearrangement place'))
 
@@ -1179,18 +1260,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
                     'timed out waiting for the source pallet obstacle to be removed')
             return
         if self.state == 'REARRANGE_PLAN_APPROACH':
-            if not self._motion_is_current():
-                return
-            motion_state = self.motion_status.get('state')
-            if motion_state == 'FAULT':
-                self._set_fault(self.motion_status.get(
-                    'fault', 'above-container pallet approach planning failed'))
-            elif motion_state == 'PLANNED':
-                self.state = 'REARRANGE_EXECUTE_APPROACH'
-                self.execute_motion_client.call_async(
-                    Trigger.Request()).add_done_callback(
-                        lambda done: self._service_response(
-                            done, 'above-container pallet approach execution'))
+            if self.pick_path.tick(self.motion_status, self.supervisor_status):
+                self.pick_path_ready_at = time.monotonic()
+                self.state = 'REARRANGE_EXECUTE_PICK'
             return
         if self.state == 'REARRANGE_EXECUTE_APPROACH':
             if not self._motion_is_current():
@@ -1216,6 +1288,8 @@ class PolicyLoadingNode(RandomStableLoadingNode):
                         done, 'pallet pre-pick execution'))
             return
         if self.state == 'REARRANGE_EXECUTE_PICK':
+            if time.monotonic()-getattr(self, 'pick_path_ready_at', 0.) < .75:
+                return  # Allow fresh TCP telemetry before guarded contact.
             if not self._motion_is_current():
                 return
             motion_state = self.motion_status.get('state')
@@ -1303,6 +1377,8 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         target_key = (
             None if operation.target_box is None else
             self._item_key(operation.target_box))
+        if target_key is not None and not self._save_pallet_record(target_key, operation.target_values):
+            return
         try:
             complete = self.loader.commit_current_operation(
                 operation.sequence_id)
@@ -1312,16 +1388,24 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             return
         if operation.kind == 'unpack':
             self.holding_slots[source_key] = int(self.active_slot)
+            self.pallet_records.pop(source_key, None)
             self.placed_obstacle_ids.pop(source_key, None)
         elif operation.source == 'holding':
             self.holding_slots.pop(source_key, None)
             self.pending_obstacle_key = target_key
         elif operation.kind == 'repack':
+            if source_key != target_key:
+                self.pallet_records.pop(source_key, None)
             self.placed_obstacle_ids.pop(source_key, None)
             self.pending_obstacle_key = target_key
         else:
             self.pending_obstacle_key = target_key
         self._update_pending_obstacle_mapping()
+        self._record_result('operation_completed', dict(
+            operation=operation.kind, source=operation.source,
+            item_id=int(operation.item_id), sequence_id=int(operation.sequence_id),
+            slot=self.active_slot,
+            target_values=(list(operation.target_values) if operation.has_target else None)))
         self._push_visualization(
             f'Completed operation {operation.step_index + 1}/'
             f'{operation.step_count}: {operation.kind}')
@@ -1370,12 +1454,39 @@ class PolicyLoadingNode(RandomStableLoadingNode):
     def _commit_succeeded_pick_place(self):
         pending = self.loader.pending
         target_key = None if pending is None else self._item_key(pending.box)
+        if target_key is not None and not self._save_pallet_record(target_key, pending.target_values):
+            return
         super()._commit_succeeded_pick_place()
         if target_key is not None and self.state != 'FAULT':
+            self._record_result('operation_completed', dict(
+                operation='pack', source='incoming', item_id=int(pending.item_id),
+                sequence_id=int(pending.sequence_id), target_values=list(pending.target_values)))
             self.pending_obstacle_key = target_key
             self._update_pending_obstacle_mapping()
 
+    def _save_pallet_record(self, key, values):
+        if getattr(self, 'simulation_enabled', False):
+            return True
+        rpy = self.supervisor_status.get('pallet_release_rpy_rad')
+        if (not isinstance(rpy, (list, tuple)) or len(rpy) != 3 or
+                not all(math.isfinite(float(v)) for v in rpy)):
+            self._set_fault('placement completed but release TCP orientation is missing; reconcile before continuing')
+            return False
+        record = pallet_record(values)
+        record['release_tcp_rpy_rad'] = list(map(float, rpy))
+        self.pallet_records[key] = record
+        return True
+
+    def _set_fault(self, reason):
+        self._record_result('fault', {'reason': str(reason)})
+        if hasattr(self, 'pick_path'):
+            self.pick_path.cancel(stop=True)
+        return super()._set_fault(reason)
+
     def abort_loading_callback(self, request, response):
+        self._record_result('abort_requested', {})
+        if hasattr(self, 'pick_path'):
+            self.pick_path.cancel()
         if self.state == 'SIMULATING':
             pending = self.loader.pending
             rearrangement = self.loader.rearrangement
@@ -1453,6 +1564,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
                     f'cannot reset policy simulation in {self.state}')
                 return response
             self.loader.reset()
+            self._record_result('pallet_reset', {})
             self.state = 'IDLE'
             self.fault = ''
             self.last_result = 'policy simulation and virtual pallet cleared'
@@ -1465,6 +1577,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self.target_acknowledged = False
             self.expected_pipeline_operation_id = None
             self.holding_slots.clear()
+            self.pallet_records.clear()
             self.placed_obstacle_ids.clear()
             self.active_operation = None
             self.active_slot = None
@@ -1485,7 +1598,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             return response
         result = super().reset_pallet_callback(request, response)
         if result.success:
+            self._record_result('pallet_reset', {})
             self.holding_slots.clear()
+            self.pallet_records.clear()
             self.placed_obstacle_ids.clear()
             self.active_operation = None
             self.active_slot = None
@@ -1494,6 +1609,23 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self.simulation_seed_initialized = False
             self.simulation_home_positions = None
         return result
+
+    def _record_result(self, kind, details):
+        recorder = getattr(self, 'result_recorder', None)
+        if recorder is None:
+            return
+        container = self.loader.env.container
+        summary = dict(packed_item_count=len(container.placed_items),
+                       buffered_item_count=len(container.holding_list),
+                       utilization_measured=getattr(container, 'measured_utilization', None),
+                       utilization_planning=float(container.utilization),
+                       utilization_including_clearance=float(container.virtual_utilization))
+        try:
+            recorder.append(kind, dict(details, simulation=bool(
+                getattr(self, 'simulation_enabled', False)), snapshot=summary), summary)
+        except Exception as exc:
+            # Never interrupt a robot operation or retry it because disk recording failed.
+            self.get_logger().error(f'Policy result recording failed: {exc}')
 
     def _log_pending(self, pending):
         self.get_logger().info(
@@ -1521,6 +1653,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             'selection_pipeline': (
                 'learned_policy_with_mcts_astar'
                 if rearrangement_enabled else 'learned_policy_only'),
+            'container_size_mm': list(map(int, self.loader.container_size)),
+            'transfer_corner_height_m': max(
+                self.loader.container_size[2]/1000.0 + .02,
+                getattr(self, 'pallet_unpack_approach_height', 0.0)),
             'rearrangement_enabled': rearrangement_enabled,
             'mcts_enabled': rearrangement_enabled,
             'astar_enabled': bool(
@@ -1529,8 +1665,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             'checkpoint': str(self.loader.checkpoint_path),
             'device': str(getattr(self.loader.agent, 'device', self.loader.device)),
             'clearance_mm': int(self.loader.clearance_mm),
+            'xy_resolution_mm': int(self.loader.xy_resolution_mm),
             'height_tolerance_mm': float(getattr(
                 self.loader, 'height_tolerance', 0.0)),
+            'com_bound_ratio': float(getattr(self.loader, 'com_bound_ratio', 0.2)),
             'holding_slots': {
                 ','.join(map(str, key)): int(slot)
                 for key, slot in getattr(self, 'holding_slots', {}).items()

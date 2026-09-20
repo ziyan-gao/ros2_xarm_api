@@ -33,13 +33,17 @@ set -u
 : "${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3:=10.0}"
 : "${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT:=false}"
 : "${RANDOM_LOADING_AUTO_START:=false}"
+: "${PICK_PLACE_TEST_MAX_STEPS:=100}"
+: "${PICK_PLACE_TEST_SEED:=-1}"
 : "${RANDOM_LOADING_CONFIG_PATH:=/opt/neuromeka_bin_packing/configs/real_platform_random.yaml}"
 : "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M:=0.480}"
 : "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
+: "${TRANSPORT_WORKSPACE_Z_MAX_MM:=800.0}"
 : "${RANDOM_LOADING_VISUALIZE:=true}"
 : "${RANDOM_LOADING_VISUAL_PORT:=8765}"
 : "${POLICY_LOADING_CHECKPOINT:=/opt/neuromeka_bin_packing/train_outputs/cardboard_xy_random_clearance20/policy_step.pth}"
 : "${POLICY_LOADING_DEVICE:=cpu}"
+: "${POLICY_LOADING_CONFIG_PATH:=/opt/neuromeka_bin_packing/configs/real_platform_policy.yaml}"
 : "${POLICY_LOADING_VISUALIZE:=true}"
 : "${POLICY_LOADING_VISUAL_PORT:=8766}"
 : "${DEPTH_ONLY_SUPPORT_Z_M:=0.0}"
@@ -106,6 +110,16 @@ RANDOM_LOADING_CONTAINER_ROS="[${RANDOM_LOADING_CONTAINER_CSV//,/, }]"
 echo "Random loading feasibility-map mask: use_fm=${RANDOM_LOADING_USE_FM}"
 echo "Random loading config: container=${RANDOM_LOADING_CONTAINER_ROS} mm, clearance=${RANDOM_LOADING_CLEARANCE_MM} mm (${RANDOM_LOADING_CLEARANCE_MODE}), height tolerance=${RANDOM_LOADING_HEIGHT_TOLERANCE_MM} mm, vertical filter=${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}, transfer corner height=${TRANSFER_CORNER_HEIGHT_M} m"
 
+# Resolve the policy's grid before importing any Neuromeka geometry in that
+# process. Do not export this override to random loading or other ROS nodes.
+policy_geometry_fields="$(python3 -m packing.real_platform_policy_config --config "${POLICY_LOADING_CONFIG_PATH}")"
+IFS=$'\t' read -r POLICY_CLEARANCE_MM POLICY_XY_RESOLUTION_MM <<< "${policy_geometry_fields}"
+if [[ -z "${POLICY_CLEARANCE_MM}" || -z "${POLICY_XY_RESOLUTION_MM}" ]]; then
+  echo "FATAL: policy geometry configuration is incomplete." >&2
+  exit 2
+fi
+echo "Policy config: clearance=${POLICY_CLEARANCE_MM} mm, XY resolution=${POLICY_XY_RESOLUTION_MM} mm"
+
 # A non-real-time controller_manager previously missed tens of Servo-J write
 # cycles and then caught up abruptly.  Refuse to connect to the real robot if
 # the container cannot create a FIFO thread; compose.yaml grants this narrowly
@@ -164,6 +178,10 @@ start_required "MoveIt planning-scene obstacles" \
   ros2 run safe_servo_visualization planning_scene_obstacles
 start_required "six-slot unpacking staging coordinator" \
   ros2 run safe_servo_visualization staging_slots --ros-args \
+    -p slot_inspection_policy_config_path:="${POLICY_LOADING_CONFIG_PATH}" \
+    -p slot_inspection_enabled:="${STAGING_SLOT_INSPECTION_ENABLED:-true}" \
+    -p slot_inspection_backoff_m:="${STAGING_SLOT_INSPECTION_BACKOFF_M:-0.100}" \
+    -p configured_container_clearance_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p transfer_item_bottom_above_pallet_m:="${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M}"
 start_required "pickup pipeline orchestrator" \
   ros2 run safe_servo_visualization pickup_pipeline --ros-args \
@@ -177,6 +195,13 @@ start_required "supervised Phase 4 pickup coordinator" \
   ros2 run safe_servo_visualization pickup_supervisor --ros-args \
     -p continuous_return_enabled:="${CONTINUOUS_RETURN_ENABLED}" \
     -p continuous_transport_blend_radius_m:="${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M}" \
+    -p continuous_transport_alternatives_enabled:="${CONTINUOUS_TRANSPORT_ALTERNATIVES_ENABLED:-true}" \
+    -p transport_moveit_fallback_enabled:="${TRANSPORT_MOVEIT_FALLBACK_ENABLED:-false}" \
+    -p transport_expanded_waypoints_enabled:="${TRANSPORT_EXPANDED_WAYPOINTS_ENABLED:-true}" \
+    -p transport_waypoint_search_timeout_sec:="${TRANSPORT_WAYPOINT_SEARCH_TIMEOUT_SEC:-180.0}" \
+    -p transport_observation_y_offset_mm:="${TRANSPORT_OBSERVATION_Y_OFFSET_MM:-200.0}" \
+    -p raised_pre_place_max_mm:="${RAISED_PRE_PLACE_MAX_MM:-30.0}" \
+    -p raised_pre_pick_max_mm:="${RAISED_PRE_PICK_MAX_MM:-30.0}" \
     -p continuous_transport_max_joint_jerk_rad_s3:="${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3}" \
     -p continuous_transport_enforce_jerk_limit:="${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT}" \
     -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
@@ -194,6 +219,7 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p direct_cartesian_max_acc_mm_s2:="${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2}" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p contact_reference_z_m:="${OBJECT_CONTACT_REFERENCE_Z_M}" \
+    -p transport_workspace_z_max_mm:="${TRANSPORT_WORKSPACE_Z_MAX_MM}" \
     -p place_workspace_z_min_mm:="${PLACE_WORKSPACE_Z_MIN_MM}"
 start_required "MoveIt Servo and guarded vertical bridge (dry_run=${MOVEIT_SERVO_DRY_RUN}, descent_speed=${SERVO_DESCENT_SPEED_M_S}m/s)" \
   ros2 launch safe_servo_package uf850_moveit_servo.launch.py \
@@ -235,14 +261,33 @@ start_required "real-platform random stable-loading coordinator" \
     -p visualization_enabled:="${RANDOM_LOADING_VISUALIZE}" \
     -p visualization_port:="${RANDOM_LOADING_VISUAL_PORT}"
 start_required "real-platform learned-policy coordinator" \
+  env NEUROMEKA_XY_RESOLUTION_MM="${POLICY_XY_RESOLUTION_MM}" \
   ros2 run safe_servo_visualization policy_loading --ros-args \
+    -p policy_config_path:="${POLICY_LOADING_CONFIG_PATH}" \
     -p packing_height_resolution_mm:=5 \
-    -p clearance_mm:=20 \
     -p checkpoint_path:="${POLICY_LOADING_CHECKPOINT}" \
     -p policy_device:="${POLICY_LOADING_DEVICE}" \
     -p auto_start_pick_place:=false \
     -p visualization_enabled:="${POLICY_LOADING_VISUALIZE}" \
     -p visualization_port:="${POLICY_LOADING_VISUAL_PORT}"
+
+# Inert until an explicit test-panel button is pressed. Uses the same random
+# loading geometry configuration, without changing either loader's inventory.
+start_required "single-item pack/unpack/repack test coordinator" \
+  ros2 run safe_servo_visualization pick_place_test --ros-args \
+    -p random_test_max_steps:="${PICK_PLACE_TEST_MAX_STEPS}" \
+    -p random_test_seed:="${PICK_PLACE_TEST_SEED}" \
+    -p container_size_mm:="${RANDOM_LOADING_CONTAINER_ROS}" \
+    -p packing_height_resolution_mm:="${RANDOM_LOADING_HEIGHT_RESOLUTION_MM}" \
+    -p clearance_mm:="${RANDOM_LOADING_CLEARANCE_MM}" \
+    -p clearance_mode:="${RANDOM_LOADING_CLEARANCE_MODE}" \
+    -p seed:="${RANDOM_LOADING_SEED}" \
+    -p scan_downscale:="${RANDOM_LOADING_SCAN_DOWNSCALE}" \
+    -p com_bound_ratio:="${RANDOM_LOADING_COM_BOUND_RATIO}" \
+    -p height_tolerance:="${RANDOM_LOADING_HEIGHT_TOLERANCE_MM}" \
+    -p use_fm:="${RANDOM_LOADING_USE_FM}" \
+    -p vertical_loading_filter_enabled:="${RANDOM_LOADING_VERTICAL_FILTER_ENABLED}" \
+    -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}"
 
 echo "Unified stack is running; MoveIt is the sole motion owner."
 echo "Direct-SDK safe servo is disabled; guarded descent uses the real MoveIt Servo bridge."

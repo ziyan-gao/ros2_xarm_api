@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from .pick_place_workflow import pick_and_place
 
 
 class PickPlacePipeline(Node):
@@ -32,9 +33,11 @@ class PickPlacePipeline(Node):
         self.reset_pickup = self.create_client(Trigger, '/pickup_pipeline/reset')
         self.start_place = self.create_client(Trigger, '/place_pipeline/start')
         self.start_continuous_place = self.create_client(Trigger, '/place_pipeline/start_continuous')
+        self.start_chained_place = self.create_client(Trigger, '/place_pipeline/start_continuous_chained')
         self.abort_place = self.create_client(Trigger, '/place_pipeline/abort')
         self.reset_place = self.create_client(Trigger, '/place_pipeline/reset')
         self.create_service(Trigger, '/pick_place_pipeline/start', self.start)
+        self.create_service(Trigger, '/pick_place_pipeline/start_chained', self.start_chained)
         self.create_service(
             Trigger, '/pick_place_pipeline/retry_place', self.retry_place)
         self.create_service(
@@ -58,14 +61,19 @@ class PickPlacePipeline(Node):
     def start(self, _request, response):
         return self._start(response, pick_only=False)
 
+    def start_chained(self, _request, response):
+        return self._start(response, pick_only=False, return_to_observation=False)
+
     def start_pick_only(self, _request, response):
         return self._start(response, pick_only=True)
 
-    def _start(self, response, pick_only):
+    def _start(self, response, pick_only, return_to_observation=True):
         if self.state in self.ACTIVE:
             response.message = f'PickAndPlace already active in {self.state}'
             return response
-        self.use_continuous = getattr(self, 'continuous_transport', False) and not pick_only
+        self.workflow = pick_and_place('incoming', 'pallet', return_to_observation=return_to_observation)
+        self.use_continuous = (getattr(self, 'continuous_transport', False) or
+                               not return_to_observation) and not pick_only
         pickup_client = self.start_pickup_hold if self.use_continuous else self.start_pickup
         if not pickup_client.service_is_ready():
             response.message = 'pickup pipeline is unavailable'
@@ -89,7 +97,7 @@ class PickPlacePipeline(Node):
                 not self.fault.startswith('KINEMATIC_REJECTED:')):
             response.message = 'retry requires a pre-motion kinematic rejection'
             return response
-        client = self.start_continuous_place if getattr(self, 'use_continuous', False) else self.start_place
+        client = self._placement_client()
         if not client.service_is_ready():
             response.message = 'place pipeline is unavailable'
             return response
@@ -114,6 +122,14 @@ class PickPlacePipeline(Node):
             self._fault(f'{label} start rejected: '
                         f'{"no response" if result is None else result.message}')
 
+    def _placement_client(self):
+        if not getattr(self, 'use_continuous', False):
+            return self.start_place
+        workflow = getattr(self, 'workflow', None)
+        if workflow is not None and not workflow.return_to_observation:
+            return self.start_chained_place
+        return self.start_continuous_place
+
     def tick(self):
         if self.state not in self.ACTIVE or self.state == 'ABORTING':
             return
@@ -130,7 +146,7 @@ class PickPlacePipeline(Node):
             if self.pick_only:
                 self.state = 'SUCCEEDED'
                 return
-            client = self.start_continuous_place if getattr(self, 'use_continuous', False) else self.start_place
+            client = self._placement_client()
             if not client.service_is_ready():
                 self._fault('place pipeline is unavailable')
                 return

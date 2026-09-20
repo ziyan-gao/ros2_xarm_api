@@ -1,0 +1,192 @@
+diff --git a/include/xarm/core/instruction/uxbus_cmd.h b/include/xarm/core/instruction/uxbus_cmd.h
+index ca6e681..4ba2569 100644
+--- a/include/xarm/core/instruction/uxbus_cmd.h
++++ b/include/xarm/core/instruction/uxbus_cmd.h
+@@ -15,6 +15,7 @@
+ #include <thread>
+ #include <chrono>
+ #include <mutex>
++#include <atomic>
+ #include <iostream>
+ #include <vector>
+ #include <functional>
+@@ -352,6 +353,9 @@ protected:
+ 
+ private:
+   int G_TOUT_ = UXBUS_CONF::GET_TIMEOUT;
++  // A timed-out motion request must never be followed by catch-up Servo-J
++  // commands on this SDK instance. Reconnect/mode changes do not reset it.
++  std::atomic<bool> servo_write_fault_latched_{false};
+   int S_TOUT_ = UXBUS_CONF::SET_TIMEOUT;
+ 
+   long long last_modbus_comm_us_;
+diff --git a/src/xarm/core/instruction/uxbus_cmd.cc b/src/xarm/core/instruction/uxbus_cmd.cc
+index e9d6950..352c57a 100644
+--- a/src/xarm/core/instruction/uxbus_cmd.cc
++++ b/src/xarm/core/instruction/uxbus_cmd.cc
+@@ -573,12 +573,52 @@ int UxbusCmd::move_gohome(float mvvelo, float mvacc, float mvtime, unsigned char
+ }
+ 
+ int UxbusCmd::move_servoj(float mvjoint[7], float mvvelo, float mvacc, float mvtime) {
++  if (servo_write_fault_latched_.load()) return UXBUS_STATE::ERR_TOUT;
++  // Streaming targets have a short lifetime, unlike queued pose commands.
++  // The driver still owns STOP and lifecycle recovery; do not retry here.
++  const long long started = get_us();
++  const long long deadline = started + 50000;  // 50 ms total, not per phase
++  long long lock_us = 0, send_us = 0, reply_us = 0;
++  std::unique_lock<std::mutex> locker(mutex_, std::defer_lock);
++  auto finish = [&](int code, const char *phase) {
++    const long long total_us = get_us() - started;
++    if (total_us >= 50000 && (code == 0 || code == UXBUS_STATE::WAR_CODE))
++      code = UXBUS_STATE::ERR_TOUT;
++    const bool failed = code != 0 && code != UXBUS_STATE::WAR_CODE;
++    if (failed) servo_write_fault_latched_.store(true);
++    if (locker.owns_lock()) locker.unlock();
++    if (failed || total_us > 30000) {
++      XARM_LOG_ERROR("Servo-J bounded write: phase=%s ret=%d lock_us=%lld send_us=%lld reply_us=%lld total_us=%lld budget_us=50000 latched=%d\n",
++                     phase, code, lock_us, send_us, reply_us, total_us, failed);
++    }
++    return code;
++  };
++  while (!locker.try_lock()) {
++    lock_us = get_us() - started;
++    if (lock_us >= 5000) return finish(UXBUS_STATE::ERR_TOUT, "lock");
++    sleep_us(100);
++  }
++  lock_us = get_us() - started;
++  if (servo_write_fault_latched_.load() || lock_us >= 5000)
++    return finish(UXBUS_STATE::ERR_TOUT, "lock");
+   float txdata[10] = { 0 };
+   for (int i = 0; i < 7; i++) { txdata[i] = mvjoint[i]; }
+   txdata[7] = mvvelo;
+   txdata[8] = mvacc;
+   txdata[9] = mvtime;
+-  return _set_nfp32(UXBUS_RG::MOVE_SERVOJ, txdata, 10);
++  unsigned char data[40];
++  nfp32_to_hex(txdata, data, 10);
++  const long long send_started = get_us();
++  if (send_started >= deadline) return finish(UXBUS_STATE::ERR_TOUT, "before_send");
++  const int transaction = _send_modbus_request(UXBUS_RG::MOVE_SERVOJ, data, 40);
++  send_us = get_us() - send_started;
++  if (transaction == -1) return finish(UXBUS_STATE::ERR_NOTTCP, "send");
++  const long long reply_started = get_us();
++  const int remaining_ms = static_cast<int>((deadline - reply_started) / 1000);
++  if (remaining_ms <= 0) return finish(UXBUS_STATE::ERR_TOUT, "send");
++  const int ret = _recv_modbus_response(UXBUS_RG::MOVE_SERVOJ, transaction, nullptr, 0, remaining_ms);
++  reply_us = get_us() - reply_started;
++  return finish(ret, "reply");
+ }
+ 
+ int UxbusCmd::move_servo_cartesian(float mvpose[6], float mvvelo, float mvacc, float mvtime) {
+diff --git a/include/xarm/core/port/socket.h b/include/xarm/core/port/socket.h
+index 73d54e0..ba4df2e 100644
+--- a/include/xarm/core/port/socket.h
++++ b/include/xarm/core/port/socket.h
+@@ -33,6 +33,7 @@ public:
+   void recv_proc(void);
+   void recv_report_proc(void);
+   int write_frame(unsigned char *data, int len);
++  int write_frame_bounded(unsigned char *data, int len, int timeout_ms);
+   int read_frame(unsigned char *data);
+   void close_port(void);
+   int read_feedback_frame(unsigned char *data);
+diff --git a/src/xarm/core/port/socket.cc b/src/xarm/core/port/socket.cc
+index 2d6dd0a..c2f05c3 100644
+--- a/src/xarm/core/port/socket.cc
++++ b/src/xarm/core/port/socket.cc
+@@ -10,6 +10,7 @@
+ 
+ #include <string.h>
+ #include <errno.h>
++#include <chrono>
+ #include <vector>
+ #include "xarm/core/port/socket.h"
+ #include "xarm/core/os/network.h"
+@@ -39,6 +40,8 @@ static bool is_ignore_errno(int sockfd, int port)
+ }
+ #else
+ #include <sys/socket.h>
++#include <netinet/tcp.h>
++#include <netinet/in.h>
+ #include <unistd.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -289,6 +292,18 @@ int SocketPort::connect()
+   if (new_fd == -1) {
+     return -1;
+   }
++#ifndef _WIN32
++  // Command packets are small and time-sensitive. Do not combine successive
++  // commands behind a delayed ACK. Report sockets remain unchanged.
++  if (!is_report) {
++    int enabled = 1;
++    if (setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
++      XARM_LOG_ERROR("command TCP_NODELAY failed: errno=%d\n", errno);
++      close(new_fd);
++      return -3;
++    }
++  }
++#endif
+   int ret = socket_connect_server(&new_fd, sin_addr_.c_str(), sin_port_);
+   if (ret == -1) {
+     close(new_fd);
+@@ -341,6 +356,30 @@ int SocketPort::write_frame(unsigned char *data, int len) {
+   return ret;
+ }
+ 
++int SocketPort::write_frame_bounded(unsigned char *data, int len, int timeout_ms) {
++#if defined(MSG_DONTWAIT) && defined(MSG_NOSIGNAL)
++  if (state_ != 0 || len <= 0 || timeout_ms <= 0) return -1;
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
++  int written = 0;
++  while (written < len && std::chrono::steady_clock::now() < deadline) {
++    const int ret = send(sockfd_, data + written, len - written, MSG_DONTWAIT | MSG_NOSIGNAL);
++    if (ret > 0) { written += ret; continue; }
++    if (ret == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) break;
++    std::this_thread::sleep_for(std::chrono::microseconds(100));
++  }
++  if (written == len) return written;
++  XARM_LOG_ERROR("Servo-J socket send incomplete: bytes=%d/%d budget_ms=%d errno=%d\n",
++                 written, len, timeout_ms, errno);
++  // A partial frame cannot safely be followed by another command on this
++  // stream. STOP cannot be guaranteed over a failed connection.
++  if (written > 0) disconnect();
++  return -1;
++#else
++  // This real-robot patch targets Linux. Never fall back to blocking send.
++  return -1;
++#endif
++}
++
+ void SocketPort::close_port(void) {
+   disconnect();
+ }
+@@ -349,4 +388,4 @@ int SocketPort::read_feedback_frame(unsigned char *data)
+ {
+   if (state_ != 0 || feedback_que_num_ <= 0 || feedback_que_ == nullptr) { return -1; }
+   return feedback_que_->pop(data);
+-}
+\ No newline at end of file
++}
+diff --git a/src/xarm/core/instruction/uxbus_cmd_tcp.cc b/src/xarm/core/instruction/uxbus_cmd_tcp.cc
+index 5f5c0e2..227296c 100644
+--- a/src/xarm/core/instruction/uxbus_cmd_tcp.cc
++++ b/src/xarm/core/instruction/uxbus_cmd_tcp.cc
+@@ -83,7 +83,9 @@ int UxbusCmdTcp::_send_modbus_request(unsigned char unit_id, unsigned char *pdu_
+ 
+   arm_port_->flush();
+   // print_hex("send:", send_data, pdu_len + 7);
+-  int ret = arm_port_->write_frame(send_data.data(), len);
++  int ret = unit_id == UXBUS_RG::MOVE_SERVOJ && curr_prot_id == PRIVATE_MODBUS_TCP_PROTOCOL
++    ? arm_port_->write_frame_bounded(send_data.data(), len, 5)
++    : arm_port_->write_frame(send_data.data(), len);
+   if (ret != len) { return -1; }
+ 
+   transaction_id_ = transaction_id_ % TRANSACTION_ID_MAX + 1;
+@@ -325,4 +327,4 @@ int UxbusCmdTcp::write_and_read_holding_registers(unsigned short r_addr, unsigne
+     }
+   }
+   return ret;
+-}
+\ No newline at end of file
++}

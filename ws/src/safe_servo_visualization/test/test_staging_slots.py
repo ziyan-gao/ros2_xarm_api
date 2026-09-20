@@ -58,6 +58,18 @@ def test_store_target_aligns_unrotated_item_flb_to_slot_corner():
     assert pose[4:] == pytest.approx((0.0, 0.0), abs=1e-12)
 
 
+def test_yaw180_store_target_preserves_corner_with_off_center_grasp():
+    staging = _staging_geometry()
+    geometry = dict(size=(.2, .1, .08), center=(.02, .01, .04),
+                    orientation=(1., 0., 0., 0.), store_tcp_q=(1., 0., 0., 0.))
+    slot = (-.375, .18, 0.)
+    original = staging._store_target(slot, geometry)
+    flipped = staging._store_target(slot, {**geometry, 'store_tcp_q': (0., 1., 0., 0.)})
+    assert flipped[0]-original[0] == pytest.approx(.04)
+    assert flipped[1]-original[1] == pytest.approx(-.02)
+    assert flipped[2] == pytest.approx(original[2])
+
+
 def test_store_target_does_not_rotate_oversize_footprint_to_make_it_fit():
     staging = _staging_geometry()
     geometry = {
@@ -66,8 +78,27 @@ def test_store_target_does_not_rotate_oversize_footprint_to_make_it_fit():
         'orientation': (1.0, 0.0, 0.0, 0.0),
     }
 
-    with pytest.raises(ValueError, match='unrotated 250x250 mm slot'):
+    with pytest.raises(ValueError, match='250x250 mm slot'):
         staging._store_target((-0.375, 0.180, 0.0), geometry)
+
+
+def test_fixed_yaw_slot_target_aligns_rotated_bounds():
+    staging = _staging_geometry()
+    q = staging._quaternion_from_rpy(math.pi, 0., math.pi/2)
+    geometry = dict(size=(.2, .1, .08), center=(0., 0., .04),
+                    orientation=(1., 0., 0., 0.), store_tcp_q=q)
+    pose = staging._store_target((0., 0., 0.), geometry)
+    assert pose[:3] == pytest.approx((.05, .1, .08))
+    assert staging._quaternion_from_rpy(*pose[3:]) == pytest.approx(q)
+
+
+def test_fixed_diagonal_footprint_rejected_without_rotating_to_fit():
+    staging = _staging_geometry()
+    geometry = dict(size=(.2, .2, .08), center=(0., 0., .04),
+                    orientation=(1., 0., 0., 0.),
+                    store_tcp_q=staging._quaternion_from_rpy(math.pi, 0., math.pi/4))
+    with pytest.raises(ValueError, match='does not fit'):
+        staging._store_target((0., 0., 0.), geometry)
 
 
 def test_retrieval_clearance_uses_higher_predicted_top_when_release_is_low():
@@ -140,12 +171,15 @@ def test_chained_store_finishes_at_raised_waypoint_without_observation():
     staging = object.__new__(StagingSlots)
     staging.return_to_observation = False
     staging.pickup_status = {
+        'operation_id': 7,
         'release_tcp_pose_mm_rad': [100.0, 200.0, 80.0, math.pi, 0.0, 0.0],
         'place_fallback_reason': '',
+        'continuous_return_completed': True,
+        'return_to_observation': False,
     }
     staging.scene_status = {'placed_item_ids': ['placed_item_12']}
     staging.placed_ids_before_store = set()
-    staging.pending_record = {'slot': 2, 'item_id': 'held_item'}
+    staging.pending_record = {'slot': 2, 'item_id': 'held_item', 'orientation': (1., 0., 0., 0.)}
     staging.expected_store_place_operation_id = 7
     staging.occupied = {}
     staging.operation = 'store'
@@ -159,6 +193,92 @@ def test_chained_store_finishes_at_raised_waypoint_without_observation():
     assert staging.state == StagingSlots.SUCCEEDED
     assert staging.last_result == 'store completed for slot 2'
     assert staging.occupied[2]['placed_obstacle_id'] == 'placed_item_12'
+
+
+def _store_release_fixture():
+    staging = object.__new__(StagingSlots)
+    staging.operation = 'store'
+    staging.state = StagingSlots.PLACING_STORE
+    staging.expected_store_place_operation_id = 7
+    staging.expected_store_transfer_operation_id = 6
+    staging.pending_record = {'slot': 0, 'item_id': 'held_item', 'orientation': (1., 0., 0., 0.)}
+    staging.occupied = {}
+    staging.placed_ids_before_store = {'placed_item_1'}
+    staging.pickup_status = {
+        'operation_id': 7, 'state': 'RETREATING',
+        'release_tcp_pose_mm_rad': [100., 200., 80., math.pi, 0., 0.],
+    }
+    staging.scene_status = {'attached_item_id': '',
+                            'placed_item_ids': ['placed_item_1', 'placed_item_2']}
+    staging._mode_tick = staging._restore_tick = lambda: None
+    staging.phase_started = None
+    return staging
+
+
+def test_release_records_actual_object_yaw_for_retrieval():
+    staging = _store_release_fixture()
+    staging.pickup_status['release_tcp_pose_mm_rad'][5] = math.pi/2
+    assert staging._record_confirmed_store_release()
+    assert staging.occupied[0]['object_yaw'] == pytest.approx(math.pi/2)
+    assert staging.occupied[0]['orientation'] == (1., 0., 0., 0.)
+
+
+def test_recorded_grasp_snapshot_rejects_bad_quaternion():
+    from safe_servo_visualization.planning_scene_obstacles_node import PlanningSceneObstacles
+    snapshot = dict(box_id=1, x_m=0., y_m=0., center_z_m=.1,
+                    size_x_m=.1, size_y_m=.2, size_z_m=.1, yaw_rad=.4,
+                    recorded_grasp=[0., 0., .05, 1., 0., 0., 0.])
+    PlanningSceneObstacles._validate_snapshot(snapshot)
+    snapshot['recorded_grasp'][3] = 0.
+    with pytest.raises(ValueError, match='recorded grasp'):
+        PlanningSceneObstacles._validate_snapshot(snapshot)
+
+
+def test_store_inventory_commits_before_retreat_finishes_and_survives_fault():
+    staging = _store_release_fixture()
+    staging.tick()
+    assert staging.state == StagingSlots.PLACING_STORE
+    assert staging.occupied[0]['placed_obstacle_id'] == 'placed_item_2'
+    assert staging.pending_record is not None  # motion still in progress
+    staging.state = StagingSlots.FAULT
+    staging.pickup_status['state'] = 'FAULT'
+    staging.tick()
+    assert staging.state == StagingSlots.FAULT
+    assert staging.occupied[0]['release_tcp_pose'][2] == 80.
+
+
+def test_late_detach_after_retreat_fault_still_commits_slot():
+    staging = _store_release_fixture()
+    staging.state = StagingSlots.FAULT
+    staging.scene_status['placed_item_ids'] = ['placed_item_1']
+    staging.tick()
+    assert not staging.occupied
+    staging.scene_status['placed_item_ids'].append('placed_item_2')
+    staging.tick()
+    assert 0 in staging.occupied
+    assert staging.state == StagingSlots.FAULT
+
+
+@pytest.mark.parametrize('invalid', ['old_operation', 'new_operation', 'attached',
+                                    'missing_pose', 'nan_pose', 'no_detach', 'ambiguous'])
+def test_store_release_requires_current_operation_and_detach_evidence(invalid):
+    staging = _store_release_fixture()
+    if invalid == 'old_operation':
+        staging.pickup_status['operation_id'] = 6
+    elif invalid == 'new_operation':
+        staging.pickup_status['operation_id'] = 8
+    elif invalid == 'attached':
+        staging.scene_status['attached_item_id'] = 'held_item'
+    elif invalid == 'missing_pose':
+        staging.pickup_status['release_tcp_pose_mm_rad'] = None
+    elif invalid == 'nan_pose':
+        staging.pickup_status['release_tcp_pose_mm_rad'][2] = math.nan
+    elif invalid == 'no_detach':
+        staging.scene_status['placed_item_ids'] = ['placed_item_1']
+    else:
+        staging.scene_status['placed_item_ids'].append('placed_item_3')
+    assert not staging._record_confirmed_store_release()
+    assert not staging.occupied
 
 
 def test_staging_transfer_failure_before_motion_uses_moveit_fallback():

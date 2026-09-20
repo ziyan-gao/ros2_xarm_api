@@ -214,7 +214,8 @@ class MoveItServoBridge(Node):
             self.get_logger().info(
                 f'guarded Servo config applied: speed={self.max_speed:.3f} m/s, '
                 f'force_delta_fz={self.force_limit:.1f} N, '
-                f'touch_mode={self.touch_mode}, fz_sign_change={sign_change}')
+                f'touch_mode={self.touch_mode}, fz_sign_change={sign_change}, '
+                f'workspace_z={self.z_bounds} m')
             self.publish_status()
 
     def _contact_delta_n(self):
@@ -915,6 +916,8 @@ class MoveItServoBridge(Node):
             'servo_motion_ready': self.servo_motion_ready,
             'configured_max_linear_speed_m_s': self.configured_max_speed,
             'active_max_linear_speed_m_s': self.max_speed,
+            'workspace_z_min_m': self.z_bounds[0],
+            'workspace_z_max_m': self.z_bounds[1],
             'kp_z': self.kp_z,
             'joint_state_age_sec': (
                 None if self.last_joint_state_time is None else

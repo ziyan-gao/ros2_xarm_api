@@ -69,6 +69,8 @@ class PlacePipeline(Node):
             Trigger, '/pickup_supervisor/start_loading')
         self.start_transport = self.create_client(
             Trigger, '/pickup_supervisor/start_continuous_transport')
+        self.start_transport_chained = self.create_client(
+            Trigger, '/pickup_supervisor/start_continuous_transport_chained')
         self.start_joint_transfer = self.create_client(
             Trigger, '/pickup_supervisor/start_joint_transfer')
         self.accept_direct_transfer = self.create_client(
@@ -77,6 +79,7 @@ class PlacePipeline(Node):
             Trigger, '/pickup_supervisor/abort')
         self.create_service(Trigger, '/place_pipeline/start', self.start_callback)
         self.create_service(Trigger, '/place_pipeline/start_continuous', self.start_continuous)
+        self.create_service(Trigger, '/place_pipeline/start_continuous_chained', self.start_continuous_chained)
         self.create_service(Trigger, '/place_pipeline/abort', self.abort_callback)
         self.create_service(Trigger, '/place_pipeline/reset', self.reset_callback)
         self.create_timer(0.1, self.tick)
@@ -105,9 +108,16 @@ class PlacePipeline(Node):
         return self._start(response, continuous=False)
 
     def start_continuous(self, _request, response):
+        return self._start_continuous(response, return_to_observation=True)
+
+    def start_continuous_chained(self, _request, response):
+        return self._start_continuous(response, return_to_observation=False)
+
+    def _start_continuous(self, response, return_to_observation):
         if self.state in self.ACTIVE:
             response.message = f'place pipeline already active in {self.state}'
             return response
+        self.return_to_observation = return_to_observation
         if not self.scene_status.get('attached_item_id'):
             self.operation_id += 1
             self.state = self.WAIT_ATTACHMENT
@@ -133,6 +143,8 @@ class PlacePipeline(Node):
                 response, 'transfer target preparation service is unavailable')
         self.operation_id += 1
         self.continuous_transport = continuous
+        if not continuous:
+            self.return_to_observation = True
         self.continuous_ack_started = None
         self.continuous_ack_received = False
         self.fault = ''
@@ -256,7 +268,9 @@ class PlacePipeline(Node):
         state = self.motion_status.get('state')
         if state == 'PREPARED' and self.pending_motion == 'transfer_preparing':
             if getattr(self, 'continuous_transport', False):
-                if not self.start_transport.service_is_ready():
+                client = (self.start_transport if getattr(self, 'return_to_observation', True)
+                          else self.start_transport_chained)
+                if not client.service_is_ready():
                     self._fault('continuous transport service is unavailable')
                     return
                 self.state = self.LOAD_PRE_PLACE
@@ -264,7 +278,7 @@ class PlacePipeline(Node):
                 self.loading_succeeded_at = None
                 self.expected_supervisor_operation_id = int(
                     self.supervisor_status.get('operation_id', 0)) + 1
-                future = self.start_transport.call_async(Trigger.Request())
+                future = client.call_async(Trigger.Request())
                 future.add_done_callback(self._start_loading_completed)
                 return
             if self.motion_status.get(
@@ -521,6 +535,16 @@ class PlacePipeline(Node):
             self._begin_observation_motion()
 
     def _begin_observation_motion(self):
+        if not getattr(self, 'return_to_observation', True):
+            # Chained completion must be confirmed above the container, not
+            # inferred merely from release/pre-place success.
+            if (not self.supervisor_status.get('continuous_return_completed') or
+                    self.supervisor_status.get('return_to_observation', True)):
+                self._fault('chained placement did not confirm its overhead handoff')
+                return
+            self.state, self.pending_motion = self.SUCCEEDED, None
+            self.publish_status()
+            return
         if not self.plan_observation.service_is_ready():
             self._fault('observation planning service is unavailable')
             return

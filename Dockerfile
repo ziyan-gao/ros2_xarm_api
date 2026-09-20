@@ -51,6 +51,8 @@ COPY patches/xarm_realmove_joint_states.patch /tmp/xarm_realmove_joint_states.pa
 COPY patches/xarm_control_write_watchdog.patch /tmp/xarm_control_write_watchdog.patch
 COPY patches/xarm_nonblocking_report_states.patch /tmp/xarm_nonblocking_report_states.patch
 COPY patches/xarm_control_handoff_lifecycle_guard.patch /tmp/xarm_control_handoff_lifecycle_guard.patch
+COPY patches/xarm_sdk_bounded_servoj.patch /tmp/xarm_sdk_bounded_servoj.patch
+COPY tests/servo_write_deadline_test.cpp /tmp/servo_write_deadline_test.cpp
 COPY patches/ros2_control_fault_stop.patch /tmp/ros2_control_fault_stop.patch
 
 # Match the installed ABI exactly; do not silently mix this patch with another
@@ -87,6 +89,7 @@ RUN mkdir -p /opt/xarm_ws/src && \
     git apply /tmp/xarm_control_write_watchdog.patch && \
     git apply /tmp/xarm_nonblocking_report_states.patch && \
     git apply /tmp/xarm_control_handoff_lifecycle_guard.patch && \
+    git -C xarm_sdk/cxx apply /tmp/xarm_sdk_bounded_servoj.patch && \
     source /opt/ros/jazzy/setup.bash && \
     source /opt/ros2_control_ws/install/setup.bash && \
     rosdep update && \
@@ -104,7 +107,12 @@ RUN mkdir -p /opt/xarm_ws/src && \
       -y && \
     cd /opt/xarm_ws && \
     colcon build --packages-up-to xarm_planner xarm_moveit_config \
-      --packages-skip xarm_gazebo
+      --packages-skip xarm_gazebo && \
+    c++ -std=c++14 -pthread -I/opt/xarm_ws/src/xarm_ros2/xarm_sdk/cxx/include \
+      /tmp/servo_write_deadline_test.cpp -L/opt/xarm_ws/install/xarm_sdk/lib \
+      -Wl,-rpath,/opt/xarm_ws/install/xarm_sdk/lib -lxarm_cxx_sdk \
+      -o /tmp/servo_write_deadline_test && \
+    /tmp/servo_write_deadline_test
 
 # 进入容器自动 source ROS 2 和工作区环境
 RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc && \

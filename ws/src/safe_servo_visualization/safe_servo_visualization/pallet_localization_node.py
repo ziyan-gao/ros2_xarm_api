@@ -188,16 +188,18 @@ class PalletLocalization(Node):
         Message layout (lengths in millimeters):
         [sequence_id, item_id, physical_x, physical_y, physical_z, rotate_90,
          raw_dx, raw_dy, raw_dz, virtual_dx, virtual_dy, virtual_dz,
-         virtual_x, virtual_y, virtual_z]
+         virtual_x, virtual_y, virtual_z, transfer_corner_height_m]
 
         The final virtual-envelope corner is optional for compatibility with
         legacy publishers, where the physical and virtual corners coincide.
+        The optional final height is in metres above the pallet, supplied by
+        the active loading mode. It is forwarded with accepted config state.
         """
         if len(msg.data) < 12:
             self.get_logger().error(
                 'random loading target requires 12 numeric fields')
             return
-        field_count = 15 if len(msg.data) >= 15 else 12
+        field_count = 16 if len(msg.data) >= 16 else (15 if len(msg.data) >= 15 else 12)
         values = np.asarray(msg.data[:field_count], dtype=float)
         sequence_id = int(round(values[0])) if math.isfinite(values[0]) else 0
         if not np.isfinite(values).all():
@@ -205,6 +207,10 @@ class PalletLocalization(Node):
             self._acknowledge_loading_target(sequence_id, False, 1)
             return
         item_id = int(round(values[1]))
+        transfer_height = float(values[15]) if field_count >= 16 else 0.0
+        if field_count >= 16 and transfer_height <= 0.0:
+            self._acknowledge_loading_target(sequence_id, False, 1)
+            return
         xyz_mm = values[2:5]
         virtual_dim_mm = values[9:12]
         virtual_xyz_mm = values[12:15] if field_count >= 15 else xyz_mm
@@ -226,6 +232,7 @@ class PalletLocalization(Node):
             return
 
         self.pre_place_xyz = xyz_mm / 1000.0
+        self.active_transfer_corner_height_m = transfer_height
         self.rotate_item_90 = bool(values[5] > 0.5)
         self._save_config()
         self.publish_config_state()
@@ -352,6 +359,7 @@ class PalletLocalization(Node):
             1.0 if self.keep_eef_perpendicular else 0.0,
             1.0 if self.add_placed_item_obstacle else 0.0,
             *[float(value) for value in self.marker_offset_xyz * 1000.0],
+            float(getattr(self, 'active_transfer_corner_height_m', 0.0)),
         ]
         self.config_state_pub.publish(msg)
 

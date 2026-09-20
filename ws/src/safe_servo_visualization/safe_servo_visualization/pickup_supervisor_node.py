@@ -61,7 +61,8 @@ class PickupSupervisor(ContinuousTransport, Node):
         WAITING_PLACE_STEP_FEEDBACK, RESTORING_CONTROL,
         SOLVING_TRANSFER_IK, VALIDATING_TRANSFER, CHECKING_LOADING_PATH, EXECUTING_TRANSFER,
         C52_STOPPING, RECOVERING_FT,
-    } | ContinuousTransport.TRANSPORT_STATES | {ContinuousTransport.RETURN_DISABLING}
+    } | ContinuousTransport.TRANSPORT_STATES | {
+        ContinuousTransport.RETURN_DISABLING, ContinuousTransport.PICK_PATH_DISABLING}
 
     def __init__(self):
         super().__init__('pickup_supervisor')
@@ -259,6 +260,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         )
         self.pre_place_clearance = float(p('pre_place_clearance_m'))
         self.transfer_corner_height = float(p('transfer_corner_height_m'))
+        self.default_transfer_corner_height = self.transfer_corner_height
         self.joint6_name = str(p('joint6_name'))
         self.joint6_limits = (
             float(p('joint6_moveit_lower_rad')),
@@ -451,6 +453,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.direct_motion_generation = 0
         self.expected_enable_generation = None
         self.operation_kind = 'pickup'
+        self.pickup_clearance_pending = False
         self.staging_place_active = False
         self.staging_place_config = None
         self.staging_release_tcp_pose = None
@@ -593,6 +596,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.detach_staged_item_client = self.create_client(
             Trigger, '/planning_scene_obstacles/detach_staged_item')
         self.create_service(Trigger, '/pickup_supervisor/start', self.start_callback)
+        self.create_service(Trigger, '/pickup_supervisor/start_for_transport', self.start_for_transport_callback)
         self.create_service(
             Trigger, '/pickup_supervisor/start_probe', self.start_probe_callback)
         self.create_service(
@@ -681,6 +685,9 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.robot_mode = int(message.mode)
         self.robot_error = int(message.err)
         self.robot_state_time = time.monotonic()
+        angles = tuple(float(value) for value in getattr(message, 'angle', ()))
+        self.sdk_report_joints = (angles if len(angles) == len(self.arm_joint_names) and
+                                  all(math.isfinite(v) for v in angles) else None)
         if len(message.pose) >= 6:
             pose = tuple(float(value) for value in message.pose[:6])
             if all(math.isfinite(value) for value in pose):
@@ -927,6 +934,12 @@ class PickupSupervisor(ContinuousTransport, Node):
         return ''
 
     def pallet_config_callback(self, message):
+        height = float(message.data[18]) if len(message.data) >= 19 else 0.0
+        if not math.isfinite(height) or height < 0:
+            self.get_logger().error('invalid pallet transfer height')
+            return
+        self.transfer_corner_height = height if height > 0 else getattr(
+            self, 'default_transfer_corner_height', getattr(self, 'transfer_corner_height', .47))
         if len(message.data) >= 12:
             self.place_target_xyz = tuple(
                 float(value) / 1000.0 for value in message.data[9:12])
@@ -1146,6 +1159,10 @@ class PickupSupervisor(ContinuousTransport, Node):
                 f'{y_error * 1000.0:+.1f}) mm, '
                 f'tolerance={self.xy_tolerance * 1000.0:.1f} mm')
         expected_z = float(snapshot['pregrasp_z_m'])
+        raised = self._validated_raised_pick(snapshot, (x, y, z))
+        original_z = expected_z
+        if raised:
+            expected_z = float(raised['xyz'][2])
         z_error = z - expected_z
         is_retrieval = (
             'retrieval_target_id' in snapshot or 'staging_slot' in snapshot)
@@ -1169,18 +1186,17 @@ class PickupSupervisor(ContinuousTransport, Node):
         # A planned pallet/staging retrieval can legitimately have its TCP
         # below the robot-base plane, because the localized pallet origin is
         # below that plane.  Those targets were already collision-checked by
-        # the mandatory overhead and straight pre-pick plans, so use the same
-        # configured low-Z floor as pallet placement while retaining the
-        # contact-search and maximum-descent limits below.
-        servo_floor_z = (
-            self.place_workspace_z_min_mm / 1000.0
-            if is_retrieval else self.servo_bounds_mm[4] / 1000.0)
+        # the mandatory overhead and straight pre-pick plans. Select their
+        # pallet or buffer floor, retaining contact-search and maximum-descent
+        # limits. Servo arming must publish this identical workspace profile.
+        servo_floor_z = self._pickup_workspace_bounds_mm(snapshot)[4] / 1000.0
         floor_z = max(
             estimated_contact_z - self.contact_search_margin,
-            z - self.max_descent,
+            (original_z if raised else z) - self.max_descent,
             servo_floor_z)
         descent = z - floor_z
-        if not 0.0 < descent <= self.max_descent:
+        allowed_descent = self.max_descent + (max(0., z-original_z) if raised else 0.)
+        if not 0.0 < descent <= allowed_descent + 1e-9:
             raise ValueError(
                 f'pickup descent {descent:.3f} m is outside (0, {self.max_descent:.3f}]')
         # A Servo fault is deliberately latched by the bridge after it is
@@ -1294,22 +1310,47 @@ class PickupSupervisor(ContinuousTransport, Node):
     def _periodic_joint_error(actual, target):
         return abs((actual - target + math.pi) % (2.0 * math.pi) - math.pi)
 
+    def _pickup_workspace_bounds_mm(self, snapshot):
+        """Use the same source-specific limits for validation and Servo arming.
+
+        Legacy retrieval snapshots used the pallet floor for contact search.
+        New snapshots explicitly distinguish pallet and buffer pickups.
+        """
+        snapshot = snapshot or {}
+        source = snapshot.get('pickup_source')
+        if source is None:
+            source = ('buffer' if 'staging_slot' in snapshot else
+                      'pallet' if 'retrieval_target_id' in snapshot else 'incoming')
+        if source == 'incoming':
+            return self.servo_bounds_mm
+        if source == 'buffer':
+            return self.staging_bounds_mm
+        if source == 'pallet':
+            return (*self.servo_bounds_mm[:4], self.place_workspace_z_min_mm,
+                    self.servo_bounds_mm[5])
+        raise ValueError(f'unknown pickup source: {source!r}')
+
+    def _descent_workspace_bounds_mm(self):
+        if self.operation_kind != 'place':
+            return self._pickup_workspace_bounds_mm(
+                getattr(self, 'active_pickup_snapshot', None))
+        if getattr(self, 'staging_place_active', False):
+            return self.staging_bounds_mm
+        return (*self.servo_bounds_mm[:4], self.place_workspace_z_min_mm,
+                self.servo_bounds_mm[5])
+
     def _publish_servo_config(self, touch_mode, bypass_force=False):
         is_place = self.operation_kind == 'place'
         force = (self.place_force_threshold if is_place else
                  self.force_threshold)
         speed_scale = (self.place_servo_speed_scale if is_place else
                        self.servo_speed_scale)
-        staging_place = getattr(self, 'staging_place_active', False)
-        bounds = (self.staging_bounds_mm if staging_place else
-                  self.servo_bounds_mm)
-        z_min = (self.staging_bounds_mm[4] if staging_place else
-                 self.place_workspace_z_min_mm if is_place else bounds[4])
+        bounds = self._descent_workspace_bounds_mm()
         message = Float64MultiArray()
         message.data = [
             speed_scale,
             bounds[0], bounds[1], bounds[2], bounds[3],
-            z_min, bounds[5],
+            bounds[4], bounds[5],
             force,
             1.0 if touch_mode else 0.0,
             1.0 if bypass_force else 0.0,
@@ -1337,7 +1378,10 @@ class PickupSupervisor(ContinuousTransport, Node):
     def start_probe_callback(self, _request, response):
         return self._start_pickup_descent(response, probe_only=True)
 
-    def _start_pickup_descent(self, response, probe_only):
+    def start_for_transport_callback(self, _request, response):
+        return self._start_pickup_descent(response, probe_only=False, defer_lift=True)
+
+    def _start_pickup_descent(self, response, probe_only, defer_lift=False):
         if self._ft_recovery_blocks_start(response):
             return response
         if self.manual_gripper_pending:
@@ -1353,6 +1397,10 @@ class PickupSupervisor(ContinuousTransport, Node):
             snapshot, z, floor_z = self._validate_pregrasp_ready()
         except ValueError as exc:
             response.message = str(exc)
+            return response
+        raised = getattr(self, 'raised_pick_ready', None)
+        if raised and probe_only:
+            response.message = 'raised known-item approach cannot be used for object estimation'
             return response
 
         object_height = float(snapshot['size_z_m'])
@@ -1374,9 +1422,11 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.operation_id += 1
         self.operation_kind = 'pickup'
         self.probe_only = bool(probe_only)
+        self.defer_pickup_lift = bool(defer_lift)
         self.continuous_return_completed = False
         self.continuous_return_target_id = None
         self.transport_is_return = False
+        self.transport_is_pick = False
         self.object_info_obtained = False
         self.contact_tcp_z = None
         self.contact_tcp_xyz = None
@@ -1418,6 +1468,15 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.floor_z = floor_z
         self.virtual_z = z
         self.state = self.ARMING_DESCENT
+        self.raised_pick_active = bool(raised)
+        if raised:
+            self.raised_pick_ready = None
+            self.raised_pick_contact_count = 0
+            self.raised_place_hold_on_failure = True
+            self._begin_place_singularity_fallback('validated raised pre-pick approach')
+            response.success = self.state != self.FAULT
+            response.message = 'raised pre-pick: guarded incremental descent, suction only after contact'
+            return response
         stale_servo_fault = str(self.servo_status.get('fault') or '').strip()
         if stale_servo_fault:
             self.get_logger().warning(
@@ -1568,6 +1627,17 @@ class PickupSupervisor(ContinuousTransport, Node):
         except ValueError as exc:
             response.message = str(exc)
             return response
+        raised = getattr(self, 'raised_pre_place_ready', None)
+        if raised:
+            xyz = self._tcp_xyz()
+            if (raised['target_id'] != self.motion_status.get('operation_id') or
+                    raised['item_id'] != self.planning_scene_status.get('attached_item_id') or
+                    max(abs(a-b) for a,b in zip(xyz, raised['xyz'])) > .002 or
+                    self.last_force_time is None or
+                    time.monotonic()-self.last_force_time > self.force_timeout):
+                response.message = 'raised pre-place handoff changed or force telemetry stale; item remains held'
+                return response
+        self.raised_place_hold_on_failure = bool(raised)
         self.operation_id += 1
         self.operation_kind = 'place'
         self.staging_place_active = False
@@ -1601,6 +1671,10 @@ class PickupSupervisor(ContinuousTransport, Node):
             return response
         servo_floor_z = self.place_workspace_z_min_mm / 1000.0
         self.floor_z = max(z - self.max_descent, servo_floor_z)
+        if raised:
+            # Preserve the original travel floor: added approach height is not
+            # subtracted from the remaining contact-descent budget.
+            self.floor_z = max(raised['original_z'] - self.max_descent, servo_floor_z)
         if z - self.floor_z < self.minimum_contact_descent:
             response.message = (
                 f'pre-place Z {z:.3f} m leaves less than '
@@ -1612,6 +1686,17 @@ class PickupSupervisor(ContinuousTransport, Node):
         # that operation (C52), and the Servo bridge already records a fresh
         # software wrench baseline every time it is enabled.
         self.state = self.ARMING_DESCENT
+        if raised:
+            # The single-use descent handoff is consumed below, but the verified
+            # approach must remain available for this placement's empty retreat.
+            self.raised_retreat_pose = dict(
+                target_id=raised['target_id'], xyz=list(raised['xyz']),
+                original_xyz=[*raised['xyz'][:2], raised['original_z']])
+            self.raised_pre_place_ready = None  # Single-use, operation-bound handoff.
+            self._begin_place_singularity_fallback('validated raised pre-place approach')
+            response.success = self.state != self.FAULT
+            response.message = 'raised pre-place: arming guarded incremental descent'
+            return response
         self._reset_servo_then_begin_place(z, self.floor_z)
         response.success = True
         response.message = (
@@ -2323,11 +2408,13 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.state = self.ARMING_DESCENT
         label = (f'box {int(snapshot["box_id"])}' if snapshot is not None
                  else 'placement surface')
+        bounds = self._descent_workspace_bounds_mm()
         self.get_logger().info(
             f'waiting for guarded Servo configuration for {label}: '
             f'Z {z:.3f} m to >= {floor_z:.3f} m '
             f'(threshold={self._configured_contact_threshold():.1f} N, '
-            f'speed_scale={self._configured_speed_scale():.2f})')
+            f'speed_scale={self._configured_speed_scale():.2f}, '
+            f'workspace_Z=[{bounds[4]/1000:.3f}, {bounds[5]/1000:.3f}] m)')
 
     def _configured_contact_threshold(self):
         if self.operation_kind == 'place':
@@ -2341,6 +2428,7 @@ class PickupSupervisor(ContinuousTransport, Node):
 
     def _descent_config_confirmed(self):
         expected_force = self._configured_contact_threshold()
+        bounds = self._descent_workspace_bounds_mm()
         configured_speed = self.servo_status.get(
             'configured_max_linear_speed_m_s')
         active_speed = self.servo_status.get('active_max_linear_speed_m_s')
@@ -2356,7 +2444,11 @@ class PickupSupervisor(ContinuousTransport, Node):
                     float(self.servo_status.get('force_limit_n')),
                     expected_force, abs_tol=1e-6) and
                 math.isclose(
-                    float(active_speed), expected_speed, abs_tol=1e-6))
+                    float(active_speed), expected_speed, abs_tol=1e-6) and
+                math.isclose(float(self.servo_status.get('workspace_z_min_m')),
+                             bounds[4] / 1000.0, abs_tol=1e-6) and
+                math.isclose(float(self.servo_status.get('workspace_z_max_m')),
+                             bounds[5] / 1000.0, abs_tol=1e-6))
         except (TypeError, ValueError):
             return False
 
@@ -2368,7 +2460,7 @@ class PickupSupervisor(ContinuousTransport, Node):
             self.descent_config_deadline = None
             self.descent_config_last_publish = None
             self.get_logger().info(
-                'guarded Servo confirmed contact threshold and speed; arming')
+                'guarded Servo confirmed contact threshold, speed, and workspace Z bounds; arming')
             self._arm_descent()
             return True
         if now >= self.descent_config_deadline:
@@ -2377,7 +2469,7 @@ class PickupSupervisor(ContinuousTransport, Node):
             self._fault(
                 'timed out waiting for guarded Servo to confirm '
                 f'{self._configured_contact_threshold():.1f} N contact '
-                'threshold and descent speed')
+                'threshold, descent speed, and workspace Z bounds')
             return True
         if (self.descent_config_last_publish is None or
                 now - self.descent_config_last_publish >= 0.2):
@@ -2769,12 +2861,13 @@ class PickupSupervisor(ContinuousTransport, Node):
         # recovery window and release the item without attempting one step.
         self.direct_place_deadline = None
         self.get_logger().warning(
-            'place Servo reached its singularity recovery condition; '
+            f'{reason}; '
             'switching to '
             f'{self.singularity_place_step * 1000.0:.1f} mm direct vertical '
             'steps with force checks between steps')
         try:
-            self._capture_direct_tcp_z_offset()
+            if getattr(self, 'live_pick_pause_gate', None) is None:
+                self._capture_direct_tcp_z_offset()
         except ValueError as exc:
             self._fault(
                 'cannot prepare direct singularity recovery TCP conversion: '
@@ -2789,11 +2882,13 @@ class PickupSupervisor(ContinuousTransport, Node):
         request = SetBool.Request()
         request.data = False
         future = self.enable_client.call_async(request)
-        future.add_done_callback(self._servo_disabled_for_direct_place)
+        operation = self.operation_id
+        future.add_done_callback(lambda done: self._servo_disabled_for_direct_place(done)
+                                 if self.operation_id == operation else None)
         self.publish_status()
 
     def _servo_disabled_for_direct_place(self, future):
-        if not self.direct_place_recovery_active:
+        if not self.direct_place_recovery_active or self.state != self.DISABLING_SERVO:
             return
         try:
             result = future.result()
@@ -2805,6 +2900,14 @@ class PickupSupervisor(ContinuousTransport, Node):
             self._fault(
                 'safe-servo did not confirm disable before direct place recovery')
             return
+        gate = getattr(self, 'live_pick_pause_gate', None)
+        if gate is not None:
+            gate['acknowledged'] = time.monotonic()
+            self.get_logger().info('pickup recovery: Servo pause acknowledged; waiting for fresh stopped joint feedback')
+            return
+        self._complete_direct_place_pause()
+
+    def _complete_direct_place_pause(self):
         if self.dry_run:
             self._release_from_direct_place(
                 'dry-run singularity recovery completed', contact_detected=True)
@@ -2846,7 +2949,14 @@ class PickupSupervisor(ContinuousTransport, Node):
                 'force telemetry became stale during direct singularity recovery')
             return
         force_delta = self._direct_place_force_delta()
-        if force_delta is not None and force_delta >= self.place_force_threshold:
+        if getattr(self, 'raised_pick_active', False):
+            try:
+                if self._raised_pick_contact_check(force_delta, now):
+                    return
+            except ValueError as exc:
+                self._fault(f'cannot verify incremental pickup contact: {exc}')
+                return
+        elif force_delta is not None and force_delta >= self.place_force_threshold:
             self._release_from_direct_place(
                 f'direct singularity recovery detected contact: '
                 f'delta_fz={force_delta:.2f} N', contact_detected=True)
@@ -2936,6 +3046,15 @@ class PickupSupervisor(ContinuousTransport, Node):
             self.robot_state_time is not None and
             self.robot_state_time > completed_at)
         if fresh_force and fresh_tcp:
+            if getattr(self, 'raised_place_hold_on_failure', False):
+                try:
+                    current_z = self._direct_mode_tcp_xyz()[2]
+                    if abs(current_z-self.retreat_target_z) > self.tolerance:
+                        self._release_from_direct_place('incremental step endpoint was not reached')
+                        return
+                except ValueError as exc:
+                    self._release_from_direct_place(f'incremental step feedback invalid: {exc}')
+                    return
             self._send_direct_place_step()
             return
         feedback_timeout = max(self.force_timeout, self.status_timeout)
@@ -2951,6 +3070,18 @@ class PickupSupervisor(ContinuousTransport, Node):
 
     def _release_from_direct_place(self, reason, contact_detected=False):
         if not self.direct_place_recovery_active:
+            return
+        if getattr(self, 'raised_pick_active', False):
+            if not contact_detected:
+                self._fault(f'guarded incremental pickup stopped: {reason}; suction remains off')
+                return
+            self.direct_place_stepping = False
+            self.direct_place_step_completed_at = None
+            self.contact_detected = True
+            self._turn_vacuum_on()
+            return
+        if getattr(self, 'raised_place_hold_on_failure', False) and not contact_detected:
+            self._fault(f'raised pre-place descent stopped: {reason}; item remains held')
             return
         self.direct_place_stepping = False
         self.direct_place_step_completed_at = None
@@ -3127,6 +3258,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             if (self.operation_kind == 'place' and
                     self._is_servo_singularity_fault(reason)):
                 self._begin_place_singularity_fallback(reason)
+            elif self._try_live_pick_singularity_recovery(reason):
+                pass
             elif (self.operation_kind == 'place' and
                   self._is_servo_external_wrench_limit(reason)):
                 self._begin_place_release_fallback(
@@ -3167,6 +3300,17 @@ class PickupSupervisor(ContinuousTransport, Node):
             if singularity_reason:
                 self._begin_place_singularity_fallback(singularity_reason)
                 return
+        elif (self.operation_kind == 'pickup' and current_enable_generation and
+              not getattr(self, 'probe_only', False) and
+              (getattr(self, 'active_pickup_snapshot', None) or {}).get(
+                  'pickup_source') in ('pallet', 'buffer')):
+            # Known-source pickups can remain in deceleration indefinitely
+            # without Servo ever raising FAULT. Reuse the same debounce as
+            # placement, then the guarded known-pick handoff (not release).
+            singularity_reason = self._place_singularity_requires_fallback(
+                current_z, time.monotonic())
+            if singularity_reason and self._try_live_pick_singularity_recovery(singularity_reason):
+                return
         if self.state == self.DESCENDING and current_z <= self.floor_z + self.tolerance:
             self._fault('reached descent floor without contact force')
             return
@@ -3188,9 +3332,25 @@ class PickupSupervisor(ContinuousTransport, Node):
                 else:
                     self._begin_place_release_fallback(reason, 'timeout')
             else:
+                if (self._servo_is_singularity_decelerating() and
+                        self._try_live_pick_singularity_recovery(
+                            reason + ' MoveIt Servo remained in singularity deceleration.')):
+                    return
                 self._fault(reason)
 
     def retreat_tick(self):
+        if self._live_pick_pause_tick():
+            return
+        if self._sdk_transport_tick():
+            return
+        if self._return_escape_tick():
+            return
+        if getattr(self, 'pick_path_restoring', False):
+            if time.monotonic() - self.pick_path_handoff_started > 30.0:
+                self._fault('pickup approach controller handoff timed out')
+                return
+            if self.state == self.PICK_PATH_DISABLING:
+                return
         if (self.state == self.RETURN_DISABLING and
                 getattr(self, 'return_staged_fallback_used', False)):
             if time.monotonic() - self.return_handoff_started > 30.0:
@@ -3706,6 +3866,9 @@ class PickupSupervisor(ContinuousTransport, Node):
             self._send_direct_retreat()
 
     def _send_direct_retreat(self):
+        if getattr(self, 'transport_sdk_active', False):
+            self._sdk_send_next()
+            return
         if not self.retreat_client.service_is_ready():
             self._fault('ufactory set_position service is unavailable')
             return
@@ -3737,7 +3900,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             # therefore SDK TCP Z=211 mm.
             self.direct_command_target_z = (
                 self.direct_target_z - self.direct_tcp_z_offset)
-            if getattr(self, 'return_clearance_pending', False):
+            if (getattr(self, 'return_clearance_pending', False) or
+                    getattr(self, 'pickup_clearance_pending', False)):
                 # Early contact may already be above pre-place: never descend
                 # again after releasing an item.
                 self.direct_command_target_z = max(self.direct_command_target_z, current_z)
@@ -3751,12 +3915,14 @@ class PickupSupervisor(ContinuousTransport, Node):
             request.relative = True
         request.speed = self.retreat_speed
         request.acc = self.retreat_acc
-        if getattr(self, 'return_clearance_pending', False):
+        if (getattr(self, 'return_clearance_pending', False) or
+                getattr(self, 'pickup_clearance_pending', False) or
+                getattr(self, 'return_escape_active', False)):
             request.speed = min(self.retreat_speed, self.return_clearance_speed)
             request.acc = min(self.retreat_acc, 100.0)
             self.get_logger().info(
-                f'slow post-release retreat to pre-place at {request.speed:.1f} mm/s; '
-                'continuous return starts only after ROS control settles')
+                f'slow clearance retreat at {request.speed:.1f} mm/s; '
+                'next motion starts only after ROS control settles')
         request.mvtime = 0.0
         nonblocking_loading_descent = (
             self.operation_kind == 'loading' and
@@ -3851,7 +4017,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             return
         state_id = component.state.id
         if state_id == State.PRIMARY_STATE_ACTIVE:
-            if (getattr(self, 'continuous_return_restoring', False) and
+            if ((getattr(self, 'continuous_return_restoring', False) or
+                    getattr(self, 'pick_path_restoring', False)) and
                     self.robot_state_time is not None and
                     time.monotonic() - self.robot_state_time <= self.status_timeout and
                     self.robot_mode == self.ros2_control_mode and self.robot_error == 0 and
@@ -4069,7 +4236,8 @@ class PickupSupervisor(ContinuousTransport, Node):
                 self.restore_settle_ready_count += 1
             else:
                 self.restore_settle_ready_count = 0
-                if getattr(self, 'continuous_return_restoring', False):
+                if (getattr(self, 'continuous_return_restoring', False) or
+                        getattr(self, 'pick_path_restoring', False)):
                     # Return motion requires one uninterrupted healthy delay,
                     # not merely enough elapsed wall time since activation.
                     self.restore_settle_started = now
@@ -4125,6 +4293,24 @@ class PickupSupervisor(ContinuousTransport, Node):
             reason = self.post_retreat_fault
             self.post_retreat_fault = ''
             self._fault(reason)
+            return
+        if getattr(self, 'transport_sdk_active', False):
+            self._sdk_restored()
+            return
+        if getattr(self, 'pickup_clearance_pending', False):
+            try:
+                xyz = self._link_tcp_xyz()
+                if (abs(xyz[2]-self.pickup_clearance_target_z) > .002 or
+                        math.hypot(xyz[0]-self.pickup_clearance_start_xy[0],
+                                   xyz[1]-self.pickup_clearance_start_xy[1]) > .003):
+                    raise ValueError('post-pick retreat endpoint mismatch')
+            except ValueError as exc:
+                self._fault(f'{exc}; item remains held, transfer blocked')
+                return
+            self.pickup_clearance_pending = False
+            self.get_logger().info('pallet pickup clearance verified; ROS control settled, transfer may start')
+        if getattr(self, 'pick_path_restoring', False):
+            self._plan_pick_path()
             return
         if getattr(self, 'continuous_return_restoring', False):
             self._plan_continuous_return()
@@ -4245,11 +4431,72 @@ class PickupSupervisor(ContinuousTransport, Node):
             self.direct_place_deadline = None
             self.direct_place_force_baseline_z = None
             self.direct_place_step_completed_at = None
+        if (getattr(self, 'transport_is_return', False) and
+                not getattr(self, 'return_to_observation', True)):
+            try:
+                if self.planning_scene_status.get('attached_item_id'):
+                    raise ValueError('item remains attached after release')
+                if self._link_tcp_xyz()[2] < self.return_clearance_z - self.tolerance:
+                    raise ValueError('empty tool did not reach the overhead handoff')
+            except ValueError as exc:
+                self._fault(str(exc))
+                return
+            self.continuous_return_completed = True
         self.state = self.SUCCEEDED
         self.publish_status()
 
     def _proceed_to_retreat(self, vacuum_verified=True):
         self.vacuum_verified = vacuum_verified
+        source = getattr(self, 'active_pickup_snapshot', None) or {}
+        pallet_source = (source.get('pickup_source') == 'pallet' or
+                         ('retrieval_target_id' in source and
+                          source.get('pickup_source') not in ('buffer', 'incoming')))
+        if (getattr(self, 'operation_kind', None) == 'pickup' and pallet_source and
+                getattr(self, 'defer_pickup_lift', False) and vacuum_verified):
+            # Match post-place retreat: clear the low contact region directly,
+            # then restore ROS control before the planner owns the long lift.
+            try:
+                if getattr(self, 'raised_pick_active', False):
+                    sdk = self._direct_mode_tcp_xyz()
+                    current = (sdk[0], sdk[1], sdk[2] + self.direct_tcp_z_offset)
+                    # XY is verified in link_tcp after restoration. SDK tool
+                    # origins may differ, so use the source snapshot's XY.
+                    xy = (float(source['x_m']), float(source['y_m']))
+                else:
+                    current = self._tcp_xyz()
+                    xy = current[:2]
+                target = max(float(self.pregrasp_z), float(current[2]))
+                if not math.isfinite(target) or target > self.servo_bounds_mm[5]/1000:
+                    raise ValueError('pickup clearance exceeds workspace ceiling')
+            except (ValueError, TypeError, KeyError) as exc:
+                self._fault(f'cannot prepare pallet pickup clearance: {exc}; item remains held')
+                return
+            self.pickup_clearance_pending = True
+            self.pickup_clearance_target_z = target
+            self.pickup_clearance_start_xy = xy
+            self.direct_target_z = target
+            self.defer_pickup_lift = False
+            direct_owned = getattr(self, 'raised_pick_active', False)
+            self.raised_pick_active = False
+            self.direct_place_stepping = False
+            self.direct_place_recovery_active = False
+            if direct_owned:
+                self._resume_direct_place_recovery_retreat()
+            else:
+                self._disable_servo_then_direct_retreat()
+            return
+        if getattr(self, 'raised_pick_active', False):
+            # Direct descent owns mode 0. Never report deferred pickup success
+            # to the transport planner before restoring mode 1 and settling.
+            self.raised_pick_active = False
+            self.direct_place_stepping = False
+            self.direct_place_recovery_active = False
+            if getattr(self, 'defer_pickup_lift', False) and vacuum_verified:
+                self.defer_pickup_lift = False
+                self._restore_ros2_control_mode()
+            else:
+                self._resume_direct_place_recovery_retreat()
+            return
         if self._should_return_continuously():
             self.vacuum_verified = False
             self._begin_continuous_return()
@@ -4331,6 +4578,18 @@ class PickupSupervisor(ContinuousTransport, Node):
         self._proceed_to_retreat()
 
     def _turn_vacuum_off(self):
+        # Use the same live xArm RPY convention as staging retrieval. Keep this
+        # separate from staging_release_tcp_pose so slot accounting is unchanged.
+        self.pallet_release_rpy_rad = None
+        if not self.staging_place_active:
+            if (self.robot_tcp_pose is not None and self.robot_state_time is not None and
+                    time.monotonic() - self.robot_state_time <= self.status_timeout and
+                    len(self.robot_tcp_pose) == 6 and
+                    all(math.isfinite(v) for v in self.robot_tcp_pose)):
+                self.pallet_release_rpy_rad = tuple(self.robot_tcp_pose[3:6])
+            else:
+                self._fault('cannot record pallet release orientation: fresh TCP pose required; item remains held')
+                return
         if self.staging_place_active:
             pose_is_fresh = (
                 self.robot_tcp_pose is not None and
@@ -4484,6 +4743,29 @@ class PickupSupervisor(ContinuousTransport, Node):
         self._request_vacuum_status()
 
     def _fault(self, reason):
+        self.raised_pick_ready = None
+        self.raised_pre_place_ready = None
+        self.raised_retreat_pose = None
+        if ((getattr(self, 'raised_place_hold_on_failure', False) and
+                getattr(self, 'direct_place_stepping', False)) or
+                getattr(self, 'pickup_clearance_pending', False) or
+                getattr(self, 'transport_sdk_active', False) or
+                getattr(self, 'live_pick_pause_gate', None) is not None or
+                getattr(self, 'return_escape_active', False)):
+            # Servo disable alone cannot stop a direct xArm service move.
+            # Do not queue another step or release while this stop is pending.
+            if self.set_state_client.service_is_ready():
+                stop = SetInt16.Request()
+                stop.data = 3
+                self.set_state_client.call_async(stop)
+            else:
+                self.get_logger().error('direct descent stop service unavailable; operator stop required')
+        self.live_pick_pause_gate = None
+        self.pickup_clearance_pending = False
+        self.transport_sdk_active = False
+        self.transport_sdk_candidate = False
+        self.return_escape_active = False
+        self.pick_path_restoring = False
         if getattr(self, 'transport_is_return', False) and reason.startswith('KINEMATIC_REJECTED:'):
             reason = 'continuous return rejected:' + reason.removeprefix('KINEMATIC_REJECTED:')
         self.continuous_return_restoring = False
@@ -4496,6 +4778,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             self.transfer_goal_handle = None
         self.direct_motion_generation += 1
         self.direct_place_stepping = False
+        self.direct_place_recovery_active = False
+        self.raised_pick_active = False
         self.fault = reason
         self.state = self.FAULT
         self.restore_wait_sequence = None
@@ -4803,6 +5087,14 @@ class PickupSupervisor(ContinuousTransport, Node):
             'operation_kind': self.operation_kind,
             'staging_place_active': self.staging_place_active,
             'release_tcp_pose_mm_rad': self.staging_release_tcp_pose,
+            'transport_slot_yaw_flipped': getattr(self, 'transport_slot_yaw_flipped', False),
+            'pallet_release_rpy_rad': getattr(self, 'pallet_release_rpy_rad', None),
+            'transport_route_attempt': self.transport_route_attempt,
+            'transport_alternatives_enabled': self.transport_alternatives_enabled,
+            'sdk_transport_fallback_enabled': getattr(self, 'sdk_transport_enabled', False),
+            'sdk_transport_active': getattr(self, 'transport_sdk_active', False),
+            'sdk_transport_phase': getattr(self, 'sdk_phase', None),
+            'sdk_transport_command_index': getattr(self, 'sdk_command_index', 0),
             'fault': self.fault,
             'dry_run': self.dry_run,
             'pregrasp_z_m': self.pregrasp_z,
@@ -4824,6 +5116,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             'contact_detected': self.contact_detected,
             'probe_only': self.probe_only,
             'object_info_obtained': self.object_info_obtained,
+            'pick_path_completed': getattr(self, 'pick_path_completed', False),
+            'pick_path_target_id': getattr(self, 'pick_path_target_id', None),
             'contact_tcp_z_m': self.contact_tcp_z,
             'contact_tcp_xyz_m': self.contact_tcp_xyz,
             'contact_reference_z_m': self.contact_reference_z,
@@ -4836,6 +5130,9 @@ class PickupSupervisor(ContinuousTransport, Node):
                 self.singularity_place_step * 1000.0,
             'direct_transfer_succeeded': self.direct_transfer_succeeded,
             'continuous_return_completed': getattr(self, 'continuous_return_completed', False),
+            'return_ik_escape_active': getattr(self, 'return_escape_active', False),
+            'return_ik_escape_steps': getattr(self, 'return_escape_count', 0),
+            'return_to_observation': getattr(self, 'return_to_observation', True),
             'continuous_return_active': bool(
                 getattr(self, 'transport_is_return', False) and self.state in self.ACTIVE),
             'direct_transfer_motion_started': self.direct_transfer_motion_started,

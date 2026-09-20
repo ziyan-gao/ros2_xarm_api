@@ -71,6 +71,21 @@ private Q_SLOTS:
   void retrieveFromStagingSlot();
   void resetStagingSlots();
 private:
+  void runPickPlaceTest(size_t index);
+  void updatePickPlaceTest(const QString & payload);
+  std::array<QPushButton *, 8> test_buttons_{};
+  std::array<QWidget *, 10> test_conflicting_groups_{};
+  std::array<rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr, 8> test_clients_{};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr test_status_sub_;
+  QLabel * test_status_label_{nullptr};
+  QCheckBox * test_confirm_{nullptr};
+  QCheckBox * test_pack_unpack_only_{nullptr};
+  QCheckBox * test_two_items_{nullptr};
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr test_two_items_client_;
+  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr test_mode_client_;
+  bool test_mode_pending_{false};
+  QTimer * test_stale_timer_{nullptr};
+  QString test_last_status_;
   void setGripper(bool close);
   QDoubleSpinBox * force_threshold_;
   QSlider * motion_speed_;

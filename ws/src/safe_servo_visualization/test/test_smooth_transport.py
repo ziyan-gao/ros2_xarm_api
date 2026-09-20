@@ -8,6 +8,23 @@ from safe_servo_visualization.smooth_transport import coefficients
 from test_continuous_transport import planned_harness, Future
 
 
+def test_grouped_translation_keeps_interior_velocity_through_join_and_retiming():
+    from safe_servo_visualization.transport_alternatives import join_trajectories
+    h, result = planned_harness()
+    trajectory = result.solution.joint_trajectory
+    middle = JointTrajectoryPoint()
+    middle.positions = [.1, .05]
+    middle.velocities = [.15, .075]
+    middle.time_from_start.nanosec = 500000000
+    trajectory.points.insert(1, middle)
+    result.solution.joint_trajectory = join_trajectories([trajectory], h.arm_joint_names)
+    h._transport_planned(Future(result))
+    assert not h.fault and h.state == h.TRANSPORT_VALIDATING
+    assert any(abs(v) > 1e-6 for v in h.transport_trajectory.points[1].velocities)
+    assert all(v == 0. for v in h.transport_trajectory.points[0].velocities)
+    assert all(v == 0. for v in h.transport_trajectory.points[-1].velocities)
+
+
 @pytest.mark.parametrize('middle_velocity', [0., .15])
 def test_stop_and_nonstop_paths_have_c2_knots_and_bounded_derivatives(middle_velocity):
     h, result = planned_harness()

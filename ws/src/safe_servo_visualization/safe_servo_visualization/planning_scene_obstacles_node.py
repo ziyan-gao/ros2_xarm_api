@@ -343,6 +343,11 @@ class PlanningSceneObstacles(Node):
         if any(float(snapshot[key]) <= 0.0 for key in fields[4:7]):
             raise ValueError('non-positive item dimension')
         int(snapshot['box_id'])
+        if 'recorded_grasp' in snapshot:
+            grasp = snapshot['recorded_grasp']
+            if (len(grasp) != 7 or not all(math.isfinite(float(v)) for v in grasp) or
+                    abs(sum(float(v)**2 for v in grasp[3:])-1.) > 1e-3):
+                raise ValueError('invalid recorded grasp transform')
 
     def _attach_detected_item(self):
         if (self.apply_pending or self.attached_item_id
@@ -373,6 +378,11 @@ class PlanningSceneObstacles(Node):
         # centered laterally, so model the object center as half its measured
         # height below the contact point in the object's local frame.
         center = self._rotate((0.0, 0.0, -item_size[2] / 2.0), item_q)
+        if 'recorded_grasp' in snapshot:
+            # Retrieval reproduces the stored TCP grasp: retain the original
+            # object-to-tool transform rather than re-deriving a zero-yaw box.
+            center = tuple(snapshot['recorded_grasp'][:3])
+            item_q = tuple(snapshot['recorded_grasp'][3:])
         obj = self._box(object_id, item_size, center, item_q)
         obj.header.frame_id = 'link_tcp'
         attached = AttachedCollisionObject()

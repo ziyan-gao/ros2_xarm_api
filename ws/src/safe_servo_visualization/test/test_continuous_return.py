@@ -10,6 +10,91 @@ from safe_servo_visualization.place_pipeline_node import PlacePipeline
 from test_continuous_transport import Harness, Future, planned_harness, DOWN
 
 
+def test_flipped_slot_retreat_keeps_verified_target_without_mutating_coordinator():
+    h = Harness()
+    h.motion_status = dict(operation_id=13, transfer_context='staging_store',
+                          pre_place_tcp_xyz_m=[.1,.2,.19],
+                          transfer_tcp_quaternion_xyzw=DOWN)
+    h.verified_slot_transfer_target = dict(h.motion_status,
+        pre_place_tcp_xyz_m=[.12,.22,.19], transfer_tcp_quaternion_xyzw=[0,1,0,0])
+    target = h._return_transport_target()
+    assert target['pre_place_tcp_xyz_m'] == [.12,.22,.19]
+    assert target['transfer_tcp_quaternion_xyzw'] == [0,1,0,0]
+    assert h.motion_status['transfer_tcp_quaternion_xyzw'] == DOWN
+    h.motion_status['operation_id'] = 14
+    with pytest.raises(ValueError, match='different target'):
+        h._return_transport_target()
+
+
+def test_flipped_retreat_without_verified_snapshot_fails_closed():
+    h = Harness()
+    h.motion_status = dict(operation_id=13, transfer_context='staging_store')
+    h.transport_slot_yaw_flipped = True
+    with pytest.raises(ValueError, match='no verified'):
+        h._return_transport_target()
+
+
+@pytest.mark.parametrize('is_return', [False, True])
+def test_capture_orientation_guard_only_applies_to_loaded_transfer(is_return):
+    h = Harness()
+    h.transport_is_return = is_return
+    h.return_to_observation = False
+    h.transport_target = dict(transfer_context='staging_store',
+        pre_place_tcp_xyz_m=[.1,.2,.19], transfer_tcp_quaternion_xyzw=DOWN,
+        transport_corner_clearance_z_m=.6)
+    h._transport_pose = lambda result: (np.array([.12,.22,.2]), np.array([0,1,0,0]))
+    # Stop at the independent ceiling guard after building the vertical path.
+    h._transport_ceiling = lambda: .5
+    h._transport_start_fk(Future(None))
+    if is_return:
+        assert 'ceiling' in h.fault
+        assert 'orientation changed' not in h.fault
+    else:
+        assert 'orientation changed' in h.fault
+
+
+@pytest.mark.parametrize('xyz,q,attached,skip', [
+    ([.3, .2, .15], DOWN, '', True),
+    ([.3, .2, .5], DOWN, '', True),
+    ([.31, .2, .15], DOWN, '', False),
+    ([.3, .2, .09], DOWN, '', False),
+    ([.3, .2, .51], DOWN, '', False),
+    ([.3, .2, .15], [0., 1., 0., 0.], '', False),
+    ([.3, .2, .15], DOWN, 'held', False),
+])
+def test_return_collision_exception_only_initial_empty_vertical_column(xyz, q, attached, skip):
+    h = Harness()
+    h.transport_scene = None
+    h.planning_scene_status = {'attached_item_id': attached}
+    h.transport_start_xyz = np.array([.3, .2, .1])
+    h.transport_start_q = np.array(DOWN)
+    h.transport_high_z = .5
+    h.return_collision_column_open = True
+    h.return_collision_previous_z = .1
+    h.transport_checks = [((0., 0.), 0.)]
+    h.transport_check_index = 0
+    h._transport_pose = lambda result: result
+    geometry, checked = [], []
+    h._transport_geometry_checked = geometry.append
+    h._transport_check_collision = checked.append
+    h._return_collision_classified(Future((np.array(xyz), np.array(q))))
+    assert not h.fault
+    assert bool(geometry) == skip
+    assert bool(checked) != skip
+    if not skip:
+        # Returning to the column later cannot reopen the exception.
+        h.planning_scene_status = {}
+        h._return_collision_classified(Future((np.array([.3, .2, .2]), np.array(DOWN))))
+        assert len(checked) == 2
+        assert not geometry
+
+
+def test_return_collision_classifier_fails_closed_on_missing_fk():
+    h = Harness()
+    h._return_collision_classified(Future(None))
+    assert 'FK failed' in h.fault
+
+
 @pytest.mark.parametrize('actual,expected,allowed', [
     ('', None, True), (None, None, True), ('', {}, True),
     ('unexpected_item', None, False),
@@ -246,6 +331,31 @@ def test_disable_confirmation_restores_control_but_does_not_start_motion():
     assert node.return_clearance_pending
     node._finish_retreat()  # This is the continuation of the readiness gate.
     assert events == ['slow_retreat','plan']
+
+
+@pytest.mark.parametrize('case', ['valid', 'stale', 'changed', 'nonfinite', 'ceiling'])
+def test_slow_return_preserves_verified_raised_pre_place_for_same_target_only(case):
+    node = return_supervisor()
+    node.motion_status['pre_place_tcp_xyz_m'] = [.1452, -.3796, -.0414]
+    node.raised_retreat_pose = dict(target_id=6, xyz=[.1452, -.3796, -.0264],
+                                   original_xyz=[.1452, -.3796, -.0414])
+    node.servo_bounds_mm = [-1000, 1000, -1000, 1000, -100, 800]
+    node.get_logger = lambda: NS(info=lambda *args: None)
+    future = Future(NS(success=True))
+    node.enable_client = NS(service_is_ready=lambda: True, call_async=lambda req: future)
+    events = []
+    node._begin_direct_retreat = lambda: events.append(node.direct_target_z)
+    if case == 'stale': node.raised_retreat_pose['target_id'] = 5
+    if case == 'changed': node.motion_status['pre_place_tcp_xyz_m'][0] += .01
+    if case == 'nonfinite': node.raised_retreat_pose['xyz'][2] = float('nan')
+    if case == 'ceiling': node.servo_bounds_mm[5] = -30.
+    node._begin_continuous_return()
+    if case in ('changed', 'nonfinite', 'ceiling'):
+        assert node.fault and not events
+    else:
+        assert not events and not node.fault
+        future.callback(future)
+        assert events == pytest.approx([-.0414 if case == 'stale' else -.0264])
 
 
 def test_late_disable_response_after_abort_is_ignored():

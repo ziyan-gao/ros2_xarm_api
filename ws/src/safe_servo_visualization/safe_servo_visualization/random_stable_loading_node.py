@@ -301,6 +301,13 @@ class RandomStableLoadingNode(Node):
                 measured_dimensions_mm[2],
                 self.packing_height_resolution_mm),
         )
+        options = {}
+        if self.NODE_NAME == 'policy_loading' and len(message.data) >= 14:
+            unrounded_mm = tuple(float(v)*1000.0 for v in message.data[11:14])
+            if not all(math.isfinite(v) and v > 0 for v in unrounded_mm):
+                self._set_fault('invalid unrounded measurement dimensions')
+                return
+            options['measured_dimensions_mm'] = unrounded_mm
         self.state = 'PLANNING'
         self.rejected_loading_poses = set()
         self.retrying_carried_item = False
@@ -312,6 +319,7 @@ class RandomStableLoadingNode(Node):
             self._plan_item,
             item_id=item_id,
             dimensions_mm=dimensions_mm,
+            **options,
         )
         self.get_logger().info(
             'planning stable target for item %d, dimensions=(%d, %d, %d) mm; '
@@ -558,7 +566,12 @@ class RandomStableLoadingNode(Node):
 
     def _publish_target(self, pending):
         message = Float64MultiArray()
-        message.data = list(pending.target_values)
+        values = list(pending.target_values)
+        # Keep geometry and mode-specific clearance in the same accepted target.
+        # ROS converts assigned data to array.array; assemble the list first.
+        if len(values) == 12:
+            values.extend(values[2:5])
+        message.data = values[:15] + [float(self.transfer_corner_height)]
         self.target_pub.publish(message)
         self.last_target_publish = time.monotonic()
 

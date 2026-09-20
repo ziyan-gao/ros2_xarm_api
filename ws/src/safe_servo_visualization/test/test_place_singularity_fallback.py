@@ -58,6 +58,60 @@ def _descending_supervisor(operation_kind, fault=None):
     return supervisor
 
 
+def test_raised_place_failure_never_releases_item():
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor.direct_place_recovery_active = True
+    supervisor.raised_place_hold_on_failure = True
+    faults = []
+    releases = []
+    supervisor._fault = faults.append
+    supervisor._turn_vacuum_off = lambda: releases.append(True)
+    supervisor._release_from_direct_place('force telemetry stale')
+    assert faults == ['raised pre-place descent stopped: force telemetry stale; item remains held']
+    assert releases == []
+
+
+@pytest.mark.parametrize('stale', [False, True])
+def test_raised_place_handoff_preserves_floor_and_is_single_use(stale):
+    from std_srvs.srv import Trigger
+    supervisor = object.__new__(PickupSupervisor)
+    supervisor._ft_recovery_blocks_start = lambda response: False
+    supervisor.manual_gripper_pending = False
+    supervisor.state = supervisor.SUCCEEDED
+    supervisor.motion_status = dict(target='transfer', state='SUCCEEDED', operation_id=7,
+                                    transfer_tcp_z_m=.6)
+    supervisor.direct_transfer_succeeded = True
+    supervisor.pallet_locked = True
+    supervisor.planning_scene_status = dict(attached_item_id='box')
+    supervisor.enable_client = RecordingClient()
+    supervisor._tcp_xyz = lambda: (.1, -.3, .21)
+    supervisor.raised_pre_place_ready = dict(target_id=6 if stale else 7, item_id='box',
+                                            xyz=[.1, -.3, .21], original_z=.2)
+    supervisor.last_force_time = time.monotonic()
+    supervisor.force_timeout = 1.
+    supervisor.operation_id = 10
+    supervisor.tolerance = .001
+    supervisor.place_workspace_z_min_mm = -200.
+    supervisor.max_descent = .04
+    supervisor.minimum_contact_descent = .001
+    calls = []
+    supervisor._begin_place_singularity_fallback = calls.append
+    supervisor._reset_servo_then_begin_place = lambda *args: pytest.fail('unexpected Servo descent')
+    response = supervisor.start_place_callback(None, Trigger.Response())
+    if stale:
+        assert not response.success
+        assert not calls
+        assert supervisor.operation_id == 10
+    else:
+        assert response.success
+        assert supervisor.floor_z == pytest.approx(.16)
+        assert supervisor.raised_pre_place_ready is None
+        assert supervisor.raised_retreat_pose == dict(
+            target_id=7, xyz=[.1, -.3, .21], original_xyz=[.1, -.3, .2])
+        assert supervisor.raised_place_hold_on_failure
+        assert calls == ['validated raised pre-place approach']
+
+
 def test_place_singularity_uses_release_and_retreat_fallback():
     supervisor = _descending_supervisor('place')
     fallbacks = []
@@ -123,6 +177,7 @@ def test_pickup_external_wrench_limit_remains_a_hard_fault():
 
 def test_singularity_recovery_records_fallback_and_disables_servo_first():
     supervisor = object.__new__(PickupSupervisor)
+    supervisor.operation_id = 1
     supervisor.place_fallback_used = False
     supervisor.place_fallback_reason = ''
     supervisor.direct_place_recovery_active = False

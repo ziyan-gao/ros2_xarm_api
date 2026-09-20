@@ -62,6 +62,7 @@ class MotionCoordinator(Node):
             p('observation_joint_tolerance_rad'))
         self.pre_place_clearance = float(p('pre_place_clearance_m'))
         self.transfer_corner_height = float(p('transfer_corner_height_m'))
+        self.default_transfer_corner_height = self.transfer_corner_height
         if self.pregrasp_clearance <= 0.0:
             raise ValueError('pregrasp_clearance_m must be positive')
         if self.joint_state_timeout <= 0.0:
@@ -138,6 +139,13 @@ class MotionCoordinator(Node):
         self.create_subscription(
             Float64MultiArray, '/staging_slots/store_transfer_target',
             self.staging_store_transfer_target_callback, 10)
+        self.pick_path_status = {}
+        self.pick_path_status_time = 0.0
+        self.create_subscription(String, '/pickup_supervisor/status', self._pick_path_status, 10)
+        self.create_service(Trigger, '/motion_coordinator/prepare_pick_waypoints',
+                            self.prepare_pick_waypoints_callback)
+        self.create_service(Trigger, '/motion_coordinator/accept_pick_waypoints',
+                            self.accept_pick_waypoints_callback)
 
         self.create_service(
             Trigger, '/motion_coordinator/plan_observation',
@@ -312,6 +320,8 @@ class MotionCoordinator(Node):
             'nominal_transfer_corner_z_m': self.nominal_transfer_corner_z,
             'transfer_corner_height_pallet_m': self.transfer_corner_height,
             'transfer_context': self.transfer_context,
+            'staging_yaw180_pose': ((self.staging_store_transfer_target or {}).get('yaw180_pose')
+                                   if self.transfer_context == 'staging_store' else None),
             'rotate_item_90': self.rotate_item_90,
             'keep_eef_perpendicular_to_pallet': self.keep_eef_perpendicular,
             'placement_corner_correction_xyz_m':
@@ -350,6 +360,12 @@ class MotionCoordinator(Node):
         self.pallet_locked = message.data == 'LOCKED'
 
     def pallet_config_callback(self, message):
+        height = float(message.data[18]) if len(message.data) >= 19 else 0.0
+        if not math.isfinite(height) or height < 0:
+            self.get_logger().error('invalid pallet transfer height')
+            return
+        self.transfer_corner_height = height if height > 0 else getattr(
+            self, 'default_transfer_corner_height', getattr(self, 'transfer_corner_height', .47))
         if len(message.data) >= 12:
             self.place_target_xyz = tuple(
                 float(value) / 1000.0 for value in message.data[9:12])
@@ -519,7 +535,7 @@ class MotionCoordinator(Node):
             self.get_logger().warning(
                 'ignored incomplete staging store transfer target')
             return
-        values = tuple(map(float, message.data[:9]))
+        values = tuple(map(float, message.data[:10]))
         if not all(math.isfinite(value) for value in values):
             self.get_logger().warning(
                 'ignored non-finite staging store transfer target')
@@ -541,8 +557,14 @@ class MotionCoordinator(Node):
             'quaternion': tuple(value / quaternion_norm
                                 for value in quaternion),
             'pre_place_z': values[8],
+            'corner_clearance_z': values[9] if len(values) > 9 else None,
             'received_at': time.monotonic(),
         }
+        if len(message.data) == 17:
+            alternate = list(map(float, message.data[10:17]))
+            norm = math.sqrt(sum(v*v for v in alternate[3:]))
+            if all(math.isfinite(v) for v in alternate) and abs(norm-1.) < 1e-5:
+                self.staging_store_transfer_target['yaw180_pose'] = alternate
 
     def prepare_staging_store_transfer_callback(self, _request, response):
         """Expose a staging waypoint through the normal transfer interface."""
@@ -568,7 +590,7 @@ class MotionCoordinator(Node):
         pre_place.orientation = transfer.orientation
         self.transfer_tcp_pose = transfer
         self.pre_place_tcp_pose = pre_place
-        self.nominal_transfer_corner_z = None
+        self.nominal_transfer_corner_z = target.get('corner_clearance_z')
         self.operation_id += 1
         self.target = 'transfer'
         self.transfer_context = 'staging_store'
@@ -910,11 +932,15 @@ class MotionCoordinator(Node):
     def staging_retrieve_target_callback(self, message):
         # [slot, contact-reference TCP xyz_m, release TCP rpy_rad,
         #  unrotated_item_size_xyz_m, clearance_m, object_yaw_rad,
-        #  optional approach_tcp_z_m]
+        #  optional approach_tcp_z_m, optional pickup_source (0=pallet, 1=buffer)]
         if len(message.data) < 11:
             self.get_logger().warning('ignored incomplete staging retrieve target')
             return
-        values = tuple(map(float, message.data[:13]))
+        values = tuple(map(float, message.data[:21]))
+        if len(values) not in (11, 12, 13, 14, 17, 21):
+            self.staging_retrieve_target = None
+            self.get_logger().warning('ignored incomplete recorded grasp transform')
+            return
         if not all(math.isfinite(value) for value in values):
             self.get_logger().warning('ignored non-finite staging retrieve target')
             return
@@ -923,6 +949,11 @@ class MotionCoordinator(Node):
         clearance = values[10]
         object_yaw = values[11] if len(message.data) >= 12 else 0.0
         approach_tcp_z = values[12] if len(message.data) >= 13 else None
+        source_code = values[13] if len(values) >= 14 else 0.0
+        if source_code not in (0.0, 1.0):
+            self.staging_retrieve_target = None
+            self.get_logger().warning('ignored unknown retrieval pickup source')
+            return
         if target_id < 0 or any(value <= 0.0 for value in size):
             self.get_logger().warning('ignored invalid retrieval target or item size')
             return
@@ -942,8 +973,24 @@ class MotionCoordinator(Node):
             'clearance': clearance,
             'object_yaw': object_yaw,
             'approach_tcp_z': approach_tcp_z,
+            'pickup_source': 'buffer' if source_code == 1.0 else 'pallet',
             'received_at': time.monotonic(),
         }
+        if len(values) == 17:
+            from .transport_alternatives import waypoint_candidates
+            rail, candidate, direction = values[14:17]
+            if (rail not in (0., 1.) or direction not in (-1., 1.) or
+                    candidate != int(candidate) or not -1 <= candidate < len(waypoint_candidates())):
+                self.staging_retrieve_target = None
+                self.get_logger().warning('ignored invalid inspection route hint')
+                return
+            self.staging_retrieve_target['inspection_route'] = [int(rail), int(candidate), int(direction)]
+        if len(values) == 21:
+            if source_code != 1.0 or abs(sum(v*v for v in values[17:21])-1.) > 1e-3:
+                self.staging_retrieve_target = None
+                self.get_logger().warning('ignored invalid recorded buffer grasp transform')
+                return
+            self.staging_retrieve_target['recorded_grasp'] = list(values[14:21])
 
     def plan_staging_approach_callback(self, _request, response):
         """Plan the mandatory above-container waypoint for pallet retrieval."""
@@ -978,7 +1025,32 @@ class MotionCoordinator(Node):
         self.planned_pregrasp = None
         return self._start_pose_plan(pose, 2000 + target_id, response)
 
-    def plan_staging_pregrasp_callback(self, _request, response):
+    def prepare_pick_waypoints_callback(self, request, response):
+        return self.plan_staging_pregrasp_callback(request, response, prepare_only=True)
+
+    def _pick_path_status(self, message):
+        try:
+            self.pick_path_status = json.loads(message.data)
+            self.pick_path_status_time = time.monotonic()
+        except (TypeError, ValueError):
+            pass
+
+    def accept_pick_waypoints_callback(self, _request, response):
+        status = self.pick_path_status
+        if (self.state != self.PREPARED or self.transfer_context != 'known_pick' or
+                not self.planned_pregrasp or time.monotonic()-self.pick_path_status_time > 1.0 or
+                status.get('state') != 'SUCCEEDED' or not status.get('pick_path_completed') or
+                status.get('operation_kind') != 'pick_approach' or
+                status.get('pick_path_target_id') != self.operation_id):
+            response.message = 'fresh verified pickup-path completion for this target is required'
+            return response
+        self._persist_pregrasp_snapshot()
+        self._set_state(self.SUCCEEDED)
+        response.success = True
+        response.message = 'verified pickup approach accepted; pre-grasp is ready'
+        return response
+
+    def plan_staging_pregrasp_callback(self, _request, response, *, prepare_only=False):
         if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
@@ -987,6 +1059,11 @@ class MotionCoordinator(Node):
         target = self.staging_retrieve_target
         if target is None or time.monotonic() - target['received_at'] > 2.0:
             response.message = 'fresh staging retrieve target is unavailable'
+            return response
+        if prepare_only and (not self.pallet_locked or
+                self.attached_item_geometry is not None or
+                target.get('approach_tcp_z') is None):
+            response.message = 'pickup path needs locked pallet, empty tool, and overhead clearance'
             return response
         target_id = target['target_id']
         x, y, contact_z, roll, pitch, yaw = target['contact_tcp_pose']
@@ -1012,7 +1089,30 @@ class MotionCoordinator(Node):
             'yaw_rad': float(target['object_yaw']),
             'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
             'retrieval_target_id': target_id,
+            'pickup_source': target.get('pickup_source', 'pallet'),
         }
+        if 'recorded_grasp' in target:
+            self.planned_pregrasp['recorded_grasp'] = target['recorded_grasp']
+        if 'inspection_route' in target:
+            self.planned_pregrasp['inspection_route'] = target['inspection_route']
+        if prepare_only:
+            self._clear_pregrasp_snapshot()
+            self.pre_place_tcp_pose = pose  # Shared executor endpoint: pre-pick, NOT contact.
+            overhead = Pose()
+            overhead.position.x, overhead.position.y = x, y
+            overhead.position.z = float(target['approach_tcp_z'])
+            overhead.orientation = pose.orientation
+            self.transfer_tcp_pose = overhead
+            self.nominal_transfer_corner_z = float(target['approach_tcp_z'])
+            self.transfer_context = 'known_pick'
+            self.operation_id += 1
+            self.target = f'pregrasp_box_{box_id}'
+            self.cancel_requested = self.pause_requested = False
+            self._publish_pregrasp_marker(pose, box_id)
+            self._set_state(self.PREPARED)
+            response.success = True
+            response.message = f'Prepared known-item pickup path; operation_id={self.operation_id}'
+            return response
         if target.get('approach_tcp_z') is not None:
             if not self.straight_plan_client.service_is_ready():
                 response.message = (

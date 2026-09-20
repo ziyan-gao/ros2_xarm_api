@@ -73,3 +73,29 @@ def test_symmetric_target_rejects_virtual_envelope_outside_pallet():
     node.loading_target_callback(message)
 
     assert acknowledgements == [(2, False, 2)]
+
+
+def test_loading_mode_height_switches_both_motion_consumers():
+    from safe_servo_visualization.motion_coordinator_node import MotionCoordinator
+    from safe_servo_visualization.pickup_supervisor_node import PickupSupervisor
+    node, ack = _loading_target_node()
+    coordinator = object.__new__(MotionCoordinator)
+    supervisor = object.__new__(PickupSupervisor)
+    for consumer in (coordinator, supervisor):
+        consumer.transfer_corner_height = .59
+        consumer.default_transfer_corner_height = .59
+    for height in (.47, .59, .47):
+        node.loading_target_callback(SimpleNamespace(data=[
+            1, 4, 0, 0, 0, 0, 110, 110, 150, 130, 130, 150, 0, 0, 0, height]))
+        assert ack[-1] == (1, True, 0)
+        config = SimpleNamespace(data=[0.]*18 + [node.active_transfer_corner_height_m])
+        for consumer in (coordinator, supervisor):
+            consumer.pallet_config_callback(config)
+            assert consumer.transfer_corner_height == height
+    # Legacy targets explicitly reset to the startup default, not last policy height.
+    node.loading_target_callback(SimpleNamespace(data=[
+        1, 4, 0, 0, 0, 0, 110, 110, 150, 130, 130, 150]))
+    assert node.active_transfer_corner_height_m == 0.
+    for consumer in (coordinator, supervisor):
+        consumer.pallet_config_callback(SimpleNamespace(data=[0.]*19))
+        assert consumer.transfer_corner_height == .59
