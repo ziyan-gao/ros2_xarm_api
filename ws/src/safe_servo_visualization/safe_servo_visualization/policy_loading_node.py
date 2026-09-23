@@ -54,6 +54,10 @@ class PolicyLoadingNode(RandomStableLoadingNode):
 
     def __init__(self):
         super().__init__()
+        if self.new_item_sam_enabled:
+            self.destroy_client(self.object_info_start_client)
+            self.object_info_start_client = self.create_client(
+                Trigger, '/pickup_pipeline/estimate_object_info_sam')
         self.result_recorder = PolicyResultRecorder(
             self.result_directory, self.result_config)
         self.loader.planning_observer = self._record_result
@@ -264,6 +268,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         if not isinstance(config, dict):
             raise TypeError(f'policy config must be a mapping: {config_path}')
         self.sam_inspection_enabled = inspection_enabled(config)
+        self.new_item_sam_enabled = config.get('new_item_sam_enabled', True)
+        if not isinstance(self.new_item_sam_enabled, bool):
+            raise ValueError('new_item_sam_enabled must be a boolean')
         geometry = PolicyGeometryConfig.from_mapping(config)
         # YAML is authoritative, including when an old launch still passes 20.
         clearance_result = self.set_parameters([
@@ -1690,6 +1697,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         inspector = getattr(self, 'sam_inspector', None)
         payload['sam_request_id'] = inspector.token if inspector else None
         payload['top_face_inspection_enabled'] = getattr(self, 'sam_inspection_enabled', False)
+        payload['new_item_sam_enabled'] = getattr(self, 'new_item_sam_enabled', False)
         operation = getattr(self, 'active_operation', None)
         rearrangement = getattr(self.loader, 'rearrangement', None)
         rearrangement_enabled = bool(getattr(

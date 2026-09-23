@@ -1,5 +1,7 @@
 """Continuous pallet transport; planning services never command the robot."""
 import math
+import copy
+from concurrent.futures import ThreadPoolExecutor
 import time
 import xml.etree.ElementTree as ET
 
@@ -22,6 +24,14 @@ from .transport_path import pickup_needs_observation, grid_pick_waypoints
 from .transport_alternatives import waypoint_candidates
 from .transport_reuse import TransportReuse
 from .staged_transport_timing import StagedTransportTiming
+
+
+def retime_snapshot(trajectory, limits, speed, acceleration, jerk, scale):
+    """Worker owns only copies; never touches a ROS node or robot state."""
+    timing = {}
+    checks, duration, ratio = smooth_and_sample(
+        trajectory, limits, speed, acceleration, jerk, scale, timing)
+    return trajectory, checks, duration, ratio, timing
 
 
 def cartesian_timing_issue(trajectory, required_joints):
@@ -412,12 +422,48 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 # an untimed geometric path or retry an execution failure.
                 raise ValueError(reason)
             scale = max(0.05, min(1.0, self.motion_speed_percent/100))
-            timing = {}
-            self.transport_checks, self.transport_duration, duration_ratio = smooth_and_sample(
-                trajectory, self.transport_joint_limits,
+            pool = getattr(self, '_retime_pool', None)
+            if pool is None:
+                self._retime_pool = pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='transport-retime')
+            prior = getattr(self, '_retime_pending', None)
+            if prior is not None and not prior[0].done():
+                raise ValueError('previous transport timing is still finishing; no new timing queued')
+            task = pool.submit(retime_snapshot,
+                copy.deepcopy(trajectory), copy.deepcopy(self.transport_joint_limits),
                 self.direct_transfer_max_joint_speed, self.direct_transfer_joint_acc,
                 self.transport_max_joint_jerk if self.transport_enforce_jerk_limit else None,
-                scale, timing)
+                scale)
+            self._retime_pending = (task, self.operation_id,
+                getattr(self, 'transport_route_generation', 0), self.motion_speed_percent)
+            self._retime_discarded = False
+            self.state = self.TRANSPORT_PLANNING
+            self.publish_status()
+        except ValueError as exc:
+            self._transport_timing_failed(exc)
+        except Exception as exc:
+            self._transport_timing_failed(exc)
+
+    def _poll_transport_timing(self):
+        pending = getattr(self, '_retime_pending', None)
+        if pending is None:
+            return
+        task, operation, generation, speed = pending
+        if (getattr(self, '_retime_discarded', False) or
+                operation != self.operation_id or self.state != self.TRANSPORT_PLANNING or
+                generation != getattr(self, 'transport_route_generation', 0)):
+            self._retime_discarded = True
+            task.cancel()
+            if task.done():
+                self._retime_pending = None
+            return
+        if not task.done():
+            return
+        self._retime_pending = None
+        try:
+            if speed != self.motion_speed_percent:
+                raise ValueError('motion speed changed during retiming; replan required')
+            trajectory, self.transport_checks, self.transport_duration, duration_ratio, timing = task.result()
+            scale = max(0.05, min(1.0, speed/100))
             self.transport_trajectory = trajectory
             worst = timing['initial_worst']
             jerk_cap = (f'{self.transport_max_joint_jerk*scale:.3f} rad/s^3'
@@ -439,21 +485,20 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 f'item-bottom clearance Z={self.transport_clearance:.3f} m')
             self._transport_validate_next()
         except ValueError as exc:
-            if self._reuse_fallback(str(exc)):
-                return
-            if str(exc).startswith('controller interpolation exceeds'):
-                self._fault(f'KINEMATIC_REJECTED: {exc}')
-                return
-            if (str(exc) == 'transport validation exceeds the bounded sample budget' and
-                    self._fallback_staged_return(str(exc))):
-                return
-            # Malformed timing/derivatives are not evidence that the sampled
-            # loading pose is unreachable. Stop instead of exhausting targets.
-            self._fault(f'continuous transport trajectory validation failed: {exc}')
+            self._transport_timing_failed(exc)
         except Exception as exc:
-            if self._reuse_fallback(str(exc)):
-                return
-            self._fault(f'continuous transport planning failed: {exc}')
+            self._transport_timing_failed(exc)
+
+    def _transport_timing_failed(self, exc):
+        if self._reuse_fallback(str(exc)):
+            return
+        if str(exc).startswith('controller interpolation exceeds'):
+            self._fault(f'KINEMATIC_REJECTED: {exc}')
+            return
+        if (str(exc) == 'transport validation exceeds the bounded sample budget' and
+                self._fallback_staged_return(str(exc))):
+            return
+        self._fault(f'continuous transport trajectory validation failed: {exc}')
 
     def _transport_validate_next(self):
         if self.transport_check_index == len(self.transport_checks):
@@ -616,6 +661,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             return
         if max(abs(a-b) for a,b in zip(self.latest_joint_positions,self.transport_seed)) > 0.01:
             self._fault('robot moved during continuous transport planning')
+            return
+        if getattr(self, 'transport_is_pick', False) and self._check_pick_descent_before_execution():
             return
         if getattr(self, 'transport_sdk_candidate', False):
             self._sdk_begin_execution()
@@ -814,6 +861,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
 
     def _transport_tick(self):
         if self.state not in self.TRANSPORT_STATES:
+            self._poll_transport_timing()  # Discard canceled/obsolete work only.
             return False
         now = time.monotonic()
         if self.robot_error not in (None,0):
@@ -840,6 +888,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         if self.state in (self.TRANSPORT_PLANNING,self.TRANSPORT_VALIDATING):
             if now-self.transport_started > 30:
                 self._fault('continuous transport planning/validation timed out')
+            else:
+                self._poll_transport_timing()
             return True
         if (self.robot_state_time is None or now-self.robot_state_time > self.status_timeout or
                 self.robot_mode != 1 or self.robot_state not in (0,1,2) or

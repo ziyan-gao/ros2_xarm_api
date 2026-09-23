@@ -199,7 +199,7 @@ class MotionCoordinator(Node):
             f'motion coordinator ready; waypoint_file={self.waypoint_file}')
 
     def plan_top_face_view_callback(self, _request, response):
-        """Debug camera move; use the normal collision-checked pose planner."""
+        """Prepare camera motion for the shared overhead waypoint executor."""
         if self.state not in (self.IDLE, self.SUCCEEDED):
             response.message = f'motion coordinator is not idle: {self.state}'
             return response
@@ -216,15 +216,25 @@ class MotionCoordinator(Node):
                 abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1) > 1e-3):
             response.message = 'invalid/stale top-face observation target'
             return response
-        if self.attached_item_geometry is not None or not self.pose_plan_client.service_is_ready():
-            response.message = 'empty tool and pose planner are required'
+        if self.attached_item_geometry is not None or not self.pallet_locked:
+            response.message = 'empty tool and locked pallet are required'
             return response
-        self.planned_pregrasp = None
         self._clear_pregrasp_snapshot()
-        result = self._start_pose_plan(target.pose, -100, response)
+        # Only route metadata: never expose this camera pose as a grasp target.
+        at_staging = -.480 <= p.x <= .480 and .075 <= p.y <= .785
+        self.planned_pregrasp = {'inspection_only': True,
+                                'pickup_source': 'buffer' if at_staging else 'pallet'}
+        self.pre_place_tcp_pose = target.pose
+        self.transfer_tcp_pose = target.pose
+        self.nominal_transfer_corner_z = p.z
+        self.transfer_context = 'known_pick'
+        self.operation_id += 1
         self.target = 'top_face_view'
-        self.publish_status()
-        return result
+        self.cancel_requested = self.pause_requested = False
+        self._set_state(self.PREPARED)
+        response.success = True
+        response.message = 'camera waypoint route prepared; use shared pickup-path executor'
+        return response
 
     def _restore_pregrasp_snapshot(self):
         try:
@@ -1077,7 +1087,8 @@ class MotionCoordinator(Node):
                 status.get('pick_path_target_id') != self.operation_id):
             response.message = 'fresh verified pickup-path completion for this target is required'
             return response
-        self._persist_pregrasp_snapshot()
+        if not self.planned_pregrasp.get('inspection_only'):
+            self._persist_pregrasp_snapshot()
         self._set_state(self.SUCCEEDED)
         response.success = True
         response.message = 'verified pickup approach accepted; pre-grasp is ready'

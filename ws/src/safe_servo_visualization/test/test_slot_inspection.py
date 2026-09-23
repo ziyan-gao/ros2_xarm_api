@@ -83,7 +83,7 @@ def test_inspection_requests_serialize_real_joint_state_from_tuple_seed(observat
         assert not requests
         return
     assert not faults
-    endpoint_z = observation_z - .03
+    endpoint_z = observation_z
     assert node.inspection_target[2] == pytest.approx(endpoint_z)
     assert node.inspection_target_message.data[12] == pytest.approx(max(.47, endpoint_z + .02))
     assert node.inspection_target[:2] == pytest.approx((.2, .2))

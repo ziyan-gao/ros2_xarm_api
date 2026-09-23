@@ -32,6 +32,7 @@ private:
   QLabel * preview_;
   QPlainTextEdit * details_;
   QPushButton * capture_;
+  QPushButton * refine_new_;
   QPushButton * segment_;
   QPushButton * save_;
   QPushButton * clear_;

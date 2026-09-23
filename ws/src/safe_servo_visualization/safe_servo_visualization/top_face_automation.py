@@ -19,6 +19,18 @@ class TopFaceAutomation:
         if not request:
             return set()
         owner = request['owner']
+        if owner == 'new_item':
+            status = self.motion_status.get('estimate', {})
+            if (status.get('state') != 'SAM_REFINEMENT' or
+                    status.get('sam_request_id') != request['request_id'] or
+                    time.monotonic()-self.motion_seen.get('estimate', 0) > 2):
+                raise ValueError('new-item refinement owner stopped or changed token')
+            for owner, states in (('test', ('ESTIMATING',)),
+                                  ('policy', ('LOCALIZING', 'WAITING_NEXT_ITEM'))):
+                if (self.motion_status.get(owner, {}).get('state') in states and
+                        time.monotonic()-self.motion_seen.get(owner, 0) <= 2):
+                    return {'estimate', owner}
+            raise ValueError('new-item refinement has no active test/policy owner')
         status = self.motion_status.get(owner, {})
         expected = 'REARRANGE_INSPECT' if owner == 'policy' else 'SAM_INSPECTION'
         if (status.get('state') != expected or status.get('sam_request_id') != request['request_id'] or
@@ -42,12 +54,15 @@ class TopFaceAutomation:
         request = None
         try:
             request = json.loads(msg.data)
-            if (request.get('owner') not in ('policy', 'slots', 'test') or
+            if (request.get('owner') not in ('policy', 'slots', 'test', 'new_item') or
                     not all(isinstance(request.get(k), str) and request[k] for k in ('request_id', 'target'))):
                 return
             if request.get('action') == 'cancel':
                 if self.inspection and request['request_id'] == self.inspection['request_id'] and request['owner'] == self.inspection['owner']:
-                    self._motion_fault('inspection canceled by owner')
+                    if request['owner'] == 'new_item':
+                        self.state, self.message = 'IDLE', 'New-item refinement canceled'
+                    else:
+                        self._motion_fault('inspection canceled by owner')
                     self.generation += 1
                     self.inspection = None
                 return
@@ -59,6 +74,14 @@ class TopFaceAutomation:
             self.inspection = request
             self._inspection_owners()
             self.inspection_started = time.monotonic()
+            if request['owner'] == 'new_item':
+                if not request['target'].startswith('coarse:'):
+                    raise ValueError('new-item request requires a stable coarse box')
+                self._idle_checks()
+                self.inspection_step = 'settling'
+                self.inspection_settle_until = time.monotonic()
+                self.state, self.message = 'CAPTURING', 'New-item SAM: stationary RGB refinement only'
+                return
             self.inspection_step = 'moving'
             # Resolve grasp now: missing legacy metadata must fail before motion.
             key = request['target'].split(':')[-1]
@@ -120,6 +143,8 @@ class TopFaceAutomation:
             elif self.inspection_step == 'settling' and time.monotonic() >= self.inspection_settle_until:
                 self.generation += 1
                 self._capture(request['target'])
+                if request['owner'] == 'new_item':
+                    self.snapshot['meta']['new_item_preview'] = True
                 if 'prompt_points' not in self.snapshot['meta']:
                     raise ValueError(self.message)
                 self.worker_generation = self.generation
@@ -138,7 +163,12 @@ class TopFaceAutomation:
                     raise ValueError('camera moved during SAM inference; capture again')
                 if not np.allclose(box, meta['base_from_box'], atol=.001, rtol=0) or not np.allclose(size, meta['size_m'], atol=.001, rtol=0):
                     raise ValueError('recorded target changed during SAM inspection')
-                rpy = recorded_grasp_rpy(self.inspection_grasp, result['yaw_rad'])
+                if request['owner'] == 'new_item':
+                    # Geometry-only response. No grasp command or inventory write.
+                    size = [*result['fitted_size_xy_m'], size[2]]
+                    rpy = [0., 0., result['yaw_rad']]
+                else:
+                    rpy = recorded_grasp_rpy(self.inspection_grasp, result['yaw_rad'])
                 self._inspection_reply(request, True,
                     top_center_base_m=result['top_center_base_m'], yaw_rad=result['yaw_rad'],
                     grasp_rpy_rad=list(rpy), size_m=size, color_stamp=meta['color_stamp'],
@@ -147,7 +177,10 @@ class TopFaceAutomation:
                 self.inspection = None
                 self.message = 'SAM inspection complete; caller owns pickup and inventory.'
         except Exception as exc:
-            self._motion_fault(str(exc))
+            if request['owner'] == 'new_item':
+                self.state, self.message = 'REJECTED', str(exc)
+            else:
+                self._motion_fault(str(exc))
             self.generation += 1
             self.inspection = None
             self._inspection_reply(request, False, error=str(exc))

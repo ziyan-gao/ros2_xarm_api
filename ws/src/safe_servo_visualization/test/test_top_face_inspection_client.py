@@ -132,7 +132,7 @@ def test_slot_target_uses_sam_without_overwriting_inventory():
 ])
 def test_inspection_waits_for_own_completed_contact_retreat(op_id, state, info, expected):
     moved, faults = [], []
-    node = NS(inspection={'target': 'box'}, inspection_started=time.monotonic(),
+    node = NS(inspection={'target': 'box', 'owner': 'policy'}, inspection_started=time.monotonic(),
               inspection_step='contact_retreat', state='CONTACT_RETREAT',
               _inspection_owners=lambda: {'policy'}, inspection_retreat_id=7,
               motion_status={'pickup': dict(operation_id=op_id, state=state, object_info_obtained=info)},

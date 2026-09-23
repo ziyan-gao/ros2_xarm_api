@@ -103,6 +103,8 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
                                  lambda msg: self._markers('placed', msg), 10)
         self.create_subscription(MarkerArray, '/pointcloud_detection/boxes',
                                  lambda msg: self._markers('detected', msg), 10)
+        self.create_subscription(MarkerArray, '/object_info_estimation/sam_coarse_boxes',
+                                 lambda msg: self._markers('coarse', msg), 10)
         self.create_subscription(String, '/top_face_debug/command', self._command, 10)
         self.create_timer(.2, self._tick)
 
@@ -230,6 +232,18 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
             p = project(center, np.linalg.inv(meta['base_from_camera']), np.asarray(meta['k']), np.asarray(meta['d']))[0]
             cv2.drawMarker(canvas, tuple(np.rint(p).astype(int)), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
             self.result['image_center_error_px'] = (p-[w/2, h/2]).tolist()
+            if meta.get('new_item_preview'):
+                self.result['diagnostic_only'] = True
+                self.result['center_xy_base_m'] = center[0, :2].tolist()
+                self.result['unchanged_top_z_m'] = meta['recorded_top_z_m']
+                self.result['unchanged_height_m'] = meta['size_m'][2]
+                delta = (center[0, :2]-np.asarray(meta['prior_top_base_m'])[0, :2])*1000
+                self.result['center_delta_xy_mm'] = delta.tolist()
+                fitted_xy = self.result.get('fitted_size_xy_m', meta['size_m'][:2])
+                self.result['size_delta_xy_mm'] = ((np.asarray(fitted_xy)-meta['size_m'][:2])*1000).tolist()
+                cv2.putText(canvas, 'PREVIEW ONLY: dXY=(%+.1f, %+.1f) mm; top Z=%.1f mm unchanged' %
+                            (*delta, meta['recorded_top_z_m']*1000),
+                            (12, 92), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 220, 255), 1)
             yaw = self.result['yaw_rad']
             # Show what SAM actually fitted, not a second copy of the prior.
             # Physical collision/pickup dimensions remain the recorded ones.
@@ -300,7 +314,19 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
                 return
             if self.future is not None:
                 raise ValueError('SAM worker is busy; wait or clear its result')
-            if action in ('move_to', 'pick'):
+            if action == 'refine_new':
+                key = command.get('target', '')
+                if not key.startswith('detected:'):
+                    raise ValueError('select a detected point-cloud box for new-item preview')
+                self.generation += 1
+                self._capture(key)
+                self.snapshot['meta']['new_item_preview'] = True
+                if 'prompt_points' not in self.snapshot['meta']:
+                    raise ValueError('coarse top face is not fully visible; capture can be saved')
+                self.worker_generation = self.generation
+                self.future = self.pool.submit(self._segment, copy.deepcopy(self.snapshot))
+                self.state, self.message = 'SEGMENTING', 'New-item preview only: coarse top Z retained; no motion or policy update.'
+            elif action in ('move_to', 'pick'):
                 self._begin_motion(action, command['target'])
             elif action == 'capture':
                 self.generation += 1
@@ -343,7 +369,8 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
         msg.data = json.dumps(dict(state=self.state, message=self.message,
             busy=self.future is not None or self.motion_phase is not None or self.inspection is not None,
             motion_active=self.motion_phase is not None or self.inspection is not None,
-            can_pick=self.result is not None and 'top_center_base_m' in self.result,
+            can_pick=self.result is not None and 'top_center_base_m' in self.result and
+                not (self.snapshot and self.snapshot['meta'].get('new_item_preview')),
             targets=sorted(self.targets), captured_target=None if self.snapshot is None else self.snapshot['meta']['target'],
             can_segment=self.snapshot is not None and 'prompt_points' in self.snapshot['meta'],
             has_capture=self.snapshot is not None, diagnostic_only=False))

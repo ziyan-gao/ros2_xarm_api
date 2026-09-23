@@ -202,6 +202,8 @@ start_required "combined PickAndPlace orchestrator" \
     -p continuous_transport_enabled:="${CONTINUOUS_TRANSPORT_ENABLED}"
 start_required "supervised Phase 4 pickup coordinator" \
   ros2 run safe_servo_visualization pickup_supervisor --ros-args \
+    -p pallet_pickup_fixed_floor_enabled:=true \
+    -p pallet_pickup_floor_z_m:=-0.050 \
     -p continuous_return_enabled:="${CONTINUOUS_RETURN_ENABLED}" \
     -p continuous_transport_blend_radius_m:="${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M}" \
     -p continuous_transport_alternatives_enabled:="${CONTINUOUS_TRANSPORT_ALTERNATIVES_ENABLED:-true}" \

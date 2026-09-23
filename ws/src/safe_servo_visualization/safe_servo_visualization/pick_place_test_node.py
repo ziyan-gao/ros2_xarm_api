@@ -40,6 +40,7 @@ class PickPlaceTest(TwoItemTest, Node):
                   cycle='/pick_place_pipeline/status', staging='/staging_slots/status',
                   random='/random_stable_loading/status', policy='/policy_loading/status')
     SERVICES = dict(estimate='/pickup_pipeline/estimate_object_info',
+                    estimate_sam='/pickup_pipeline/estimate_object_info_sam',
                     incoming='/pick_place_pipeline/start_chained',
                     place='/place_pipeline/start_continuous_chained',
                     grasp='/pickup_supervisor/start_for_transport',
@@ -64,6 +65,8 @@ class PickPlaceTest(TwoItemTest, Node):
         if not 1 <= self.random_max_steps <= 10000:
             raise ValueError('random_test_max_steps must be in [1, 10000]')
         self.random_active = False
+        self.new_item_sam_enabled = True
+        self.create_service(SetBool, '/pick_place_test/set_new_item_sam', self.set_new_item_sam)
         self.two_item_mode = False
         self.test_items = {}
         self.active_item = 0
@@ -317,7 +320,7 @@ class PickPlaceTest(TwoItemTest, Node):
         self.sequence += 1
         if step == 'pack_new':
             self.phase('ESTIMATING')
-            self.call('estimate', 'pickup')
+            self.call('estimate_sam' if getattr(self, 'new_item_sam_enabled', False) else 'estimate', 'pickup')
         elif step == 'unpack':
             if max(self.record['size_mm'][:2]) > 250:
                 response.message = 'item cannot fit in 250 x 250 mm staging slot'
@@ -572,6 +575,10 @@ class PickPlaceTest(TwoItemTest, Node):
             self.fail(str(exc))
 
     def _tick(self):
+        if (self.state == 'ESTIMATING' and self.fresh('pickup') and
+                self.status['pickup'].get('new_item_sam_active') and
+                self.status['pickup'].get('state') in ('WAIT_DETECTION', 'SAM_REFINEMENT')):
+            self.phase_started = time.monotonic()
         self._record_slot_release()
         self._record_pallet_release()
         if (self.state == 'RETRIEVE_SLOT' and self.fresh('staging') and
@@ -768,6 +775,7 @@ class PickPlaceTest(TwoItemTest, Node):
         reasons = {s: self.check_preconditions(s) for s in STEPS}
         self.pub.publish(String(data=json.dumps(dict(
             state=self.state, step=self.step, location=self.location, fault=self.fault,
+            new_item_sam_enabled=getattr(self, 'new_item_sam_enabled', False),
             sam_request_id=getattr(getattr(self, 'sam_inspector', None), 'token', None),
             top_face_inspection_enabled=self.status.get('staging', {}).get('top_face_inspection_enabled', False),
             phase_elapsed_sec=round(time.monotonic()-self.phase_started, 1),
@@ -787,6 +795,17 @@ class PickPlaceTest(TwoItemTest, Node):
             random_start_allowed=(self.state != 'FAULT' and not self.random_active and bool(self.random_choices())),
             container_size_mm=self.container, transfer_corner_height_m=self.clearance,
         ), separators=(',', ':'))))
+
+
+    def set_new_item_sam(self, request, response):
+        if self.busy or self.random_active:
+            response.message = 'stop the test before changing new-item SAM'
+            return response
+        self.new_item_sam_enabled = bool(request.data)
+        response.success = True
+        response.message = f'Test-only new-item SAM enabled={self.new_item_sam_enabled}'
+        self.publish_status()
+        return response
 
 
 def main(args=None):

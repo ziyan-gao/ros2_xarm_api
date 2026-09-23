@@ -6,10 +6,80 @@ from .transport_alternatives import waypoint_candidates
 from .waypoint_search import GRID_SECONDS, next_grid
 
 from std_srvs.srv import SetBool
+from moveit_msgs.srv import GetCartesianPath
+from geometry_msgs.msg import Pose
 
 
 class ContinuousPick:
     PICK_PATH_DISABLING = 'PICK_PATH_DISABLING'
+
+    def _check_pick_descent_before_execution(self):
+        """Plan-only probe from the exact approach joint branch to contact."""
+        snapshot = self.transport_target.get('planned_pregrasp') or {}
+        if not getattr(self, 'transport_is_pick', False) or snapshot.get('inspection_only'):
+            return False
+        if snapshot.get('pickup_source') not in ('pallet', 'buffer'):
+            return False
+        key = (self.operation_id, getattr(self, 'transport_route_generation', 0),
+               id(self.transport_trajectory))
+        if getattr(self, '_pick_descent_verified', None) == key:
+            return False
+        if getattr(self, '_pick_descent_pending', None) == key:
+            return True
+        try:
+            z = float(snapshot['top_z_m'])
+            if not math.isfinite(z):
+                raise ValueError('invalid contact height')
+            req = GetCartesianPath.Request()
+            req.header.frame_id = 'link_base'
+            req.group_name, req.link_name = self.planning_group, self.ik_link_name
+            req.start_state.is_diff = True
+            req.start_state.joint_state.name = list(self.arm_joint_names)
+            req.start_state.joint_state.position = list(self.transport_trajectory.points[-1].positions)
+            pose = Pose()
+            pose.position.x, pose.position.y = map(float, self.transport_target['pre_place_tcp_xyz_m'][:2])
+            pose.position.z = z
+            (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w) = map(
+                float, self.transport_target['transfer_tcp_quaternion_xyzw'])
+            req.waypoints = [pose]
+            req.max_step = .005
+            # Kinematic-only probe into intentional object contact. Never sent
+            # to execution; the approach retains its full collision checks.
+            req.avoid_collisions = False
+            req.max_velocity_scaling_factor = req.max_acceleration_scaling_factor = .1
+            self._pick_descent_pending = key
+            self.transport_cartesian.call_async(req).add_done_callback(
+                self._transport_guard(lambda f: self._pick_descent_result(f, key)))
+        except Exception as exc:
+            self._fault(f'pickup descent preflight failed: {exc}')
+        return True
+
+    def _pick_descent_result(self, future, key):
+        if getattr(self, '_pick_descent_pending', None) != key:
+            return
+        self._pick_descent_pending = None
+        try:
+            result = future.result()
+            trajectory = result.solution.joint_trajectory
+            if result.error_code.val != 1 or result.fraction < 1.-1e-6 or not trajectory.points:
+                raise ValueError(f'contact descent only {result.fraction:.1%} feasible')
+            if list(trajectory.joint_names) != list(self.arm_joint_names):
+                raise ValueError('contact descent joint order mismatch')
+            for point in trajectory.points:
+                if len(point.positions) != len(self.arm_joint_names):
+                    raise ValueError('incomplete contact descent joints')
+                for name, value in zip(self.arm_joint_names, point.positions):
+                    lo, hi, _ = self.transport_joint_limits[name]
+                    if not math.isfinite(value) or not lo <= value <= hi:
+                        raise ValueError(f'contact descent exceeds {name} limits')
+            self._pick_descent_verified = key
+            self.get_logger().info('pickup descent kinematic preflight passed; contact still requires force-controlled Servo')
+            self._transport_execute()
+        except Exception as exc:
+            if self._try_pick_grid():
+                self.get_logger().warning(f'pickup descent preflight rejected branch: {exc}; trying next waypoint candidate')
+                return
+            self._fault(f'KINEMATIC_REJECTED: pickup descent preflight: {exc}; no approach executed')
 
     def _validate_live_pick_recovery(self, check_servo_force=True):
         now = time.monotonic()
@@ -271,6 +341,8 @@ class ContinuousPick:
         return True
 
     def _try_raised_pick_path(self, reason):
+        if (getattr(self, 'transport_target', {}).get('planned_pregrasp') or {}).get('inspection_only'):
+            return False  # Camera centering requires the requested endpoint.
         if (not getattr(self, 'transport_is_pick', False) or
                 self.state not in (self.TRANSPORT_PLANNING, self.TRANSPORT_DIAGNOSING) or
                 self.transport_target.get('transfer_context') != 'known_pick' or

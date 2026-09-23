@@ -64,7 +64,10 @@ def summarize_box_samples(samples):
     }
 
 
-class PickupPipeline(Node):
+from .new_item_sam import NewItemSAM
+
+
+class PickupPipeline(NewItemSAM, Node):
     """Run observation, detection, pre-grasp, and supervised pickup."""
 
     IDLE = 'IDLE'
@@ -79,6 +82,7 @@ class PickupPipeline(Node):
     ABORTING = 'ABORTING'
 
     ACTIVE = {
+        'SAM_REFINEMENT',
         MOVE_OBSERVATION, WAIT_DETECTION, MOVE_PREGRASP, SERVO_PICKUP,
         RETURN_OBSERVATION, ABORTING,
     }
@@ -180,6 +184,9 @@ class PickupPipeline(Node):
             Trigger, '/pickup_supervisor/reset')
 
         self.create_service(Trigger, '/pickup_pipeline/start', self.start_callback)
+        self._init_new_item_sam()
+        self.create_service(Trigger, '/pickup_pipeline/estimate_object_info_sam',
+                            self.estimate_object_info_sam_callback)
         self.create_service(Trigger, '/pickup_pipeline/start_for_transport', self.start_for_transport)
         self.create_service(
             Trigger, '/pickup_pipeline/estimate_object_info',
@@ -224,6 +231,8 @@ class PickupPipeline(Node):
         self.refined_boxes = boxes
 
     def _set_fault(self, reason):
+        if hasattr(self, 'new_item_sam_client'):
+            self.new_item_sam_client.cancel()
         if self.state == self.FAULT:
             return
         self.fault = reason
@@ -257,11 +266,13 @@ class PickupPipeline(Node):
 
     def start_callback(self, _request, response):
         if self.state not in self.ACTIVE:
+            self.new_item_sam_active = False
             self.defer_lift = False
         return self._start(response, estimation_only=False)
 
     def start_for_transport(self, _request, response):
         if self.state not in self.ACTIVE:
+            self.new_item_sam_active = False
             self.defer_lift = True
         return self._start(response, estimation_only=False)
 
@@ -269,6 +280,8 @@ class PickupPipeline(Node):
         return self.grasp_hold_client if getattr(self, 'defer_lift', False) else self.grasp_at_contact_client
 
     def estimate_object_info_callback(self, _request, response):
+        if self.state not in self.ACTIVE:
+            self.new_item_sam_active = False
         return self._start(response, estimation_only=True)
 
     def discard_object_info_callback(self, _request, response):
@@ -413,6 +426,8 @@ class PickupPipeline(Node):
                 self._set_fault(f'motion execution rejected: {message}')
 
     def abort_callback(self, _request, response):
+        if hasattr(self, 'new_item_sam_client'):
+            self.new_item_sam_client.cancel()
         if self.state not in self.ACTIVE:
             response.message = f'no active pickup pipeline in state {self.state}'
             return response
@@ -452,6 +467,9 @@ class PickupPipeline(Node):
         return response
 
     def tick(self):
+        if self.state == 'SAM_REFINEMENT':
+            self._tick_new_item_sam()
+            return
         if self.state == self.MOVE_OBSERVATION:
             self._tick_move_observation()
         elif self.state == self.WAIT_DETECTION:
@@ -538,6 +556,10 @@ class PickupPipeline(Node):
             self.publish_status()
 
     def _tick_wait_detection(self):
+        if getattr(self, 'new_item_sam_active', False) and self.stable_box_published_at is None:
+            self.phase_started = time.monotonic()
+            if time.monotonic() < self.new_item_sam_retry_at:
+                return
         if self._phase_elapsed() > self.detection_timeout:
             self._set_fault('timed out waiting for refined box detection')
             return
@@ -581,6 +603,9 @@ class PickupPipeline(Node):
                 self.detection_dimension_tolerance):
             return
         stable_marker = self._averaged_marker(marker, summary)
+        if getattr(self, 'new_item_sam_active', False):
+            self._begin_new_item_sam(stable_marker)
+            return
         message = MarkerArray()
         message.markers = [stable_marker]
         self.stable_box_pub.publish(message)
@@ -868,6 +893,9 @@ class PickupPipeline(Node):
         message = String()
         message.data = json.dumps({
             'state': self.state,
+            'sam_request_id': getattr(getattr(self, 'new_item_sam_client', None), 'token', None),
+            'new_item_sam_active': getattr(self, 'new_item_sam_active', False),
+            'new_item_sam_message': getattr(self, 'new_item_sam_message', ''),
             'fault': self.fault,
             'operation_id': self.operation_id,
             'motion_state': self.motion_status.get('state'),

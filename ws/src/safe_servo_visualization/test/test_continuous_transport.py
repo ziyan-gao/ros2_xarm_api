@@ -35,7 +35,23 @@ class Harness(ContinuousTransport):
     FAULT = 'FAULT'
     SUCCEEDED = 'SUCCEEDED'
 
+    def _transport_planned(self, future):
+        # Numerical tests wait explicitly; production callbacks never wait.
+        super()._transport_planned(future)
+        pending = getattr(self, '_retime_pending', None)
+        if pending is not None:
+            try:
+                pending[0].result(timeout=30)
+            except Exception:
+                pass  # The main-thread poll must report worker errors.
+            self._poll_transport_timing()
+        pool = getattr(self, '_retime_pool', None)
+        if pool is not None:
+            pool.shutdown(wait=True)
+            self._retime_pool = None
+
     def __init__(self):
+        self.operation_id = 'test-operation'
         self.state = self.TRANSPORT_PLANNING
         self.fault = ''
         self.released = False

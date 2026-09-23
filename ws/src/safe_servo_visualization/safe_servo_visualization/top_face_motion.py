@@ -2,6 +2,8 @@
 import json
 import math
 import time
+from pathlib import Path
+import yaml
 
 import cv2
 import numpy as np
@@ -10,6 +12,7 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String, Float64MultiArray
 from std_srvs.srv import Trigger
 from xarm_msgs.srv import SetInt16
+from moveit_msgs.srv import GetPositionFK
 
 from .top_face_geometry import transform, top_points, project, prompts
 from .pick_path_client import PickPathClient
@@ -56,13 +59,15 @@ def recorded_grasp_rpy(object_in_tcp, refined_yaw):
 
 class TopFaceMotion:
     def _init_motion(self):
-        for name, default in (('inspection_tcp_z_m', 0.), ('refine_max_age_sec', 30.)):
+        for name, default in (('inspection_tcp_z_m', 0.), ('refine_max_age_sec', 30.),
+                              ('inspection_waypoint_file', '/workspace/config/taught_waypoints.yaml')):
             self.declare_parameter(name, default)
         self.motion_status = {}
         self.motion_seen = {}
         self.motion_phase = None
         self.motion_future = None
         self.motion_started = 0.
+        self.view_fk = self.create_client(GetPositionFK, '/compute_fk')
         self.pick_path = PickPathClient(self, self._motion_fault)
         self.view_pub = self.create_publisher(PoseStamped, '/top_face_debug/view_target', 10)
         self.pick_pub = self.create_publisher(Float64MultiArray, '/staging_slots/retrieve_target', 10)
@@ -123,13 +128,33 @@ class TopFaceMotion:
         # The horizontal-plane assumption belongs to SAM refinement, not here.
         return box, size, top_points(size, box)
 
-    def _begin_motion(self, action, key):
+    def _is_slot_target(self, key):
+        obstacle = self.motion_status['scene'].get('placed_marker_object_ids', {}).get(key.split(':')[-1])
+        return key.startswith('placed:') and bool(obstacle) and any(
+            slot.get('occupied') and slot.get('obstacle_id') == obstacle
+            for slot in self.motion_status['slots'].get('slots', []))
+
+    def _begin_motion(self, action, key, observation_z=None):
+        if action == 'pick' and getattr(self, 'snapshot', None) and self.snapshot['meta'].get('new_item_preview'):
+            raise ValueError('new-item refinement is preview-only; automatic pickup is not connected')
         self._idle_checks()
         box, size, points = self._target_geometry(key)
         self.debug_source_id = None
         self.debug_slot = None
         self.debug_target = key
         if action == 'move_to':
+            slot_view = self._is_slot_target(key)
+            if slot_view and observation_z is None:
+                with Path(self.get_parameter('inspection_waypoint_file').value).open() as stream:
+                    observation = yaml.safe_load(stream)['waypoints']['observation']
+                req = GetPositionFK.Request()
+                req.header.frame_id = self.base
+                req.fk_link_names = ['link_tcp']
+                req.robot_state.joint_state.name = observation['joint_names']
+                req.robot_state.joint_state.position = observation['positions_rad']
+                self.motion_started = time.monotonic()
+                self._request(self.view_fk, 'VIEW_HEIGHT', req)
+                return
             info = self.info
             if info is None:
                 raise ValueError('CameraInfo is unavailable')
@@ -143,16 +168,20 @@ class TopFaceMotion:
                     not math.isfinite(float(clearance)) or float(clearance) <= 0):
                 raise ValueError('container clearance/inspection height unavailable')
             height = max(height, float(pallet[2, 3])+float(clearance), float(points[0, 2])+.100)
+            if slot_view:
+                if not math.isfinite(observation_z) or observation_z < height:
+                    raise ValueError('observation TCP height is below required inspection clearance')
+                height = observation_z
             # Begin at container clearance, increasing only if the face does
             # not fit the image. Never lower below the container-safe plane.
-            for extra in np.arange(0., .201, .01):
+            for extra in ([0.] if slot_view else np.arange(0., .201, .01)):
                 try:
                     pose = centered_camera_pose(tcp, extrinsic, points,
                         np.asarray(info.k).reshape(3, 3), np.asarray(info.d), info.width, info.height,
                         height+float(extra))
                     break
                 except ValueError as exc:
-                    if 'outside the image margin' not in str(exc) or extra >= .20:
+                    if slot_view or 'outside the image margin' not in str(exc) or extra >= .20:
                         raise
             tf = self.tf.lookup_transform(self.base, 'link_tcp', Time()).transform
             target = PoseStamped()
@@ -260,19 +289,27 @@ class TopFaceMotion:
                     return
                 response = self.motion_future.result()
                 self.motion_future = None
+                if self.motion_phase == 'VIEW_HEIGHT':
+                    if response.error_code.val != 1 or not response.pose_stamped:
+                        raise ValueError('cannot compute observation TCP height')
+                    self._begin_motion('move_to', self.debug_target,
+                                       response.pose_stamped[0].pose.position.z)
+                    return
                 if not (response.success if hasattr(response, 'success') else response.ret == 0):
                     raise ValueError(response.message)
             phase = self.motion_phase
             elapsed = time.monotonic()-self.phase_started
             if phase == 'VIEW_TARGET' and elapsed > .3:
+                self.pick_path.reset(self.debug_motion_id)
                 self._request(self.motion_clients['view'], 'VIEW_PLAN')
             elif phase == 'VIEW_PLAN':
                 if int(motion.get('operation_id', -1)) < self.debug_motion_id:
                     return
                 if int(motion['operation_id']) != self.debug_motion_id or motion.get('target') != 'top_face_view':
                     raise ValueError('observation plan replaced by another command')
-                if motion['state'] == 'PLANNED':
-                    self._request(self.motion_clients['execute'], 'VIEW_EXECUTE')
+                if self.pick_path.tick(motion, pickup):
+                    self.motion_phase = None
+                    self.state, self.message = 'IDLE', 'Camera waypoint move completed. Capture / project, then Run SAM.'
             elif phase == 'VIEW_EXECUTE':
                 if int(motion.get('operation_id', -1)) != self.debug_motion_id:
                     raise ValueError('observation execution replaced')

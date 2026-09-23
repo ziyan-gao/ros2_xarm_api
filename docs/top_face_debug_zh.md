@@ -162,6 +162,35 @@ bash /workspace/setup_top_face_sam.sh cuda
 ROS 接口仅为 `/top_face_debug/command`（JSON 命令）、`/top_face_debug/status`（状态）、`/top_face_debug/preview`（图像），不包含任何机器人控制客户端。
 # Policy loading 集成
 
+## 新物体 SAM 只读预览
+
+### Policy 和 Test panel 的新物体自动精修
+
+SAM Move to 通过共享 PickPathClient / continuous-pick 路径执行：先抬升、跨区域经 observation-side waypoint，再到观察点。不再调用独立 pose planner；观察目标标记为 inspection-only，不能用作抓取快照。真实 pallet/buffer 抓取路径执行前，从路径终点关节构型预计算到记录接触高度的下降段，检查完整性及关节位置限位。不可行时尝试既有跨区域 waypoint 搜索，耗尽则停止。此预检不执行下降，也不替代实际 Servo 的关节、速度和力保护；不能保证实际接触高度偏差或动态速度下必然可达。
+
+Policy loading 通过 `real_platform_policy.yaml` 的 `new_item_sam_enabled: true` 启用新物体 SAM。手动启动 policy loading 和连续加载的下一件均使用同一精修入口。SAM 更新真实 XY 尺寸、中心和 yaw，保留粗估 Z/箱高，然后沿用原有接触估计、策略量化和装箱流程。分割失败停留重试，不用粗框直接抓取；marker detection 显示采样预览。需要重启 policy_loading 和 top_face_debug。单独的普通 Estimate object info 按钮仍是原入口。
+
+### Test panel 的 Pack new 自动精修（默认开启）
+
+新物体 SAM 成功后使用本次冻结粗框与精修结果，不再要求实时点云粗框继续存在或满足 0.5 秒新鲜度，避免粗框短暂丢失引发重复分割。请求 token/目标匹配、相机未移动、记录几何未改变及精修修正范围检查仍保留。该检查并不保证物体在 RGB 采样后没有被人移动；采样至抓取期间请勿移动物体。
+
+在 ROS 环境中、测试停止时启用独立开关：
+
+```bash
+ros2 service call /pick_place_test/set_new_item_sam std_srvs/srv/SetBool '{data: true}'
+```
+
+然后使用 test panel 的 Pack new（随机测试同样适用）：观察位 → 收集稳定点云粗框 → 静止采样 SAM → 更新真实 XY 尺寸/中心/yaw（保留 Z 和箱高）→ 原 pre-pick 与力控接触。SAM 失败会停留观察位，重新收集稳定样本并重试，可调整光照或停止测试；不会直接用粗框继续抓取。运行时不能切换开关。用 `{data: false}` 临时关闭，重启 test 节点后默认开启。Policy 的普通估计入口不受影响。
+
+Slot 中物体的 SAM Move to 使用 `taught_waypoints.yaml` 中 observation 关节位姿经 FK 得到的 TCP 高度，保持相同 Z，仅调整 XY 使顶面居中。不再采用较低的容器上方最小高度；若该高度无法满足安全间距或视野要求，则停止并报告原因。旧 slot inspection 路径也使用 observation TCP 高度，不再减去 30 mm。
+
+需重启 `pickup_pipeline`、`pick_place_test`、`top_face_debug` 加载代码。此开关目前是 ROS 服务，不是新增复选框。先做单件实机验证；离线测试不等于实机确认。
+
+在目标下拉框选择 `detected:` 开头的点云箱体，点击 **Refine new item (preview only)**。节点采样当前 RGB，投影粗箱体顶面提示 SAM，再用粗顶面高度平面求交计算 XY 尺寸、中心及 yaw。不会使用新的逐像素深度，也不改变原 Z/箱高。
+
+画面绿色为点云粗框，紫色为 SAM mask，黄色为精修框/中心；文字显示粗/精修尺寸、中心偏移及保留的顶面 Z。结果可用 Save debug data 保存。目标必须新鲜且顶面完整可见；不满足时给出错误，不自动移动相机。此按钮不更新 policy、场景或抓取目标，结果禁止用于 Pick。自动新物体抓取保持原流程。
+
+
 Test panel 同样接入：unpack / repack 在移除源障碍前执行 Move to → SAM，pack from slot 通过 staging slots 执行同一路径；pack new 不变。开关沿用 staging slots 从 policy YAML 加载的 `top_face_inspection_enabled`，并非 random YAML。单步和随机测试共用该入口。检查失败会停止测试，不会退回旧位姿抓取。
 
 如果新物体刚完成接触估计、监督器仍在 `AWAITING_GRASP`，自动检查会先调用已有的竖直 retreat：清除旧接触信息、退至记录的 pre-grasp 高度，等待对应操作完成并恢复控制后才执行 Move to。接触位置监控不关闭，也不会在该步骤吸取或释放物体。

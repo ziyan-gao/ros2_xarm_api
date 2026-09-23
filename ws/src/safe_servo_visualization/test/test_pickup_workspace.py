@@ -69,6 +69,24 @@ def test_buffer_validation_and_arming_share_buffer_floor():
     assert node.config_pub.publish.call_args.args[0].data[5] == -60.
 
 
+@pytest.mark.parametrize('source,workspace,max_descent,expected', [
+    ('pallet', -100., .15, -.05),
+    ('pallet', -40., .15, -.04),
+    ('pallet', -100., .04, -.015),
+    ('buffer', -100., .15, -.020),
+])
+def test_fixed_pallet_floor_preserves_other_limits(source, workspace, max_descent, expected):
+    node = supervisor()
+    node.pallet_pickup_fixed_floor_enabled = True
+    node.pallet_pickup_floor_z = -.05
+    node.place_workspace_z_min_mm = workspace
+    node.max_descent = max_descent
+    node.motion_status['planned_pregrasp'].update(
+        pickup_source=source, pregrasp_z_m=.025, top_z_m=-.005)
+    node._tcp_xyz = lambda: (.128, -.591, .025)
+    assert node._validate_pregrasp_ready()[2] == pytest.approx(expected)
+
+
 def test_new_item_after_unpack_restores_incoming_floor():
     node = supervisor()
     node._publish_servo_config(touch_mode=True)

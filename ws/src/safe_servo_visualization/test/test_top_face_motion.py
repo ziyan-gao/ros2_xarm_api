@@ -5,10 +5,48 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import numpy as np
 import pytest
+from geometry_msgs.msg import Quaternion
+from builtin_interfaces.msg import Time as TimeMessage
 from std_msgs.msg import String
 from safe_servo_visualization.top_face_geometry import transform, top_points, project
 from safe_servo_visualization.top_face_motion import centered_camera_pose, recorded_grasp_rpy, TopFaceMotion
 from safe_servo_visualization.top_face_debug_node import TopFaceDebug
+
+
+def slot_view_harness():
+    node = TopFaceMotion()
+    node._idle_checks = Mock()
+    box = transform([.1, -.1, .15], [0, 0, 0, 1])
+    node._target_geometry = Mock(return_value=(box, [.15, .12, .1], top_points([.15, .12, .1], box)))
+    node.motion_status = {'scene': {'placed_marker_object_ids': {'1': 'placed_item_1'}},
+                         'slots': {'slots': [{'occupied': True, 'obstacle_id': 'placed_item_1'}]},
+                         'motion': {'operation_id': 2, 'transfer_corner_height_pallet_m': .3}}
+    node.base = 'link_base'
+    node.info = NS(k=[600., 0., 320., 0., 600., 240., 0., 0., 1.], d=[0.]*5,
+                   width=640, height=480, header=NS(frame_id='camera'))
+    node.get_clock = lambda: NS(now=lambda: NS(to_msg=TimeMessage))
+    node.get_parameter = lambda name: NS(value=0.)
+    node._matrix = lambda dst, src, stamp: (transform([.4, .2, .6], [1, 0, 0, 0])
+                                           if src == 'link_tcp' else np.eye(4))
+    node.tf = NS(lookup_transform=lambda *a: NS(transform=NS(rotation=Quaternion(x=1.))))
+    node.view_pub = Mock()
+    node.get_logger = lambda: Mock()
+    return node
+
+
+def test_slot_view_uses_exact_observation_tcp_height():
+    node = slot_view_harness()
+    node._begin_motion('move_to', 'placed:box:1', observation_z=.6)
+    assert node.debug_view_target.pose.position.z == pytest.approx(.6)
+    assert node.motion_phase == 'VIEW_TARGET'
+    node.view_pub.publish.assert_called_once()
+
+
+def test_slot_view_rejects_unsafe_observation_height_without_moving():
+    node = slot_view_harness()
+    with pytest.raises(ValueError, match='below required'):
+        node._begin_motion('move_to', 'placed:box:1', observation_z=.2)
+    node.view_pub.publish.assert_not_called()
 
 
 @pytest.mark.parametrize('quaternion', [

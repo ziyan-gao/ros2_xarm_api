@@ -75,6 +75,8 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.declare_parameter('minimum_measured_object_height_m', 0.02)
         self.declare_parameter('maximum_measured_object_height_m', 0.45)
         self.declare_parameter('contact_search_margin_m', 0.015)
+        self.declare_parameter('pallet_pickup_fixed_floor_enabled', False)
+        self.declare_parameter('pallet_pickup_floor_z_m', -0.050)
         self.declare_parameter('max_descent_m', 0.15)
         self.declare_parameter('position_tolerance_m', 0.001)
         self.declare_parameter('xy_tolerance_m', 0.015)
@@ -184,6 +186,10 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.maximum_measured_object_height = float(
             p('maximum_measured_object_height_m'))
         self.contact_search_margin = float(p('contact_search_margin_m'))
+        self.pallet_pickup_fixed_floor_enabled = bool(p('pallet_pickup_fixed_floor_enabled'))
+        self.pallet_pickup_floor_z = float(p('pallet_pickup_floor_z_m'))
+        if not math.isfinite(self.pallet_pickup_floor_z):
+            raise ValueError('pallet_pickup_floor_z_m must be finite')
         self.max_descent = float(p('max_descent_m'))
         self.tolerance = float(p('position_tolerance_m'))
         self.xy_tolerance = float(p('xy_tolerance_m'))
@@ -1190,8 +1196,15 @@ class PickupSupervisor(ContinuousTransport, Node):
         # pallet or buffer floor, retaining contact-search and maximum-descent
         # limits. Servo arming must publish this identical workspace profile.
         servo_floor_z = self._pickup_workspace_bounds_mm(snapshot)[4] / 1000.0
+        contact_floor_z = estimated_contact_z - self.contact_search_margin
+        source = snapshot.get('pickup_source')
+        if source is None:
+            source = ('buffer' if 'staging_slot' in snapshot else
+                      'pallet' if 'retrieval_target_id' in snapshot else 'incoming')
+        if source == 'pallet' and getattr(self, 'pallet_pickup_fixed_floor_enabled', False):
+            contact_floor_z = self.pallet_pickup_floor_z
         floor_z = max(
-            estimated_contact_z - self.contact_search_margin,
+            contact_floor_z,
             (original_z if raised else z) - self.max_descent,
             servo_floor_z)
         descent = z - floor_z
@@ -5176,6 +5189,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        pool = getattr(node, '_retime_pool', None)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()
 

@@ -47,6 +47,8 @@ TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(pare
   buttons->addWidget(move_, 2, 0);
   buttons->addWidget(pick_, 2, 1);
   buttons->addWidget(stop_, 3, 0, 1, 2);
+  refine_new_ = new QPushButton("Refine new item (preview only)", this);
+  buttons->addWidget(refine_new_, 4, 0, 1, 2);
   layout->addLayout(buttons);
   preview_ = new QLabel("No capture", this);
   preview_->setAlignment(Qt::AlignCenter);
@@ -59,6 +61,7 @@ TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(pare
   details_->setPlainText("Waiting for top_face_debug node...");
   layout->addWidget(details_);
   connect(capture_, &QPushButton::clicked, this, [this] { command("capture"); });
+  connect(refine_new_, &QPushButton::clicked, this, [this] { command("refine_new"); });
   connect(segment_, &QPushButton::clicked, this, [this] { command("segment"); });
   connect(save_, &QPushButton::clicked, this, [this] { command("save"); });
   connect(clear_, &QPushButton::clicked, this, [this] { command("clear"); });
@@ -164,6 +167,7 @@ void TopFaceDebugPanel::updateControls()
   const bool available = online && !last_status_["busy"].toBool() &&
     (!command_pending_.isValid() || command_pending_.elapsed() > 400);
   capture_->setEnabled(available && targets_->count() > 0);
+  refine_new_->setEnabled(available && targets_->currentText().startsWith("detected:"));
   segment_->setEnabled(available && last_status_["can_segment"].toBool() &&
     targets_->currentText() == last_status_["captured_target"].toString());
   save_->setEnabled(available && last_status_["has_capture"].toBool());

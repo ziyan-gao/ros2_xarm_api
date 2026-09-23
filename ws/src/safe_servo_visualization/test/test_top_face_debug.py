@@ -107,6 +107,36 @@ def test_missing_sam_checkpoint_is_actionable(node):
         node._segment({})
 
 
+def test_new_item_preview_rejects_placed_target(node):
+    node._command(String(data=json.dumps(dict(action='refine_new', target='placed:box:7'))))
+    assert node.state == 'ERROR'
+    assert 'detected' in node.message
+    assert node.motion_phase is None
+
+
+def test_new_item_preview_capture_and_fit_without_motion(node):
+    from concurrent.futures import Future
+    mask = capture_synthetic(node)
+    marker = node.targets['placed:placed_item_visuals:7']
+    marker.header.stamp = node.colors[-1].header.stamp
+    node._markers('detected', MarkerArray(markers=[marker]))
+    pending = Future()
+    node.pool.submit = lambda *args: pending
+    node._command(String(data=json.dumps(dict(action='refine_new', target='detected:placed_item_visuals:7'))))
+    assert node.state == 'SEGMENTING'
+    meta = node.snapshot['meta']
+    assert meta['new_item_preview'] and not meta['uses_measured_depth']
+    assert node.motion_phase is None
+    pending.set_result((dict(top_center_base_m=meta['prior_top_base_m'][0],
+                            yaw_rad=meta['prior_yaw'], fitted_size_xy_m=meta['size_m'][:2]), mask))
+    node._tick()
+    assert node.state == 'ESTIMATED'
+    assert node.result['center_delta_xy_mm'] == [0., 0.]
+    assert node.result['unchanged_top_z_m'] == meta['recorded_top_z_m']
+    with pytest.raises(ValueError, match='preview-only'):
+        node._begin_motion('pick', meta['target'])
+
+
 def capture_synthetic(node):
     k, camera, size, prior, depth, mask = scene()
     now = node.get_clock().now().to_msg()

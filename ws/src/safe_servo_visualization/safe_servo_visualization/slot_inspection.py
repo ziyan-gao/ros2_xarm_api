@@ -145,12 +145,12 @@ class SlotInspection:
             camera_offset_base = self._quat_rotate(
                 (translation.x, translation.y, translation.z), q)
             xyz = inspection_position(np.array(pose[:3])/1000,
-                                      self.inspection_observation_z - .030,
+                                      self.inspection_observation_z,
                                       camera_offset_base, self.inspection_backoff)
             self.get_logger().info(
                 f'slot inspection XY backoff={self.inspection_backoff*1000:.1f} mm; '
                 f'target XYZ=({xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}) m; '
-                'Z fixed at observation TCP height minus 30 mm')
+                'Z fixed at observation TCP height')
             # The local inspection endpoint may be below the container travel
             # floor. Only the overhead crossing must remain above that floor.
             safe_z = self._pallet_origin_z() + self.transfer_item_bottom_above_pallet

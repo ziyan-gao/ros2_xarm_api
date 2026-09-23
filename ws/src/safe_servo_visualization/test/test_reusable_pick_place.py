@@ -43,13 +43,16 @@ def test_known_source_without_record_is_not_estimated_as_new_item(source):
     ('pack', 'incoming', 'pallet'), ('pack', 'holding', 'pallet'),
     ('unpack', 'pallet', 'slot'), ('repack', 'pallet', 'pallet'),
 ])
-def test_policy_returns_after_every_unpack_or_last_operation(kind, source, destination):
+def test_policy_unpack_ends_at_handoff_other_final_operations_return(kind, source, destination):
     op = NS(kind=kind, source=source, source_item=object(), step_index=0, step_count=2)
     recipe = PolicyLoadingNode._operation_workflow(op)
     assert recipe.destination == destination
-    assert recipe.return_to_observation is (kind == 'unpack')
+    assert recipe.return_to_observation is False
+    assert recipe.stages[-1] == 'overhead_handoff'
     op.step_index = 1
-    assert PolicyLoadingNode._operation_workflow(op).return_to_observation
+    final = PolicyLoadingNode._operation_workflow(op)
+    assert final.return_to_observation is (kind != 'unpack')
+    assert final.stages[-1] == ('overhead_handoff' if kind == 'unpack' else 'overhead_observation')
 
 
 def test_known_pickup_requests_deferred_lift_but_normal_pickup_does_not():

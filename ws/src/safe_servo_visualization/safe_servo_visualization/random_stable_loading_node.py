@@ -359,6 +359,7 @@ class RandomStableLoadingNode(Node):
 
     def pickup_status_callback(self, message):
         self.pickup_status = self._decode_status(message)
+        self.pickup_status_seen = time.monotonic()
 
     def pallet_status_callback(self, message):
         self.pallet_status = message.data
@@ -394,6 +395,13 @@ class RandomStableLoadingNode(Node):
             return
 
         if self.state == 'LOCALIZING':
+            if (getattr(self, 'new_item_sam_enabled', False) and
+                    self.pickup_status.get('new_item_sam_active') and
+                    self.pickup_status.get('state') in ('WAIT_DETECTION', 'SAM_REFINEMENT') and
+                    time.monotonic()-getattr(self, 'pickup_status_seen', 0.) < 2.):
+                # Wait for stable perception without timing out the policy;
+                # only fresh live feedback can extend this wait.
+                self.localization_started = time.monotonic()
             if self.pickup_status.get('state') == 'FAULT':
                 self._set_fault(
                     self.pickup_status.get(
