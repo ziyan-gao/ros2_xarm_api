@@ -43,6 +43,7 @@ class MoveItServoBridge(Node):
         self.declare_parameter('force_timeout_sec', 0.6)
         self.declare_parameter('force_limit_n', 5.0)
         self.declare_parameter('torque_limit_nm', 0.5)
+        self.declare_parameter('torque_protection_enabled', True)
         self.declare_parameter('trajectory_controller', 'uf850_traj_controller')
         self.declare_parameter('joint_state_broadcaster', 'joint_state_broadcaster')
         self.declare_parameter('joint_state_topic', '/joint_states')
@@ -69,6 +70,9 @@ class MoveItServoBridge(Node):
         self.force_timeout = float(p('force_timeout_sec'))
         self.force_limit = float(p('force_limit_n'))
         self.torque_limit = float(p('torque_limit_nm'))
+        self.torque_protection_enabled = bool(p('torque_protection_enabled'))
+        if not self.torque_protection_enabled:
+            self.get_logger().warning('Software torque protection disabled; linear force protection remains enabled')
         self.trajectory_controller = str(p('trajectory_controller'))
         self.joint_state_broadcaster = str(p('joint_state_broadcaster'))
         self.joint_state_topic = str(p('joint_state_topic'))
@@ -221,6 +225,10 @@ class MoveItServoBridge(Node):
     def _contact_delta_n(self):
         return self.force_limit
 
+    def _torque_exceeded(self, fraction=1.0):
+        return (getattr(self, 'torque_protection_enabled', True) and
+                self.torque_norm >= fraction * self.torque_limit)
+
     def _force_safety_cap_n(self):
         if self.contact_on_fz_sign_change:
             return max(12.0, 3.0 * self.force_limit)
@@ -287,14 +295,14 @@ class MoveItServoBridge(Node):
                         self.contact_on_fz_sign_change,
                         sign_observable, sign_reversed):
                     self._latch_touch_contact()
-                elif self.force_norm >= safety_cap or self.torque_norm >= self.torque_limit:
+                elif self.force_norm >= safety_cap or self._torque_exceeded():
                     self.latch_fault(
                         f'external wrench safety limit: force={self.force_norm:.2f} N, '
                         f'delta_fz={delta:.2f} N, torque={self.torque_norm:.2f} Nm')
             return
         if self.enabled and (
                 self.force_norm >= self.force_limit or
-                self.torque_norm >= self.torque_limit):
+                self._torque_exceeded()):
             self.latch_fault(
                 f'external wrench limit: force={self.force_norm:.2f} N, '
                 f'torque={self.torque_norm:.2f} Nm')
@@ -717,7 +725,7 @@ class MoveItServoBridge(Node):
         if (self.force_norm is None or self.torque_norm is None or
                 ((not self.bypass_force_arm_check) and (not self.touch_mode) and (
                     self.force_norm >= 0.8 * self.force_limit or
-                    self.torque_norm >= 0.8 * self.torque_limit))):
+                    self._torque_exceeded(.8)))):
             response.message = 'external force/torque is not clear'
             return response
         if not self.dry_run:
@@ -905,6 +913,7 @@ class MoveItServoBridge(Node):
             'force_delta_n': self.force_delta_norm,
             'force_delta_z_n': self.force_delta_z,
             'force_limit_n': self.force_limit,
+            'torque_protection_enabled': self.torque_protection_enabled,
             'touch_mode': self.touch_mode,
             'touch_descent': self.touch_descent,
             'touch_contact': self.touch_contact,

@@ -235,6 +235,7 @@ start_required "supervised Phase 4 pickup coordinator" \
 start_required "MoveIt Servo and guarded vertical bridge (dry_run=${MOVEIT_SERVO_DRY_RUN}, descent_speed=${SERVO_DESCENT_SPEED_M_S}m/s)" \
   ros2 launch safe_servo_package uf850_moveit_servo.launch.py \
     dry_run:="${MOVEIT_SERVO_DRY_RUN}" \
+    torque_protection_enabled:="${SERVO_TORQUE_PROTECTION_ENABLED:-false}" \
     max_linear_speed:="${SERVO_DESCENT_SPEED_M_S}" \
     kp_z:="${SERVO_DESCENT_KP_Z}"
 start_required "ArUco box marker detector" \

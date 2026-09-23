@@ -48,6 +48,8 @@ def launch_setup(context, *args, **kwargs):
         name='safe_servo',
         output='screen',
         parameters=[{
+            'torque_protection_enabled': ParameterValue(
+                LaunchConfiguration('torque_protection_enabled'), value_type=bool),
             'dry_run': ParameterValue(
                 LaunchConfiguration('dry_run'), value_type=bool),
             'max_linear_speed': ParameterValue(
@@ -61,6 +63,9 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'torque_protection_enabled', default_value='true',
+            description='Enable software torque stop (linear force checks remain active)'),
         DeclareLaunchArgument(
             'dry_run', default_value='true',
             description='Simulate guarded Servo commands without robot motion'),

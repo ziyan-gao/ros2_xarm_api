@@ -1,6 +1,19 @@
 """Test guarded force-sign contact qualification."""
 
 from safe_servo_package.moveit_servo_bridge import MoveItServoBridge
+from types import SimpleNamespace
+
+
+def test_torque_switch_keeps_default_guard_and_disables_both_thresholds():
+    node = SimpleNamespace(torque_norm=.6, torque_limit=.5)
+    assert MoveItServoBridge._torque_exceeded(node)
+    node.torque_protection_enabled = False
+    assert not MoveItServoBridge._torque_exceeded(node)
+    assert not MoveItServoBridge._torque_exceeded(node, .8)
+    node.torque_protection_enabled = True
+    node.torque_norm = .45
+    assert not MoveItServoBridge._torque_exceeded(node)
+    assert MoveItServoBridge._torque_exceeded(node, .8)
 
 
 def test_sign_reversal_alone_does_not_trigger_touch_contact():

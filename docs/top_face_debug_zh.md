@@ -166,6 +166,8 @@ ROS 接口仅为 `/top_face_debug/command`（JSON 命令）、`/top_face_debug/s
 
 ### Policy 和 Test panel 的新物体自动精修
 
+统一启动默认设置 `SERVO_TORQUE_PROTECTION_ENABLED=false`：关闭 guarded Servo 的软件力矩停机和力矩阈值解锁限制，但仍发布力矩数据，保留线性力上限、接触阈值、传感器新鲜度及控制器自身保护。设为 `true` 可恢复。此项启动时读取，不会热切换；停止操作、妥善安置物体后重启 Servo bridge 生效。直接启动该 launch 而未传参数时仍默认开启保护。
+
 SAM Move to 通过共享 PickPathClient / continuous-pick 路径执行：先抬升、跨区域经 observation-side waypoint，再到观察点。不再调用独立 pose planner；观察目标标记为 inspection-only，不能用作抓取快照。真实 pallet/buffer 抓取路径执行前，从路径终点关节构型预计算到记录接触高度的下降段，检查完整性及关节位置限位。不可行时尝试既有跨区域 waypoint 搜索，耗尽则停止。此预检不执行下降，也不替代实际 Servo 的关节、速度和力保护；不能保证实际接触高度偏差或动态速度下必然可达。
 
 Policy loading 通过 `real_platform_policy.yaml` 的 `new_item_sam_enabled: true` 启用新物体 SAM。手动启动 policy loading 和连续加载的下一件均使用同一精修入口。SAM 更新真实 XY 尺寸、中心和 yaw，保留粗估 Z/箱高，然后沿用原有接触估计、策略量化和装箱流程。分割失败停留重试，不用粗框直接抓取；marker detection 显示采样预览。需要重启 policy_loading 和 top_face_debug。单独的普通 Estimate object info 按钮仍是原入口。
