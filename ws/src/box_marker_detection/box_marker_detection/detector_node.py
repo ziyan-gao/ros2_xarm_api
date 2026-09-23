@@ -1,4 +1,5 @@
 import math
+import time
 from copy import deepcopy
 
 import cv2
@@ -131,6 +132,9 @@ class BoxMarkerDetector(Node):
             Image, str(p('image_topic')), self.image_callback, sensor_qos)
         self.image_pub = self.create_publisher(
             Image, '/marker_detection/image', 10)
+        self.sam_preview = None
+        self.sam_preview_seen = 0.
+        self.create_subscription(Image, '/top_face_debug/preview', self.sam_preview_callback, 10)
         self.pose_pub = self.create_publisher(
             PoseArray, '/marker_detection/box_poses', 10)
         self.id_pub = self.create_publisher(
@@ -142,6 +146,15 @@ class BoxMarkerDetector(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.get_logger().info(
             'box marker detector waiting for image and CameraInfo')
+
+    def sam_preview_callback(self, msg):
+        if msg.encoding != 'bgr8' or msg.height <= 0 or msg.width <= 0:
+            return
+        if msg.step < msg.width*3 or len(msg.data) < msg.height*msg.step:
+            return
+        self.sam_preview = np.ndarray((msg.height, msg.width, 3), dtype=np.uint8,
+                                      buffer=bytes(msg.data), strides=(msg.step, 3, 1)).copy()
+        self.sam_preview_seen = time.monotonic()
 
     def info_callback(self, msg):
         first_info = self.camera_matrix is None
@@ -238,6 +251,17 @@ class BoxMarkerDetector(Node):
                     self.make_box_markers(marker_id, dimensions, pose, msg.header.stamp))
                 self.broadcast_box_tf(marker_id, pose, msg.header.stamp)
 
+        # The SAM preview is a captured frame, not a mask aligned to this live frame.
+        age = time.monotonic() - self.sam_preview_seen
+        if self.sam_preview is not None and age < 15.:
+            ph, pw = self.sam_preview.shape[:2]
+            scale = min(image.shape[1]*.42/pw, image.shape[0]*.42/ph)
+            thumb = cv2.resize(self.sam_preview, (max(1, int(pw*scale)), max(1, int(ph*scale))))
+            h, w = thumb.shape[:2]
+            image[-h:, -w:] = thumb
+            cv2.putText(image, f'SAM CAPTURE ({age:.1f}s ago)',
+                        (image.shape[1]-w, image.shape[0]-h-7),
+                        cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 255, 255), 1)
         # cv_bridge from Jazzy does not recognize OpenCV 5's CV_8UC3 type
         # number on conversion back to ROS. Construct the standard image
         # message directly; the input conversion remains compatible.

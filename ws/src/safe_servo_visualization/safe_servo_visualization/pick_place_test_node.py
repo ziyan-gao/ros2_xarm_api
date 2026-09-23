@@ -21,7 +21,8 @@ from packing.real_platform_loading import RealPlatformRandomLoader
 from .pick_path_client import PickPathClient
 from .random_stable_loading_node import round_down_to_increment, round_up_to_increment
 from .pallet_item_record import pallet_record, retrieval_values
-from .two_item_test import TwoItemTest
+from .two_item_test import TwoItemTest, planning_dimensions
+from .top_face_inspection_client import TopFaceInspectionClient, marker_target
 
 
 STEPS = ('pack_new', 'unpack', 'pack_slot', 'repack')
@@ -110,6 +111,8 @@ class PickPlaceTest(TwoItemTest, Node):
         self.test_clients = {k: self.create_client(Trigger, v) for k, v in self.SERVICES.items()}
         self.remove = self.create_client(SetInt16, '/planning_scene_obstacles/remove_placed_item')
         self.pick_path = PickPathClient(self, self.fail)
+        self.sam_inspector = TopFaceInspectionClient(self, 'test')
+        self.sam_pick_result = None
         self.pub = self.create_publisher(String, '/pick_place_test/status', 10)
         self.target_pub = self.create_publisher(Float64MultiArray, '/random_stable_loading/target', 10)
         self.source_pub = self.create_publisher(Float64MultiArray, '/staging_slots/retrieve_target', 10)
@@ -159,7 +162,9 @@ class PickPlaceTest(TwoItemTest, Node):
                 self.status.get('scene', {}).get('attached_item_id')):
             return
         self.record['obstacle_id'] = self.slot().get('obstacle_id')
-        self.record['size_mm'] = [v*1000 for v in self.slot()['size_m']]
+        self.record.setdefault('planning_size_mm', list(planning_dimensions(
+            self.record['size_mm'], getattr(self, 'height_grid', 5))))
+        self.record['real_size_mm'] = [v*1000 for v in self.slot()['size_m']]
         self.record['slot_id'] = self.test_slot
         self.location = 'slot'
         self._sync_item()
@@ -194,6 +199,8 @@ class PickPlaceTest(TwoItemTest, Node):
         first = not self.record or self.record.get('release_sequence') != self.sequence
         if first:
             self.record = pallet_record(self.target)
+            self.record['planning_size_mm'] = list(planning_dimensions(
+                self.record['size_mm'], getattr(self, 'height_grid', 5)))
             self.record['virtual_size_mm'] = list(self.target[9:12])
             self.record.update(obstacle_id=next(iter(new)), release_sequence=self.sequence)
         elif self.record.get('obstacle_id') != next(iter(new)):
@@ -317,7 +324,7 @@ class PickPlaceTest(TwoItemTest, Node):
                 return response
             self.begin_pallet_pick()
         else:
-            self.plan(self.record['item_id'], self.record['size_mm'])
+            self.plan(self.record['item_id'], self.record.get('planning_size_mm', self.record['size_mm']))
         response.success = self.state != 'FAULT'
         response.message = self.fault or ('started '+step+'; real robot motion')
         return response
@@ -357,6 +364,7 @@ class PickPlaceTest(TwoItemTest, Node):
         return self.accepted and current == self.expected and status.get('state') == state
 
     def plan(self, item_id, dimensions):
+        dimensions = planning_dimensions(dimensions, getattr(self, 'height_grid', 5))
         self.phase('PLANNING_RANDOM_TARGET')
         excluded = set()
         if self.step == 'repack':
@@ -390,6 +398,14 @@ class PickPlaceTest(TwoItemTest, Node):
                 self.fail('loading target was replaced by another publisher')
 
     def begin_pallet_pick(self):
+        self.sam_pick_result = None
+        if self.status.get('staging', {}).get('top_face_inspection_enabled', False):
+            self.sam_inspector.begin(marker_target(self.status['scene'], self.record['obstacle_id']))
+            self.phase('SAM_INSPECTION')
+            return
+        self.remove_pallet_source()
+
+    def remove_pallet_source(self):
         # Validate before removing the source obstacle or issuing motion.
         rpy = self.record.get('release_tcp_rpy_rad')
         if (not isinstance(rpy, (list, tuple)) or len(rpy) != 3 or
@@ -406,6 +422,14 @@ class PickPlaceTest(TwoItemTest, Node):
         t, q = tf.translation, tf.rotation
         values = retrieval_values(self.record, self.sequence, [t.x, t.y, t.z],
                                   [q.x, q.y, q.z, q.w], self.clearance)
+        refined = getattr(self, 'sam_pick_result', None)
+        if self.status.get('staging', {}).get('top_face_inspection_enabled', False):
+            if refined is None:
+                raise ValueError('validated SAM result required for test pallet pickup')
+            top = refined['top_center_base_m']
+            values = [float(self.sequence), *top, *refined['grasp_rpy_rad'],
+                      *refined['size_m'], .03, refined['yaw_rad'],
+                      max(t.z+self.clearance, top[2]+.08), 0.]
         self.source_pub.publish(Float64MultiArray(data=values))
         self.phase('PREPARE_PICK_PATH')
         self.pick_path.reset(int(self.status['motion'].get('operation_id', 0))+1)
@@ -452,6 +476,8 @@ class PickPlaceTest(TwoItemTest, Node):
 
     def random_choices(self):
         """Choose operation uniformly, then a free slot uniformly, not one item per slot."""
+        if self.state == 'FAULT':
+            return {}
         if self._two_enabled():
             return self._two_choices()
         choices = {}
@@ -602,6 +628,11 @@ class PickPlaceTest(TwoItemTest, Node):
                     self.begin_stage(False)
                 else:
                     self.begin_pallet_pick()
+        elif self.state == 'SAM_INSPECTION':
+            result = self.sam_inspector.tick()
+            if result is not None:
+                self.sam_pick_result = result
+                self.remove_pallet_source()
         elif self.state == 'REMOVE_SOURCE_OBSTACLE':
             if self.accepted and self.removed_id not in placed_ids(self.status['scene']):
                 self.begin_pick_path()
@@ -647,7 +678,9 @@ class PickPlaceTest(TwoItemTest, Node):
                 if not self.slot().get('occupied') or self.status['scene'].get('attached_item_id'):
                     return
                 self.record['obstacle_id'] = self.slot().get('obstacle_id')
-                self.record['size_mm'] = [v*1000 for v in self.slot()['size_m']]
+                self.record.setdefault('planning_size_mm', list(planning_dimensions(
+                    self.record['size_mm'], getattr(self, 'height_grid', 5))))
+                self.record['real_size_mm'] = [v*1000 for v in self.slot()['size_m']]
                 self.record['slot_id'] = self.test_slot
                 if staging.get('return_to_observation') is not False:
                     return self.fail('store did not confirm overhead-handoff mode')
@@ -668,6 +701,8 @@ class PickPlaceTest(TwoItemTest, Node):
                 self.fail('placement finished but item registration is missing/ambiguous')
 
     def fail(self, reason):
+        if hasattr(self, 'sam_inspector'):
+            self.sam_inspector.cancel()
         self._record_pallet_release()
         self._sync_item()
         self.random_active = False
@@ -733,6 +768,8 @@ class PickPlaceTest(TwoItemTest, Node):
         reasons = {s: self.check_preconditions(s) for s in STEPS}
         self.pub.publish(String(data=json.dumps(dict(
             state=self.state, step=self.step, location=self.location, fault=self.fault,
+            sam_request_id=getattr(getattr(self, 'sam_inspector', None), 'token', None),
+            top_face_inspection_enabled=self.status.get('staging', {}).get('top_face_inspection_enabled', False),
             phase_elapsed_sec=round(time.monotonic()-self.phase_started, 1),
             allowed={s: not r for s, r in reasons.items()}, blocked=reasons,
             record=self.record, target=self.target, events=list(self.events),
@@ -747,7 +784,7 @@ class PickPlaceTest(TwoItemTest, Node):
             random_seed=(None if self.random_seed is None else str(self.random_seed)),
             random_counts=self.random_counts,
             random_message=self.random_message,
-            random_start_allowed=(not self.random_active and bool(self.random_choices())),
+            random_start_allowed=(self.state != 'FAULT' and not self.random_active and bool(self.random_choices())),
             container_size_mm=self.container, transfer_corner_height_m=self.clearance,
         ), separators=(',', ':'))))
 

@@ -98,7 +98,8 @@ def test_node_starts_idle_and_no_low_level_motion_publishers(node):
     assert node.motion_future is None
     topics = {pub.topic_name for pub in node.publishers}
     assert topics <= {'/top_face_debug/status', '/top_face_debug/preview', '/rosout', '/parameter_events',
-                      '/top_face_debug/view_target', '/staging_slots/retrieve_target'}
+                      '/top_face_debug/view_target', '/staging_slots/retrieve_target',
+                      '/top_face_debug/inspection_result'}
 
 
 def test_missing_sam_checkpoint_is_actionable(node):

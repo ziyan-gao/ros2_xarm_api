@@ -22,6 +22,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from .top_face_geometry import transform, top_points, project, prompts, fit_top
 from .top_face_motion import TopFaceMotion
+from .top_face_automation import TopFaceAutomation
 
 
 def stamp_seconds(stamp):
@@ -62,7 +63,7 @@ def fresh_frame(colors, now, max_age=.8):
     return max(frames, key=lambda c: stamp_seconds(c.header.stamp))
 
 
-class TopFaceDebug(TopFaceMotion, Node):
+class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
     def __init__(self):
         super().__init__('top_face_debug')
         for name, default in (
@@ -91,6 +92,7 @@ class TopFaceDebug(TopFaceMotion, Node):
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.predictor = None
         self._init_motion()
+        self._init_automation()
         self.status_pub = self.create_publisher(String, '/top_face_debug/status', 10)
         self.image_pub = self.create_publisher(Image, '/top_face_debug/preview', 2)
         self.create_subscription(Image, self.get_parameter('color_topic').value,
@@ -282,8 +284,11 @@ class TopFaceDebug(TopFaceMotion, Node):
             command = json.loads(msg.data)
             action = command['action']
             if action == 'stop':
-                if self.motion_phase is not None:
+                if self.motion_phase is not None or getattr(self, 'inspection', None):
                     self._motion_fault('operator stopped debug motion')
+                return
+            if getattr(self, 'inspection', None):
+                self.message = 'Policy inspection is active; only Stop is accepted.'
                 return
             if self.motion_phase is not None:
                 self.message = 'Motion is active; only Stop is accepted.'
@@ -330,13 +335,14 @@ class TopFaceDebug(TopFaceMotion, Node):
                     self.message = json.dumps(self.result, ensure_ascii=True, allow_nan=False)
                 except Exception as exc:
                     self.state, self.message = 'ERROR', str(exc)
+        self._automation_tick()
         self._publish_status()
 
     def _publish_status(self):
         msg = String()
         msg.data = json.dumps(dict(state=self.state, message=self.message,
-            busy=self.future is not None or self.motion_phase is not None,
-            motion_active=self.motion_phase is not None,
+            busy=self.future is not None or self.motion_phase is not None or self.inspection is not None,
+            motion_active=self.motion_phase is not None or self.inspection is not None,
             can_pick=self.result is not None and 'top_center_base_m' in self.result,
             targets=sorted(self.targets), captured_target=None if self.snapshot is None else self.snapshot['meta']['target'],
             can_segment=self.snapshot is not None and 'prompt_points' in self.snapshot['meta'],

@@ -1,7 +1,20 @@
 """Two-item inventory and floor-only random test scheduling; no motion commands."""
 from copy import deepcopy
+import math
 from packing_env.data_type.item import Item
 from packing_env.data_type.geometry import Point3D
+
+
+def planning_dimensions(dimensions, height_grid=5):
+    """Policy grid only; never mutate the measured geometry used for motion."""
+    values = tuple(map(float, dimensions))
+    if len(values) != 3 or not all(math.isfinite(v) and v > 0 for v in values):
+        raise ValueError('invalid item dimensions')
+    result = [math.floor((v+1e-9)/5)*5 for v in values[:2]]
+    result.append(math.ceil((values[2]-1e-9)/height_grid)*height_grid)
+    if min(result) <= 0:
+        raise ValueError('item dimensions are below the planning grid')
+    return tuple(result)
 
 
 def disjoint_xy(corner, size, record):
@@ -59,7 +72,9 @@ class TwoItemTest:
 
     def _floor_available(self):
         others = self._other_pallet_items()
-        dx, dy, dz = self.record['size_mm']
+        dx, dy, dz = planning_dimensions(
+            self.record.get('planning_size_mm', self.record['size_mm']),
+            getattr(self, 'height_grid', 5))
         if dz > self.container[2]:
             return False
         for dimensions in ((dx, dy, dz), (dy, dx, dz)):

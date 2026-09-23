@@ -72,6 +72,7 @@ class TopFaceMotion:
             'pick': '/pickup_supervisor/start',
             'cancel': '/motion_coordinator/cancel',
             'abort': '/pickup_supervisor/abort',
+            'retreat': '/pickup_supervisor/retreat',
         }.items()}
         self.remove_source = self.create_client(SetInt16, '/planning_scene_obstacles/remove_placed_item')
         self.consume_slot = self.create_client(SetInt16, '/staging_slots/accept_debug_pick')
@@ -91,11 +92,12 @@ class TopFaceMotion:
             pass
 
     def _idle_checks(self):
+        owners = getattr(self, '_inspection_owners', lambda: set())()
         for key in ('motion', 'pickup', 'scene', 'slots'):
             if time.monotonic()-self.motion_seen.get(key, 0) > 2:
                 raise ValueError(f'{key} status unavailable/stale')
         for key, status in self.motion_status.items():
-            if key == 'scene':
+            if key == 'scene' or key in owners:
                 continue
             if status.get('state') not in ('IDLE', 'SUCCEEDED', 'OBJECT_INFO_READY', 'READY', 'AWAITING_GRASP'):
                 raise ValueError(f'{key} is not idle: {status.get("state")}')
@@ -242,7 +244,10 @@ class TopFaceMotion:
                 if time.monotonic()-self.motion_seen.get(key, 0) > 2:
                     raise ValueError(f'lost {key} status during motion')
             motion, pickup = self.motion_status['motion'], self.motion_status['pickup']
+            owners = getattr(self, '_inspection_owners', lambda: set())()
             for key in ('policy', 'random', 'test', 'cycle', 'place', 'estimate', 'slots'):
+                if key in owners:
+                    continue
                 status = self.motion_status.get(key)
                 if status and status.get('state') not in ('IDLE', 'SUCCEEDED', 'OBJECT_INFO_READY', 'READY', 'AWAITING_GRASP'):
                     raise ValueError(f'another workflow started: {key}')

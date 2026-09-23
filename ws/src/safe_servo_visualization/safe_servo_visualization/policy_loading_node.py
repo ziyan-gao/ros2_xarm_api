@@ -24,6 +24,7 @@ from xarm_msgs.srv import SetInt16
 from .random_stable_loading_node import RandomStableLoadingNode
 from .pick_place_workflow import pick_and_place
 from .pick_path_client import PickPathClient
+from .top_face_inspection_client import TopFaceInspectionClient, inspection_enabled, marker_target
 from .pallet_item_record import pallet_record, retrieval_values
 from .policy_result_recorder import PolicyResultRecorder
 from packing.real_platform_policy_config import PolicyGeometryConfig
@@ -33,6 +34,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
     """Run direct policy loading or transactional MCTS/A* rearrangement."""
 
     REARRANGEMENT_STATES = {
+        'REARRANGE_INSPECT',
         'PLAN_READY', 'REARRANGE_WAIT_TARGET', 'REARRANGE_REMOVE_OBSTACLE',
         'REARRANGE_PLAN_APPROACH', 'REARRANGE_EXECUTE_APPROACH',
         'REARRANGE_PLAN_PICK', 'REARRANGE_EXECUTE_PICK',
@@ -161,6 +163,8 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         self.start_supervisor_pick_client = self.create_client(
             Trigger, '/pickup_supervisor/start_for_transport')
         self.pick_path = PickPathClient(self, self._set_fault)
+        self.sam_inspector = TopFaceInspectionClient(self, 'policy')
+        self.sam_pallet_result = None
         self.start_place_client = self.create_client(
             Trigger, '/place_pipeline/start_continuous_chained')
         self.start_place_return_client = self.create_client(
@@ -259,6 +263,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             OmegaConf.load(config_path), resolve=True)
         if not isinstance(config, dict):
             raise TypeError(f'policy config must be a mapping: {config_path}')
+        self.sam_inspection_enabled = inspection_enabled(config)
         geometry = PolicyGeometryConfig.from_mapping(config)
         # YAML is authoritative, including when an old launch still passes 20.
         clearance_result = self.set_parameters([
@@ -940,6 +945,7 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self._finish_rearrangement_plan()
             return
         self.active_operation = operation
+        self.sam_pallet_result = None
         self.workflow = self._operation_workflow(operation)
         self.target_acknowledged = False
         self.placed_ids_before_operation = self._scene_placed_item_ids()
@@ -1041,6 +1047,15 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             self.waiting_removed_obstacle = '__pending_registration__'
             self.obstacle_wait_started = time.monotonic()
             return
+        if (getattr(self, 'sam_inspection_enabled', False) and
+                (self.sam_pallet_result is None or self.sam_pallet_result[0] != operation.sequence_id)):
+            try:
+                self.sam_inspector.begin(marker_target(self.scene_status, obstacle_id))
+                self.state = 'REARRANGE_INSPECT'
+                self.publish_status()
+            except ValueError as exc:
+                self._set_fault(str(exc))
+            return
         match = re.fullmatch(r'placed_item_(\d+)', obstacle_id)
         if match:
             if not self.remove_placed_obstacle_client.service_is_ready():
@@ -1092,6 +1107,19 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             1.0 - 2.0 * (y*y + z*z))
 
     def _pallet_item_retrieval_message(self, operation):
+        if getattr(self, 'sam_inspection_enabled', False):
+            saved = self.sam_pallet_result
+            if saved is None or saved[0] != operation.sequence_id:
+                raise ValueError('validated SAM inspection for this operation is required')
+            result = saved[1]
+            top = result['top_center_base_m']
+            try:
+                tf = self.tf_buffer.lookup_transform('link_base', 'pallet_frame', rclpy.time.Time())
+            except TransformException as exc:
+                raise ValueError(f'live pallet transform is unavailable: {exc}') from exc
+            overhead = max(tf.transform.translation.z+self.pallet_unpack_approach_height, top[2]+.08)
+            return Float64MultiArray(data=[float(operation.sequence_id), *top,
+                *result['grasp_rpy_rad'], *result['size_m'], .03, result['yaw_rad'], overhead, 0.])
         record = self.pallet_records.get(self._item_key(operation.source_item))
         if record is None:
             raise ValueError('missing physical pallet placement record; reconcile inventory before unpack/repack')
@@ -1202,6 +1230,16 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             lambda done: self._service_response(done, 'rearrangement place'))
 
     def tick(self):
+        if self.state == 'REARRANGE_INSPECT':
+            try:
+                result = self.sam_inspector.tick()
+                if result is not None:
+                    self.sam_pallet_result = (self.active_operation.sequence_id, result)
+                    self._record_result('top_face_inspection', result)
+                    self._start_pallet_retrieve(self.active_operation)
+            except Exception as exc:
+                self._set_fault(f'SAM pallet inspection failed: {exc}')
+            return
         if self.state == 'SIMULATING':
             if (self.simulation_started is not None and
                     time.monotonic() - self.simulation_started >=
@@ -1478,12 +1516,16 @@ class PolicyLoadingNode(RandomStableLoadingNode):
         return True
 
     def _set_fault(self, reason):
+        if hasattr(self, 'sam_inspector'):
+            self.sam_inspector.cancel()
         self._record_result('fault', {'reason': str(reason)})
         if hasattr(self, 'pick_path'):
             self.pick_path.cancel(stop=True)
         return super()._set_fault(reason)
 
     def abort_loading_callback(self, request, response):
+        if hasattr(self, 'sam_inspector'):
+            self.sam_inspector.cancel()
         self._record_result('abort_requested', {})
         if hasattr(self, 'pick_path'):
             self.pick_path.cancel()
@@ -1645,6 +1687,9 @@ class PolicyLoadingNode(RandomStableLoadingNode):
             ))
 
     def _extend_status(self, payload, pending):
+        inspector = getattr(self, 'sam_inspector', None)
+        payload['sam_request_id'] = inspector.token if inspector else None
+        payload['top_face_inspection_enabled'] = getattr(self, 'sam_inspection_enabled', False)
         operation = getattr(self, 'active_operation', None)
         rearrangement = getattr(self.loader, 'rearrangement', None)
         rearrangement_enabled = bool(getattr(

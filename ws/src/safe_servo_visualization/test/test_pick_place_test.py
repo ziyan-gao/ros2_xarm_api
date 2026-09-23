@@ -47,6 +47,38 @@ class Client:
 TARGET = [1000001., 4., 20., 40., 0., 1., 110., 150., 160., 170., 130., 160., 10., 30., 0.]
 
 
+def test_measured_slot_geometry_does_not_replace_planning_geometry():
+    h = Harness()
+    h.step, h.location, h.state = 'unpack', 'carried', 'STORE_SLOT_AND_HANDOFF'
+    h.test_slot = 0
+    h.record = dict(size_mm=[145, 150, 155], obstacle_id='placed_item_1')
+    measured = [144.84838470816612, 149.3209682404995, 151.51385293280345]
+    h.status['staging']['slots'] = [dict(slot=0, occupied=True,
+        obstacle_id='placed_item_3', size_m=[v/1000 for v in measured])]
+    h._record_slot_release()
+    assert h.record['planning_size_mm'] == [145, 150, 155]
+    assert h.record['size_mm'] == [145, 150, 155]
+    assert h.record['real_size_mm'] == pytest.approx(measured)
+    assert h.location == 'slot'
+
+
+def test_fault_does_not_reenter_candidate_generation():
+    h = Harness()
+    h.state = 'FAULT'
+    h.two_item_mode = True
+    h._two_choices = Mock(side_effect=ValueError('must not be called'))
+    assert h.random_choices() == {}
+    h.publish_status()
+    h._two_choices.assert_not_called()
+
+
+def test_legacy_measured_dimensions_are_quantized_without_mutation():
+    from safe_servo_visualization.two_item_test import planning_dimensions
+    measured = [144.848, 149.321, 151.514]
+    assert planning_dimensions(measured) == (140, 145, 155)
+    assert measured == [144.848, 149.321, 151.514]
+
+
 class Harness(PickPlaceTest):
     def __init__(self):
         self.status = {k: dict(state='IDLE', operation_id=0) for k in self.TOPICS}

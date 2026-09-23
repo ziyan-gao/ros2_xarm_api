@@ -160,3 +160,22 @@ bash /workspace/setup_top_face_sam.sh cuda
 可以通过 `results_directory` ROS 参数改变目录。结果带 `diagnostic_only: true`；不会写入 policy 实验 JSON，也不会自动覆盖抓取位姿。保存的数据可用于离线复现，但第一版面板尚无加载旧采集的按钮。
 
 ROS 接口仅为 `/top_face_debug/command`（JSON 命令）、`/top_face_debug/status`（状态）、`/top_face_debug/preview`（图像），不包含任何机器人控制客户端。
+# Policy loading 集成
+
+Test panel 同样接入：unpack / repack 在移除源障碍前执行 Move to → SAM，pack from slot 通过 staging slots 执行同一路径；pack new 不变。开关沿用 staging slots 从 policy YAML 加载的 `top_face_inspection_enabled`，并非 random YAML。单步和随机测试共用该入口。检查失败会停止测试，不会退回旧位姿抓取。
+
+如果新物体刚完成接触估计、监督器仍在 `AWAITING_GRASP`，自动检查会先调用已有的竖直 retreat：清除旧接触信息、退至记录的 pre-grasp 高度，等待对应操作完成并恢复控制后才执行 Move to。接触位置监控不关闭，也不会在该步骤吸取或释放物体。
+
+`real_platform_policy.yaml` 中设置 `top_face_inspection_enabled: true` 后：
+
+- 托盘 unpack / repack：Move to → 静止采样 → SAM 顶面定位 → 原有 pre-pick / 力控接触 / 吸取 / 抬升 / 搬运。
+- 从 slot 取回：同样先观察和 SAM 定位，再进入原有 slot retrieval。
+- 新物体的初次估计和抓取不变。`slot_inspection_enabled` 是旧深度检查开关，与本开关不同；SAM 开启时优先使用 SAM。
+
+定位使用记录的顶面高度，不依赖当前深度；抓取方向使用记录的物体—TCP 相对姿态结合精修物体 yaw，不使用观察姿态的 yaw。
+SAM 不修改库存，也不自行吸取。主流程负责移除目标障碍、抓取和操作提交。缺失抓取记录、定位失败、相机移动或超时会停止流程，不自动沿用旧结果。
+每次检查使用独立 request ID，过期结果不能用于下一件物体。旧版本放置的物体若没有抓取姿态记录，需要重新建立记录。
+
+`/marker_detection/image` 右下角显示 SAM 采样画中画，标记 `SAM CAPTURE`，15 秒后隐藏；主画面仍是实时视频。画中画不是贴在当前帧上的实时 mask，避免相机移动后产生误导。
+
+修改后需重新构建并重启相关节点（policy loading、staging slots、top_face_debug、box_marker_detection），YAML 在节点启动时读取。先以单件物体验证 unpack → slot retrieval → repack，再运行自动实验。

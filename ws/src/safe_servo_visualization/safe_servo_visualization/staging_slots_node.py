@@ -2,6 +2,8 @@ import json
 import math
 import re
 import time
+from pathlib import Path
+import yaml
 
 from controller_manager_msgs.srv import (
     ListControllers, ListHardwareComponents, SetHardwareComponentState,
@@ -22,6 +24,7 @@ from xarm_msgs.srv import Call, MoveJoint, SetInt16
 from .pick_place_workflow import pick_and_place
 from .pick_path_client import PickPathClient
 from .slot_inspection import SlotInspection
+from .top_face_inspection_client import TopFaceInspectionClient, inspection_enabled, marker_target
 
 
 class StagingSlots(SlotInspection, Node):
@@ -50,6 +53,7 @@ class StagingSlots(SlotInspection, Node):
     FAULT = 'FAULT'
 
     ACTIVE = {
+        'SAM_INSPECTION',
         SlotInspection.INSPECTION_FK, SlotInspection.INSPECTION_MOVE,
         SlotInspection.INSPECTION_DEPTH,
         SlotInspection.INSPECTION_CHECK,
@@ -220,6 +224,11 @@ class StagingSlots(SlotInspection, Node):
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self._init_inspection()
+        config_path = str(self.get_parameter('slot_inspection_policy_config_path').value)
+        config = yaml.safe_load(Path(config_path).read_text()) if config_path else {}
+        self.sam_inspection_enabled = inspection_enabled(config or {})
+        self.sam_inspector = TopFaceInspectionClient(self, 'slots')
+        self.sam_retrieval_result = None
 
         self.status_pub = self.create_publisher(String, '/staging_slots/status', 10)
         self.marker_pub = self.create_publisher(
@@ -881,7 +890,16 @@ class StagingSlots(SlotInspection, Node):
         self.fault = ''
         self.last_result = ''
         self.phase_started = time.monotonic()
-        if getattr(self, 'inspection_enabled', False):
+        self.sam_retrieval_result = None
+        if getattr(self, 'sam_inspection_enabled', False):
+            try:
+                self.sam_inspector.begin(marker_target(self.scene_status, placed_id))
+                self.state = 'SAM_INSPECTION'
+            except ValueError as exc:
+                self._fault(str(exc))
+                response.message = str(exc)
+                return response
+        elif getattr(self, 'inspection_enabled', False):
             self._begin_slot_inspection()
         else:
             self._begin_retrieval_removal()
@@ -936,7 +954,16 @@ class StagingSlots(SlotInspection, Node):
             pose[3], pose[4], pose[5],
             *record['size'], self.clearance, float(record.get('object_yaw', 0.0)), approach_z, 1.0,
         ]
-        if 'center' in record and 'orientation' in record:
+        refined = getattr(self, 'sam_retrieval_result', None)
+        if getattr(self, 'sam_inspection_enabled', False):
+            if refined is None:
+                self._fault('validated SAM slot inspection is required before pickup')
+                return
+            top = refined['top_center_base_m']
+            approach_z = max(approach_z, top[2] + self.clearance + .02)
+            target.data = [float(self.active_slot), *top, *refined['grasp_rpy_rad'],
+                           *refined['size_m'], self.clearance, refined['yaw_rad'], approach_z, 1.0]
+        elif 'center' in record and 'orientation' in record:
             target.data.extend([*record['center'], *record['orientation']])
         self.retrieve_target_pub.publish(target)
         self.state = self.PLANNING_RETRIEVAL_APPROACH if overhead else self.PLANNING_RETRIEVAL
@@ -1539,6 +1566,15 @@ class StagingSlots(SlotInspection, Node):
         future.add_done_callback(self._request_accepted)
 
     def tick(self):
+        if self.state == 'SAM_INSPECTION':
+            try:
+                result = self.sam_inspector.tick()
+                if result is not None:
+                    self.sam_retrieval_result = result
+                    self._begin_retrieval_removal()
+            except Exception as exc:
+                self._fault(f'SAM slot inspection failed: {exc}')
+            return
         if self.operation == 'store' and self.state in (
                 self.TRANSFERRING_STORE, self.PLACING_STORE, self.FAULT):
             self._record_confirmed_store_release()
@@ -1789,6 +1825,8 @@ class StagingSlots(SlotInspection, Node):
             *(value * 1000.0 for value in errors))
 
     def _fault(self, reason):
+        if hasattr(self, 'sam_inspector'):
+            self.sam_inspector.cancel()
         if getattr(self, 'abort_latched', False):
             return
         if hasattr(self, 'pick_path'):
@@ -1847,6 +1885,8 @@ class StagingSlots(SlotInspection, Node):
         return response
 
     def abort_callback(self, _request, response):
+        if hasattr(self, 'sam_inspector'):
+            self.sam_inspector.cancel()
         if self.state not in self.ACTIVE:
             response.message = 'no active staging operation'
             return response
@@ -1900,6 +1940,8 @@ class StagingSlots(SlotInspection, Node):
             'selected_store_slot': self.selected_store_slot,
             'selected_retrieve_slot': self.selected_retrieve_slot,
             'inspection_enabled': getattr(self, 'inspection_enabled', False),
+            'top_face_inspection_enabled': getattr(self, 'sam_inspection_enabled', False),
+            'sam_request_id': getattr(getattr(self, 'sam_inspector', None), 'token', None),
             'inspection_backoff_mm': getattr(self, 'inspection_backoff', .1)*1000,
             'inspection_progress': (getattr(self, 'inspection_reason', '')
                                     if self.state == self.INSPECTION_DEPTH else ''),
