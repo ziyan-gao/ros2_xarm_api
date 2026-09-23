@@ -91,6 +91,8 @@ class PlanningSceneObstacles(Node):
             String, '/planning_scene_obstacles/status', 10)
         self.placed_marker_pub = self.create_publisher(
             MarkerArray, '/planning_scene_obstacles/placed_item_markers', 10)
+        # Read-only snapshot refresh for late-joining RViz/inspection viewers.
+        self.create_timer(0.5, self._publish_placed_item_visuals)
         self.create_timer(0.5, self.ensure_scene)
 
     @staticmethod

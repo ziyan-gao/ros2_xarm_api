@@ -132,6 +132,7 @@ fi
 echo "Real-time scheduling preflight passed."
 
 child_pids=()
+optional_pids=()
 
 start_required() {
   echo "Starting $1"
@@ -141,9 +142,9 @@ start_required() {
 }
 
 stop_children() {
-  if ((${#child_pids[@]})); then
-    kill -TERM "${child_pids[@]}" 2>/dev/null || true
-    wait "${child_pids[@]}" 2>/dev/null || true
+  if ((${#child_pids[@]} + ${#optional_pids[@]})); then
+    kill -TERM "${child_pids[@]}" "${optional_pids[@]}" 2>/dev/null || true
+    wait "${child_pids[@]}" "${optional_pids[@]}" 2>/dev/null || true
   fi
 }
 trap stop_children EXIT INT TERM
@@ -170,6 +171,14 @@ start_required "camera calibration TF and force visualization" \
 
 start_required "observation waypoint storage" \
   ros2 run safe_servo_visualization waypoint_store
+
+# Passive debugger: tracked for shutdown, deliberately NOT in the required
+# wait set. A missing SAM environment/model must never stop robot control.
+if [[ "${TOP_FACE_DEBUG_ENABLED:-true}" == "true" ]]; then
+  echo "Starting optional read-only top-face debugger"
+  bash /workspace/start_top_face_debug.sh &
+  optional_pids+=("$!")
+fi
 
 start_required "MoveIt motion coordinator" \
   ros2 run safe_servo_visualization motion_coordinator --ros-args \
@@ -292,6 +301,5 @@ start_required "single-item pack/unpack/repack test coordinator" \
 echo "Unified stack is running; MoveIt is the sole motion owner."
 echo "Direct-SDK safe servo is disabled; guarded descent uses the real MoveIt Servo bridge."
 
-# Every component is required. If one exits, stop the stack instead of leaving
-# a partially functioning robot application running.
+# Stop if a required component exits; the passive debugger is excluded.
 wait -n "${child_pids[@]}"

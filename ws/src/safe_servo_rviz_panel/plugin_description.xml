@@ -4,4 +4,9 @@
          base_class_type="rviz_common::Panel">
     <description>Velocity and Cartesian workspace controls for safe_servo.</description>
   </class>
+  <class name="safe_servo_rviz_panel/TopFaceDebugPanel"
+         type="safe_servo_rviz_panel::TopFaceDebugPanel"
+         base_class_type="rviz_common::Panel">
+    <description>Read-only RGB-D/SAM top-face inspection debugger; no robot motion.</description>
+  </class>
 </library>

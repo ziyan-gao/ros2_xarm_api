@@ -15,6 +15,7 @@ setup(
     maintainer='robot', maintainer_email='robot@example.com',
     description='UF850 visualization helpers', license='Apache-2.0',
     entry_points={'console_scripts': [
+        'top_face_debug = safe_servo_visualization.top_face_debug_node:main',
         'visualization_node = safe_servo_visualization.visualization_node:main',
         'pallet_localization = safe_servo_visualization.pallet_localization_node:main',
         'item_localization = safe_servo_visualization.item_localization_node:main',

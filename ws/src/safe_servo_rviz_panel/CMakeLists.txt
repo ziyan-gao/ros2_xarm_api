@@ -6,14 +6,17 @@ find_package(rclcpp REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 set(CMAKE_AUTOMOC ON)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 add_library(${PROJECT_NAME} SHARED
   include/safe_servo_rviz_panel/safe_servo_panel.hpp
   src/safe_servo_panel.cpp
+  include/safe_servo_rviz_panel/top_face_debug_panel.hpp
+  src/top_face_debug_panel.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC include)
-ament_target_dependencies(${PROJECT_NAME} pluginlib rclcpp rviz_common std_msgs std_srvs)
+ament_target_dependencies(${PROJECT_NAME} pluginlib rclcpp rviz_common std_msgs std_srvs sensor_msgs)
 target_link_libraries(${PROJECT_NAME} Qt5::Widgets)
 pluginlib_export_plugin_description_file(rviz_common plugin_description.xml)
 install(TARGETS ${PROJECT_NAME} DESTINATION lib)

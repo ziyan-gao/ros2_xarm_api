@@ -1,0 +1,15 @@
+# Optional GPU access; the base Compose file remains usable on CPU-only hosts.
+# This host uses NVIDIA CDI mode, requiring the explicit runtime as well.
+services:
+  ros2_cv:
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display
+      - TOP_FACE_SAM_DEVICE=${TOP_FACE_SAM_DEVICE:-cuda}
