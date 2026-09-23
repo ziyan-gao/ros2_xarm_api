@@ -97,10 +97,10 @@ def fit_top(mask, k, d, base_from_camera, prior_points, size, prior_yaw):
         yaw = math.radians(angle) + quarter*math.pi/2
         delta = (yaw-prior_yaw+math.pi) % (2*math.pi)-math.pi
         if error <= .025:
-            options.append((abs(delta), error, prior_yaw+delta))
+            options.append((abs(delta), error, prior_yaw+delta, footprint.tolist()))
     if not options:
         raise ValueError('segmented footprint differs from recorded size by more than 25 mm')
-    _, size_error, yaw = min(options)
+    _, size_error, yaw, fitted_size = min(options)
     center3 = np.array([*center, height])
     if np.linalg.norm(center3[:2]-prior[0, :2]) > .05:
         raise ValueError('estimated center moved more than 50 mm; target association uncertain')
@@ -108,6 +108,7 @@ def fit_top(mask, k, d, base_from_camera, prior_points, size, prior_yaw):
                 delta_center_m=(center3-prior[0]).tolist(),
                 delta_yaw_deg=float(math.degrees(yaw-prior_yaw)),
                 footprint_error_mm=size_error*1000,
+                fitted_size_xy_m=fitted_size,
                 contour_points=len(pixels), recorded_top_z_m=height,
                 estimation_method='rgb_mask_recorded_top_plane', uses_measured_depth=False,
                 diagnostic_only=True)

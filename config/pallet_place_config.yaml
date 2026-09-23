@@ -31,7 +31,7 @@ pallet_pose:
 pre_place_pose:
   frame_id: pallet_frame
   position_m:
-  - 0.0
+  - 0.3
   - 0.0
   - 0.0
   rotate_item_90_deg: false

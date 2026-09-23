@@ -1,4 +1,4 @@
-"""Passive inspection sandbox: no motion/gripper clients or inventory writes."""
+"""Top-face inspection sandbox with explicit operator-triggered motion."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -21,6 +21,7 @@ from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .top_face_geometry import transform, top_points, project, prompts, fit_top
+from .top_face_motion import TopFaceMotion
 
 
 def stamp_seconds(stamp):
@@ -61,7 +62,7 @@ def fresh_frame(colors, now, max_age=.8):
     return max(frames, key=lambda c: stamp_seconds(c.header.stamp))
 
 
-class TopFaceDebug(Node):
+class TopFaceDebug(TopFaceMotion, Node):
     def __init__(self):
         super().__init__('top_face_debug')
         for name, default in (
@@ -83,12 +84,13 @@ class TopFaceDebug(Node):
         self.result = None
         self.preview = None
         self.mask = None
-        self.state, self.message = 'IDLE', 'Read-only: select a target, then Capture / project.'
+        self.state, self.message = 'IDLE', 'Select target: Move to, Capture / project, Run SAM, then explicit Pick.'
         self.generation = 0
         self.future = None
         self.worker_generation = None
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.predictor = None
+        self._init_motion()
         self.status_pub = self.create_publisher(String, '/top_face_debug/status', 10)
         self.image_pub = self.create_publisher(Image, '/top_face_debug/preview', 2)
         self.create_subscription(Image, self.get_parameter('color_topic').value,
@@ -227,14 +229,32 @@ class TopFaceDebug(Node):
             cv2.drawMarker(canvas, tuple(np.rint(p).astype(int)), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
             self.result['image_center_error_px'] = (p-[w/2, h/2]).tolist()
             yaw = self.result['yaw_rad']
-            size = meta['size_m']
+            # Show what SAM actually fitted, not a second copy of the prior.
+            # Physical collision/pickup dimensions remain the recorded ones.
+            size = [*self.result.get('fitted_size_xy_m', meta['size_m'][:2]), meta['size_m'][2]]
             box_center = center[0]-[0, 0, size[2]/2]
             fitted = top_points(size, transform(box_center,
                 [0, 0, math.sin(yaw/2), math.cos(yaw/2)]))
             outline = project(fitted, np.linalg.inv(meta['base_from_camera']),
                               np.asarray(meta['k']), np.asarray(meta['d']))
             cv2.polylines(canvas, [np.rint(outline[1:]).astype(np.int32)], True, (0, 255, 255), 2)
-        cv2.putText(canvas, 'READ-ONLY / NO MOTION', (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 220, 255), 2)
+            pre_pick = center.copy()
+            pre_pick[0, 2] += .03
+            pre_pixel = project(pre_pick, np.linalg.inv(meta['base_from_camera']),
+                                np.asarray(meta['k']), np.asarray(meta['d']))[0]
+            if np.isfinite(pre_pixel).all() and np.max(abs(pre_pixel)) < 100000:
+                tip = tuple(np.rint(pre_pixel).astype(int))
+                cv2.drawMarker(canvas, tip, (255, 255, 0), cv2.MARKER_DIAMOND, 18, 2)
+                cv2.line(canvas, tip, tuple(np.rint(p).astype(int)), (255, 255, 0), 1)
+            self.result['pre_pick_tcp_base_m'] = pre_pick[0].tolist()
+            self.result['pre_pick_tcp_pixel'] = pre_pixel.tolist()
+            cv2.putText(canvas, 'CYAN: pre-pick TCP (+30mm); YELLOW: contact center',
+                        (12, 50), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 220, 255), 1)
+            cv2.putText(canvas,
+                        'Prior XY: %.1f x %.1f mm; SAM XY: %.1f x %.1f mm' %
+                        tuple(v*1000 for v in [*meta['size_m'][:2], *size[:2]]),
+                        (12, 70), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 220, 255), 1)
+        cv2.putText(canvas, 'CAPTURED FRAME / EXPLICIT MOTION BUTTONS', (12, 28), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 220, 255), 2)
         self.preview = canvas
         msg = Image(height=h, width=w, encoding='bgr8', step=w*3, data=canvas.tobytes())
         msg.header.frame_id = meta['camera_frame']
@@ -261,6 +281,13 @@ class TopFaceDebug(Node):
         try:
             command = json.loads(msg.data)
             action = command['action']
+            if action == 'stop':
+                if self.motion_phase is not None:
+                    self._motion_fault('operator stopped debug motion')
+                return
+            if self.motion_phase is not None:
+                self.message = 'Motion is active; only Stop is accepted.'
+                return
             if action == 'clear':
                 self.generation += 1  # Invalidate any late inference result.
                 self.snapshot = self.result = self.mask = self.preview = None
@@ -268,7 +295,9 @@ class TopFaceDebug(Node):
                 return
             if self.future is not None:
                 raise ValueError('SAM worker is busy; wait or clear its result')
-            if action == 'capture':
+            if action in ('move_to', 'pick'):
+                self._begin_motion(action, command['target'])
+            elif action == 'capture':
                 self.generation += 1
                 self._capture(command['target'])
             elif action == 'segment':
@@ -290,6 +319,7 @@ class TopFaceDebug(Node):
             self._publish_status()
 
     def _tick(self):
+        self._motion_tick()
         if self.future is not None and self.future.done():
             future, self.future = self.future, None
             if self.worker_generation == self.generation:
@@ -304,10 +334,13 @@ class TopFaceDebug(Node):
 
     def _publish_status(self):
         msg = String()
-        msg.data = json.dumps(dict(state=self.state, message=self.message, busy=self.future is not None,
+        msg.data = json.dumps(dict(state=self.state, message=self.message,
+            busy=self.future is not None or self.motion_phase is not None,
+            motion_active=self.motion_phase is not None,
+            can_pick=self.result is not None and 'top_center_base_m' in self.result,
             targets=sorted(self.targets), captured_target=None if self.snapshot is None else self.snapshot['meta']['target'],
             can_segment=self.snapshot is not None and 'prompt_points' in self.snapshot['meta'],
-            has_capture=self.snapshot is not None, diagnostic_only=True))
+            has_capture=self.snapshot is not None, diagnostic_only=False))
         self.status_pub.publish(msg)
 
 

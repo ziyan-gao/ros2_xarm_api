@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QResizeEvent>
 #include <QPixmap>
+#include <QMessageBox>
 #include <pluginlib/class_list_macros.hpp>
 #include <rviz_common/display_context.hpp>
 
@@ -20,11 +21,12 @@ namespace safe_servo_rviz_panel
 TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(parent)
 {
   auto * layout = new QVBoxLayout(this);
-  auto * title = new QLabel("Top-face inspection test — READ ONLY", this);
+  auto * title = new QLabel("Top-face inspection and pickup test", this);
   title->setWordWrap(true);
   layout->addWidget(title);
-  auto * help = new QLabel("No robot motion, vacuum command, or inventory update. "
-    "Place the target in view before capturing. Select the marker ID below.", this);
+  auto * help = new QLabel("Move to: center the recorded top face in the camera. "
+    "Capture → SAM → Pick: force-confirmed pickup and lift. Stop automatic loaders first. "
+    "Motion buttons require confirmation; Stop does not release vacuum.", this);
   help->setWordWrap(true);
   layout->addWidget(help);
   targets_ = new QComboBox(this);
@@ -39,6 +41,12 @@ TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(pare
   buttons->addWidget(segment_, 0, 1);
   buttons->addWidget(save_, 1, 0);
   buttons->addWidget(clear_, 1, 1);
+  move_ = new QPushButton("Move to", this);
+  pick_ = new QPushButton("Pick", this);
+  stop_ = new QPushButton("Stop motion", this);
+  buttons->addWidget(move_, 2, 0);
+  buttons->addWidget(pick_, 2, 1);
+  buttons->addWidget(stop_, 3, 0, 1, 2);
   layout->addLayout(buttons);
   preview_ = new QLabel("No capture", this);
   preview_->setAlignment(Qt::AlignCenter);
@@ -54,6 +62,9 @@ TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(pare
   connect(segment_, &QPushButton::clicked, this, [this] { command("segment"); });
   connect(save_, &QPushButton::clicked, this, [this] { command("save"); });
   connect(clear_, &QPushButton::clicked, this, [this] { command("clear"); });
+  connect(move_, &QPushButton::clicked, this, [this] { command("move_to"); });
+  connect(pick_, &QPushButton::clicked, this, [this] { command("pick"); });
+  connect(stop_, &QPushButton::clicked, this, [this] { command("stop"); });
   connect(targets_, qOverload<int>(&QComboBox::currentIndexChanged), this,
     [this](int) { updateControls(); });
   auto * timer = new QTimer(this);
@@ -102,6 +113,14 @@ void TopFaceDebugPanel::command(const QString & action)
   QJsonObject object;
   object["action"] = action;
   object["target"] = targets_->currentText();
+  if (action == "move_to" || action == "pick") {
+    if (QMessageBox::question(this, "Real robot motion",
+        action + " → " + targets_->currentText() +
+        "\nThis will move the real robot. Stop automatic loading and clear the workspace. "
+        "After a debug pick, reconcile/reset experiment inventory before resuming loading.",
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) { return; }
+    if (!received_.isValid() || received_.elapsed() > 2500 || last_status_["busy"].toBool()) { return; }
+  }
   std_msgs::msg::String msg;
   msg.data = QJsonDocument(object).toJson(QJsonDocument::Compact).toStdString();
   if (action == "clear" || action == "capture") {
@@ -148,7 +167,12 @@ void TopFaceDebugPanel::updateControls()
   segment_->setEnabled(available && last_status_["can_segment"].toBool() &&
     targets_->currentText() == last_status_["captured_target"].toString());
   save_->setEnabled(available && last_status_["has_capture"].toBool());
-  clear_->setEnabled(online);
+  clear_->setEnabled(online && !last_status_["motion_active"].toBool());
+  move_->setEnabled(available && targets_->count() > 0);
+  pick_->setEnabled(available && last_status_["can_pick"].toBool() &&
+    targets_->currentText() == last_status_["captured_target"].toString());
+  stop_->setEnabled(online && last_status_["motion_active"].toBool());
+  targets_->setEnabled(available);
 }
 
 void TopFaceDebugPanel::showImage()

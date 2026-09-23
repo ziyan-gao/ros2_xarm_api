@@ -35,6 +35,9 @@ private:
   QPushButton * segment_;
   QPushButton * save_;
   QPushButton * clear_;
+  QPushButton * move_;
+  QPushButton * pick_;
+  QPushButton * stop_;
   QImage image_;
   QElapsedTimer received_;
   QElapsedTimer command_pending_;

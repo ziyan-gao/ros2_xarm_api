@@ -574,6 +574,9 @@ class PlanningSceneObstacles(Node):
             self.add_placed_item_obstacle = configured
 
     def _detachment_succeeded(self, placed_id, placed_geometry=None):
+        # Preserve the object-in-tool rotation BEFORE clearing the attachment.
+        # This is the grasp relationship, independent of any observation pose.
+        grasp_orientation = self.attached_item_orientation
         self.attached_item_id = ''
         self.attached_item_size = None
         self.attached_item_center = None
@@ -585,6 +588,10 @@ class PlanningSceneObstacles(Node):
         if placed_geometry is not None:
             self.placed_item_counter += 1
             self.placed_item_visuals[self.placed_item_counter] = placed_geometry
+            if not hasattr(self, 'placed_grasp_orientations'):
+                self.placed_grasp_orientations = {}
+            if grasp_orientation is not None:
+                self.placed_grasp_orientations[self.placed_item_counter] = list(grasp_orientation)
             self._publish_placed_item_visuals()
         if placed_id:
             self.placed_item_ids.append(placed_id)
@@ -743,6 +750,10 @@ class PlanningSceneObstacles(Node):
             'placed_item_ids': list(self.placed_item_ids),
             'placed_item_count': len(self.placed_item_ids),
             'placed_item_visual_ids': self._placed_item_visual_ids(),
+            'placed_marker_object_ids': {str(k): obj.id for k, obj in self.placed_item_visuals.items()},
+            'placed_marker_grasp_orientations': {
+                str(k): q for k, q in getattr(self, 'placed_grasp_orientations', {}).items()
+                if k in self.placed_item_visuals},
             'placed_item_visual_count': len(self.placed_item_visuals),
             'add_placed_item_obstacle': self.add_placed_item_obstacle,
             'last_placement_error': self.last_placement_error,

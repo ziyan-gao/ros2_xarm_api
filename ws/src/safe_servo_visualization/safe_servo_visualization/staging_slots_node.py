@@ -307,6 +307,7 @@ class StagingSlots(SlotInspection, Node):
         self.create_service(
             Trigger, '/staging_slots/retrieve_chained', self.retrieve_chained_callback)
         self.create_service(Trigger, '/staging_slots/reset', self.reset_callback)
+        self.create_service(SetInt16, '/staging_slots/accept_debug_pick', self.accept_debug_pick_callback)
         self.abort_supervisor = self.create_client(Trigger, '/pickup_supervisor/abort')
         self.cancel_motion = self.create_client(Trigger, '/motion_coordinator/cancel')
         self.abort_latched = False
@@ -1870,6 +1871,23 @@ class StagingSlots(SlotInspection, Node):
             self.set_state.call_async(SetInt16.Request(data=3))
         response.success = True
         response.message = 'staging stop requested; no release or automatic retreat'
+        return response
+
+    def accept_debug_pick_callback(self, request, response):
+        """Commit standalone debug retrieval only after verified attachment."""
+        slot = int(request.data)
+        snapshot = self.motion_status.get('planned_pregrasp') or {}
+        if (self.state not in ('IDLE', 'SUCCEEDED') or slot not in self.occupied or
+                self.pickup_status.get('state') != 'SUCCEEDED' or
+                snapshot.get('pickup_source') != 'buffer' or
+                snapshot.get('retrieval_target_id') != slot or
+                not self.scene_status.get('attached_item_id') or
+                self.scene_status.get('last_attached_pickup_operation_id') != self.pickup_status.get('operation_id')):
+            response.ret, response.message = 1, 'verified debug slot pickup is required'
+            return response
+        self.occupied.pop(slot)
+        self.publish_status()
+        response.ret, response.message = 0, 'debug slot pickup committed'
         return response
 
     def publish_status(self):

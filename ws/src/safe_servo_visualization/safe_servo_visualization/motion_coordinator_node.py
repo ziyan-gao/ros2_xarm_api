@@ -141,6 +141,11 @@ class MotionCoordinator(Node):
             self.staging_store_transfer_target_callback, 10)
         self.pick_path_status = {}
         self.pick_path_status_time = 0.0
+        self.top_face_view = None
+        self.create_subscription(PoseStamped, '/top_face_debug/view_target',
+                                 lambda msg: setattr(self, 'top_face_view', msg), 10)
+        self.create_service(Trigger, '/motion_coordinator/plan_top_face_view',
+                            self.plan_top_face_view_callback)
         self.create_subscription(String, '/pickup_supervisor/status', self._pick_path_status, 10)
         self.create_service(Trigger, '/motion_coordinator/prepare_pick_waypoints',
                             self.prepare_pick_waypoints_callback)
@@ -192,6 +197,34 @@ class MotionCoordinator(Node):
         self.create_timer(0.5, self.publish_status)
         self.get_logger().info(
             f'motion coordinator ready; waypoint_file={self.waypoint_file}')
+
+    def plan_top_face_view_callback(self, _request, response):
+        """Debug camera move; use the normal collision-checked pose planner."""
+        if self.state not in (self.IDLE, self.SUCCEEDED):
+            response.message = f'motion coordinator is not idle: {self.state}'
+            return response
+        if not self._require_fresh_joint_state(response, 'top-face observation'):
+            return response
+        target = self.top_face_view
+        if target is None:
+            response.message = 'no top-face observation target'
+            return response
+        age = (self.get_clock().now()-rclpy.time.Time.from_msg(target.header.stamp)).nanoseconds*1e-9
+        p, q = target.pose.position, target.pose.orientation
+        if (target.header.frame_id != 'link_base' or not 0 <= age < 2 or
+                not all(math.isfinite(v) for v in (p.x, p.y, p.z, q.x, q.y, q.z, q.w)) or
+                abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w-1) > 1e-3):
+            response.message = 'invalid/stale top-face observation target'
+            return response
+        if self.attached_item_geometry is not None or not self.pose_plan_client.service_is_ready():
+            response.message = 'empty tool and pose planner are required'
+            return response
+        self.planned_pregrasp = None
+        self._clear_pregrasp_snapshot()
+        result = self._start_pose_plan(target.pose, -100, response)
+        self.target = 'top_face_view'
+        self.publish_status()
+        return result
 
     def _restore_pregrasp_snapshot(self):
         try:
