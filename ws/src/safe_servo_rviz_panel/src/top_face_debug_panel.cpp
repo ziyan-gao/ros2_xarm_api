@@ -69,7 +69,7 @@ TopFaceDebugPanel::TopFaceDebugPanel(QWidget * parent) : rviz_common::Panel(pare
   connect(pick_, &QPushButton::clicked, this, [this] { command("pick"); });
   connect(stop_, &QPushButton::clicked, this, [this] { command("stop"); });
   connect(targets_, qOverload<int>(&QComboBox::currentIndexChanged), this,
-    [this](int) { updateControls(); });
+    [this](int) { updateControls(); command("select"); });
   auto * timer = new QTimer(this);
   connect(timer, &QTimer::timeout, this, [this] {
     updateControls();

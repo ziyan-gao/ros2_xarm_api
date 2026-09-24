@@ -55,6 +55,27 @@ def prompts(pixels, width, height, margin=12):
     return positive, box
 
 
+def mask_plane_contours(mask, k, d, base_from_camera, height):
+    """Preserve mask boundaries/holes as base-frame horizontal-plane polygons."""
+    contours, _ = cv2.findContours(np.asarray(mask, np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    polygons = []
+    for contour in contours:
+        pixels = cv2.approxPolyDP(contour, 1., True).reshape(-1, 2).astype(float)
+        if len(pixels) < 3:
+            continue
+        rays = cv2.undistortPoints(pixels[:, None, :], k, d).reshape(-1, 2)
+        directions = np.c_[rays, np.ones(len(rays))] @ base_from_camera[:3, :3].T
+        origin = base_from_camera[:3, 3]
+        if np.any(abs(directions[:, 2]) < .01):
+            raise ValueError('mask plane projection is grazing')
+        distance = (height-origin[2])/directions[:, 2]
+        xyz = origin + distance[:, None]*directions
+        if np.any(distance <= .001) or not np.isfinite(xyz).all():
+            raise ValueError('mask plane projection invalid')
+        polygons.append(xyz.tolist())
+    return polygons
+
+
 def fit_top(mask, k, d, base_from_camera, prior_points, size, prior_yaw):
     """Intersect the SAM contour rays with the recorded horizontal top plane.
 

@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 import rclpy
+from unittest.mock import Mock
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
@@ -16,6 +17,14 @@ from visualization_msgs.msg import Marker, MarkerArray
 from safe_servo_visualization.top_face_geometry import (
     transform, top_points, project, prompts, fit_top)
 from safe_servo_visualization.top_face_debug_node import TopFaceDebug, fresh_frame, image_array
+
+
+def test_removed_scene_marker_does_not_clear_successful_mask_before_pickup():
+    node = NS(_motion_tick=Mock(), snapshot={'meta': {'target': 'placed:box:1'}},
+              targets={}, overlay_pub=Mock(), future=None,
+              _automation_tick=Mock(), _publish_status=Mock())
+    TopFaceDebug._tick(node)
+    node.overlay_pub.publish.assert_not_called()
 
 
 def scene():
@@ -99,7 +108,7 @@ def test_node_starts_idle_and_no_low_level_motion_publishers(node):
     topics = {pub.topic_name for pub in node.publishers}
     assert topics <= {'/top_face_debug/status', '/top_face_debug/preview', '/rosout', '/parameter_events',
                       '/top_face_debug/view_target', '/staging_slots/retrieve_target',
-                      '/top_face_debug/inspection_result'}
+                      '/top_face_debug/inspection_result', '/top_face_debug/projected_mask'}
 
 
 def test_missing_sam_checkpoint_is_actionable(node):

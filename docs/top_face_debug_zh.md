@@ -209,4 +209,6 @@ SAM 不修改库存，也不自行吸取。主流程负责移除目标障碍、�
 
 `/marker_detection/image` 右下角显示 SAM 采样画中画，标记 `SAM CAPTURE`，15 秒后隐藏；主画面仍是实时视频。画中画不是贴在当前帧上的实时 mask，避免相机移动后产生误导。
 
+主视频另显示紫色 `SAM REPROJECTED`：将 SAM mask 轮廓（保留孔洞，约 1 像素简化）按采样相机内外参投到记录顶面平面，再按当前视频帧时间戳的 TF 重投影；不使用实时深度。原始采样后 10 秒失效，重投影不续期。显示端最多缓存视频帧 200 ms 等待精确时间 TF，不阻塞检测结果发布；超时或顶面在相机后方时不显示 mask。开始抓取、挂载物体、记录目标几何变化或切换调试目标时清除。unpack 在接近物体前移除场景 marker 不再单独清除 mask，因为此时物体尚未移动。它不是实时分割，不检测人为移动或遮挡；右下角截图仍独立保留。需重启 top_face_debug、box_marker_detector；选择切换通知需重建 safe_servo_rviz_panel 并重启 RViz。
+
 修改后需重新构建并重启相关节点（policy loading、staging slots、top_face_debug、box_marker_detection），YAML 在节点启动时读取。先以单件物体验证 unpack → slot retrieval → repack，再运行自动实验。

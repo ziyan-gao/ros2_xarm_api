@@ -20,7 +20,7 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .top_face_geometry import transform, top_points, project, prompts, fit_top
+from .top_face_geometry import transform, top_points, project, prompts, fit_top, mask_plane_contours
 from .top_face_motion import TopFaceMotion
 from .top_face_automation import TopFaceAutomation
 
@@ -95,6 +95,7 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
         self._init_automation()
         self.status_pub = self.create_publisher(String, '/top_face_debug/status', 10)
         self.image_pub = self.create_publisher(Image, '/top_face_debug/preview', 2)
+        self.overlay_pub = self.create_publisher(String, '/top_face_debug/projected_mask', 2)
         self.create_subscription(Image, self.get_parameter('color_topic').value,
                                  lambda msg: self.colors.append(msg), qos_profile_sensor_data)
         self.create_subscription(CameraInfo, self.get_parameter('camera_info_topic').value,
@@ -130,6 +131,7 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
                          [tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w])
 
     def _capture(self, key):
+        self.overlay_pub.publish(String(data='{}'))
         self.snapshot = self.result = self.mask = self.preview = None
         marker = self.targets.get(key)
         if marker is None or time.monotonic()-self.marker_seen.get(key.split(':')[0], 0) > 2:
@@ -276,6 +278,12 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
         msg.header.frame_id = meta['camera_frame']
         msg.header.stamp = Time(seconds=meta['color_stamp']).to_msg()
         self.image_pub.publish(msg)
+        if self.mask is not None and self.result and 'error' not in self.result:
+            polygons = mask_plane_contours(self.mask, np.asarray(meta['k']), np.asarray(meta['d']),
+                                          np.asarray(meta['base_from_camera']), meta['recorded_top_z_m'])
+            self.overlay_pub.publish(String(data=json.dumps(dict(
+                target=meta['target'], base_frame=self.base, color_stamp=meta['color_stamp'],
+                polygons=polygons), allow_nan=False)))
 
     def _save(self):
         if self.snapshot is None:
@@ -297,6 +305,9 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
         try:
             command = json.loads(msg.data)
             action = command['action']
+            if action == 'select':
+                self.overlay_pub.publish(String(data='{}'))
+                return  # Display-only selection, never changes motion ownership.
             if action == 'stop':
                 if self.motion_phase is not None or getattr(self, 'inspection', None):
                     self._motion_fault('operator stopped debug motion')
@@ -351,6 +362,18 @@ class TopFaceDebug(TopFaceAutomation, TopFaceMotion, Node):
 
     def _tick(self):
         self._motion_tick()
+        if (self.snapshot and self.snapshot['meta']['target'].startswith('placed:') and
+                self.snapshot['meta']['target'] in self.targets):
+            # Removing an obstacle before approach also removes its marker,
+            # but does not physically move the item. Keep the frozen mask in
+            # that case until pickup/attachment, explicit clear, or expiry.
+            try:
+                box, size, _ = self._target_geometry(self.snapshot['meta']['target'])
+                if (not np.allclose(box, self.snapshot['meta']['base_from_box'], atol=.001, rtol=0) or
+                        not np.allclose(size, self.snapshot['meta']['size_m'], atol=.001, rtol=0)):
+                    self.overlay_pub.publish(String(data='{}'))
+            except Exception:
+                self.overlay_pub.publish(String(data='{}'))
         if self.future is not None and self.future.done():
             future, self.future = self.future, None
             if self.worker_generation == self.generation:

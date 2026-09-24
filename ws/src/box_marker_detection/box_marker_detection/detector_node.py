@@ -1,6 +1,8 @@
 import math
+import json
 import time
 from copy import deepcopy
+from collections import deque
 
 import cv2
 import numpy as np
@@ -11,7 +13,8 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Int32MultiArray
+from std_msgs.msg import Int32MultiArray, String
+from .sam_overlay import projected_mask
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -134,6 +137,15 @@ class BoxMarkerDetector(Node):
             Image, '/marker_detection/image', 10)
         self.sam_preview = None
         self.sam_preview_seen = 0.
+        self.sam_projection = None
+        self.sam_blocked = False
+        self.sam_pickup_active = False
+        self.video_pending = deque(maxlen=8)
+        self.create_timer(.02, self.flush_video)
+        self.create_subscription(String, '/top_face_debug/projected_mask', self.sam_projection_callback, 2)
+        self.create_subscription(String, '/planning_scene_obstacles/status', self.sam_scene_callback, 10)
+        self.create_subscription(String, '/pickup_supervisor/status', self.sam_pickup_callback, 10)
+        self.create_subscription(String, '/top_face_debug/command', self.sam_command_callback, 10)
         self.create_subscription(Image, '/top_face_debug/preview', self.sam_preview_callback, 10)
         self.pose_pub = self.create_publisher(
             PoseArray, '/marker_detection/box_poses', 10)
@@ -146,6 +158,41 @@ class BoxMarkerDetector(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.get_logger().info(
             'box marker detector waiting for image and CameraInfo')
+
+    def sam_projection_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            self.sam_projection = payload if payload and not (self.sam_blocked or self.sam_pickup_active) else None
+        except (ValueError, TypeError):
+            self.sam_projection = None
+
+    def sam_scene_callback(self, msg):
+        try:
+            status = json.loads(msg.data)
+            self.sam_blocked = bool(status.get('attached_item_id') or status.get('attachment_pending'))
+            if self.sam_blocked:
+                self.sam_projection = None
+        except (ValueError, TypeError):
+            self.sam_projection = None
+
+    def sam_pickup_callback(self, msg):
+        try:
+            status = json.loads(msg.data)
+            self.sam_pickup_active = (status.get('operation_kind') == 'pickup' and
+                                      status.get('state') not in ('IDLE', 'SUCCEEDED'))
+            if self.sam_pickup_active:
+                self.sam_projection = None
+        except (ValueError, TypeError):
+            self.sam_projection = None
+
+    def sam_command_callback(self, msg):
+        try:
+            command = json.loads(msg.data)
+            if (command.get('action') in ('move_to', 'pick', 'capture', 'refine_new', 'clear', 'stop', 'select') or
+                    (self.sam_projection and command.get('target') != self.sam_projection.get('target'))):
+                self.sam_projection = None
+        except (ValueError, TypeError):
+            self.sam_projection = None
 
     def sam_preview_callback(self, msg):
         if msg.encoding != 'bgr8' or msg.height <= 0 or msg.width <= 0:
@@ -251,6 +298,50 @@ class BoxMarkerDetector(Node):
                     self.make_box_markers(marker_id, dimensions, pose, msg.header.stamp))
                 self.broadcast_box_tf(marker_id, pose, msg.header.stamp)
 
+        # Perception topics stay immediate. Only the display waits for image-time TF.
+        self.pose_pub.publish(poses)
+        id_msg = Int32MultiArray()
+        id_msg.data = detected_ids
+        self.id_pub.publish(id_msg)
+        self.marker_pub.publish(marker_array)
+        self.video_pending.append((msg, image.copy(), self.camera_matrix.copy(),
+                                   self.distortion.copy(), time.monotonic()))
+        self.flush_video()
+
+    def flush_video(self):
+        while self.video_pending:
+            msg, image, k, d, received = self.video_pending[0]
+            payload = self.sam_projection
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec*1e-9
+            if payload and 0 <= stamp-float(payload['color_stamp']) < 10.:
+                ready = self.tf_buffer.can_transform(
+                    msg.header.frame_id, payload['base_frame'], rclpy.time.Time.from_msg(msg.header.stamp))
+                if not ready and time.monotonic()-received < .2:
+                    return  # Yield to TF subscriptions, never sleep in the callback.
+            self.video_pending.popleft()
+            self.render_video(msg, image, k, d)
+
+    def render_video(self, msg, image, k, d):
+        if self.sam_projection:
+            try:
+                payload = self.sam_projection
+                stamp = msg.header.stamp.sec + msg.header.stamp.nanosec*1e-9
+                now = self.get_clock().now().nanoseconds*1e-9
+                if now-float(payload['color_stamp']) >= 10. or stamp-float(payload['color_stamp']) >= 10.:
+                    self.sam_projection = None
+                elif stamp >= float(payload['color_stamp']):
+                    # Exact image-time TF only: never use the latest-pose fallback.
+                    tf = self.tf_buffer.lookup_transform(msg.header.frame_id, payload['base_frame'],
+                                                         rclpy.time.Time.from_msg(msg.header.stamp))
+                    mask = projected_mask(payload, stamp, transform_matrix(tf.transform),
+                                          k, d, image.shape)
+                    if mask is not None:
+                        image[mask] = (.65*image[mask] + .35*np.array([220, 40, 220])).astype(np.uint8)
+                        cv2.putText(image, 'SAM REPROJECTED (recorded plane)', (12, 28),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .55, (220, 40, 220), 2)
+            except Exception as exc:
+                self.get_logger().warning(f'SAM reprojection skipped: {exc}', throttle_duration_sec=2.)
+
         # The SAM preview is a captured frame, not a mask aligned to this live frame.
         age = time.monotonic() - self.sam_preview_seen
         if self.sam_preview is not None and age < 15.:
@@ -274,11 +365,6 @@ class BoxMarkerDetector(Node):
         overlay.step = image.shape[1] * 3
         overlay.data = np.ascontiguousarray(image).tobytes()
         self.image_pub.publish(overlay)
-        self.pose_pub.publish(poses)
-        id_msg = Int32MultiArray()
-        id_msg.data = detected_ids
-        self.id_pub.publish(id_msg)
-        self.marker_pub.publish(marker_array)
 
     def make_box_markers(self, marker_id, dimensions, pose, stamp):
         cube = Marker()
