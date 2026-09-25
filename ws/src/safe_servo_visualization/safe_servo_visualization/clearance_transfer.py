@@ -1,4 +1,4 @@
-"""Measured-state clearance -> free-space -> vertical approach sequencing."""
+"""Clearance routes with one checked cuMotion/Cartesian execution."""
 import time
 import math
 import numpy as np
@@ -8,7 +8,7 @@ CLEARANCE_TARGET_MARGIN_M = .010
 class ClearanceTransfer:
     def _wait_descent_baseline(self):
         if (not getattr(self, 'direct_moveit_active', False) or
-                getattr(self, 'clearance_phase', None) != 'descend' or
+                getattr(self, 'clearance_phase', None) not in ('descend', 'continuous') or
                 getattr(self, 'transport_is_return', False)):
             return False
         key = (self.operation_id, self.transport_route_generation, id(self.transport_trajectory))
@@ -29,7 +29,8 @@ class ClearanceTransfer:
         self.transport_force_count = 0
         self.descent_baseline_ready = key
         self.descent_baseline_gate = None
-        self.transport_descent_time = 0.
+        if self.clearance_phase == 'descend':
+            self.transport_descent_time = 0.
         self.get_logger().info(
             f'captured immediate Cartesian descent Fz baseline='
             f'{self.transport_contact_baseline:.3f} N (no settling wait)')
@@ -87,9 +88,12 @@ class ClearanceTransfer:
         slot_z = getattr(self, 'transport_slot_clearance_z_m', 0.) or clearance
         source_region = (getattr(self, 'clearance_last_region', None) if getattr(self, 'transport_is_pick', False)
                          else source.get('pickup_source'))
-        source_z = slot_z if source_region == 'buffer' else clearance
+        # Match the pallet-only 100 mm reduction in live_bridge's virtual box.
+        pallet_z = clearance - (.100 if getattr(
+            self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion' else 0.)
+        source_z = slot_z if source_region == 'buffer' else pallet_z
         destination_z = slot_z if (target.get('pickup_source') == 'buffer' or
-                                  self.transport_target.get('transfer_context') == 'staging_store') else clearance
+                                  self.transport_target.get('transfer_context') == 'staging_store') else pallet_z
         self.clearance_target_region = ('buffer' if (target.get('pickup_source') == 'buffer' or
             self.transport_target.get('transfer_context') == 'staging_store') else 'pallet')
         scene = self.transport_scene
@@ -145,7 +149,7 @@ class ClearanceTransfer:
         self.transport_safe_z = planning_floor
         self.transport_high_z = max(source_tcp, destination_tcp)
         self.clearance_phase = ('inspection_cartesian' if same_area_inspection else 'lift')
-        self.get_logger().info(f'clearance TCP: source={source_tcp:.3f} m, destination={destination_tcp:.3f} m; execute lift before free-space planning')
+        self.get_logger().info(f'clearance TCP: source={source_tcp:.3f} m, destination={destination_tcp:.3f} m')
         if same_area_inspection:
             self.get_logger().info(
                 'top-face inspection route: same-area Cartesian motion directly to final pose')
@@ -172,9 +176,14 @@ class ClearanceTransfer:
         self.state = self.TRANSPORT_PLANNING
         self.alternative_current_xyz, self.alternative_current_q = np.asarray(xyz), np.asarray(q)
         self.alternative_parts = []
+        self.alternative_part_kinds = []
         self.direct_lift_z = None
         self.direct_lift_verified = False
         final, final_q = self.clearance_final
+        if (getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion' and
+                self.clearance_phase != 'inspection_cartesian'):
+            self._plan_continuous_clearance(xyz, q)
+            return
         if self.clearance_phase == 'lift':
             end = np.array([xyz[0], xyz[1], self.clearance_source_z])
             end_q, kind = q, 'cartesian'
@@ -192,6 +201,78 @@ class ClearanceTransfer:
         self.transport_end, self.transport_end_q = np.asarray(end), np.asarray(end_q)
         self.alternative_segments = [(kind, self.transport_end, self.transport_end_q)]
         self._alternative_next()
+
+    def _plan_continuous_clearance(self, xyz, q):
+        """Plan all legs from predecessor endpoints; do not move between requests."""
+        self.clearance_phase = 'continuous'
+        final, final_q = self.clearance_final
+        self.transport_end, self.transport_end_q = final, final_q
+        self.clearance_has_descent = (
+            not getattr(self, 'transport_is_return', False) and
+            np.linalg.norm(self.clearance_destination-final) > .001)
+        target = self.transport_target.get('planned_pregrasp') or {}
+        if getattr(self, 'transport_is_pick', False) and target.get('approach_mode') == 'joint_direct':
+            self.clearance_has_descent = False
+            self.direct_lift_z = None
+            self.alternative_segments = [('moveit', final, final_q)]
+            self.get_logger().info('new-item approach: checked direct joint interpolation')
+            self._alternative_next()
+            return
+        if (getattr(self, 'transport_is_pick', False) and not target.get('inspection_only') and
+                target.get('pickup_source') in ('pallet', 'buffer')):
+            if xyz[2] < final[2] - .001:
+                raise ValueError('inspection pose is below pre-pick; cannot move horizontally then downward')
+            self.clearance_destination = np.array([final[0], final[1], xyz[2]])
+            self.transport_high_z = float(xyz[2])
+            self.direct_lift_z = None
+            self.clearance_has_descent = xyz[2] - final[2] > .001
+            self.alternative_segments = [('cartesian', self.clearance_destination, final_q)]
+            if self.clearance_has_descent:
+                self.alternative_segments.append(('cartesian', final, final_q))
+            self.get_logger().info('inspection approach: checked horizontal Cartesian then downward')
+            self._alternative_next()
+            return
+        segments = []
+        if self.clearance_source_z-xyz[2] > .001:
+            # Reserve the top half of the clearance margin for the rounded turn.
+            self.direct_lift_z = self.clearance_source_z-CLEARANCE_TARGET_MARGIN_M/2
+            segments.append(('cartesian', np.array([*xyz[:2], self.clearance_source_z]), q))
+        destination = self.clearance_destination if self.clearance_has_descent else final
+        segments.append(('moveit', destination, final_q))
+        if self.clearance_has_descent:
+            segments.append(('cartesian', final, final_q))
+        self.alternative_segments = segments
+        self.get_logger().info('planning complete clearance route; one blended trajectory, no intermediate execution')
+        self._alternative_next()
+
+    def _continuous_clearance_geometry_issue(self, xyz, q, t):
+        """Classify the turn spatially; sparse neighboring knots are not its bounds."""
+        descent = self.transport_descent_time
+        distance = float(np.linalg.norm(xyz-self.clearance_destination))
+        radius = min(self.transport_radius, CLEARANCE_TARGET_MARGIN_M)
+        issue = None
+        if descent is not None and t >= descent:
+            # The neighboring knot times only limit where blending may occur.
+            # Outside the sphere, the incoming path is still free transfer and
+            # the outgoing path must already satisfy strict vertical descent.
+            if (t < self.clearance_descent_blend_end and distance <= radius and
+                    math.isinf(self.clearance_previous_descent_z)):
+                return None
+            if t >= self.clearance_descent_seam_time:
+                if (np.linalg.norm(xyz[:2]-self.transport_end[:2]) > .001 or
+                        abs(float(q @ self.transport_end_q)) < math.cos(math.radians(.5)/2) or
+                        xyz[2] > min(self.clearance_previous_descent_z,
+                                     self.clearance_destination[2])+.001):
+                    issue = 'continuous final approach must descend vertically with fixed orientation'
+                else:
+                    # Once outside the turn, never reopen its relaxed XY region.
+                    self.clearance_previous_descent_z = float(xyz[2])
+                    return None
+        if issue:
+            return (f'{issue}; t={t:.4f}s, xyz={np.asarray(xyz).round(6).tolist()}, '
+                    f'seam_xyz={self.clearance_destination.round(6).tolist()}, '
+                    f'distance={distance*1000:.2f}mm, radius={radius*1000:.2f}mm')
+        return None
 
     def _advance_clearance_phase(self, xyz, q):
         phase = getattr(self, 'clearance_phase', None)

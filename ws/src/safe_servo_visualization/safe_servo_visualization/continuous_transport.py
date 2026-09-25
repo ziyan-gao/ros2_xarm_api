@@ -105,7 +105,7 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
         self.create_service(Trigger, '/pickup_supervisor/start_pick_waypoints', self.start_pick_waypoints)
         self.declare_parameter('continuous_transport_blend_radius_m', 0.04)
         self.transport_radius = float(self.get_parameter('continuous_transport_blend_radius_m').value)
-        self.declare_parameter('cartesian_transport_speed_ratio', 0.35)
+        self.declare_parameter('cartesian_transport_speed_ratio', 1.0)
         self.cartesian_transport_speed_ratio = float(
             self.get_parameter('cartesian_transport_speed_ratio').value)
         if (not math.isfinite(self.cartesian_transport_speed_ratio) or
@@ -182,6 +182,17 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             self.transport_cumotion_joint_limits = {}
             self.get_logger().error(f'continuous transport cannot read robot limits: {exc}')
 
+    def _prepared_transport_target(self):
+        """Acknowledge the exact destination and payload observed by this node."""
+        item = self.planning_scene_status.get('attached_item_id')
+        motion = self.motion_status
+        if (not self.pallet_locked or not item or motion.get('state') != 'PREPARED' or
+                motion.get('transfer_context') not in ('pallet', 'staging_store') or
+                motion.get('operation_id') is None):
+            return None
+        return dict(operation_id=motion['operation_id'], attached_item_id=item,
+                    transfer_context=motion['transfer_context'])
+
     def start_continuous_transport(self, _request, response):
         return self._start_continuous_transport(response, return_to_observation=True)
 
@@ -197,10 +208,14 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
         if self.dry_run or not self.transport_joint_limits:
             response.message = 'continuous transport requires real-control mode and bounded robot description'
             return response
-        if (not self.pallet_locked or not self.planning_scene_status.get('attached_item_id') or
-                self.motion_status.get('state') != 'PREPARED' or
-                self.motion_status.get('transfer_context') not in ('pallet', 'staging_store')):
-            response.message = 'continuous transport requires a prepared destination and attached item'
+        if self._prepared_transport_target() is None:
+            response.message = (
+                'continuous transport requires a prepared destination and attached item; '
+                f'pallet_locked={self.pallet_locked}, '
+                f'attached_item_id={self.planning_scene_status.get("attached_item_id")}, '
+                f'motion_state={self.motion_status.get("state")}, '
+                f'motion_operation_id={self.motion_status.get("operation_id")}, '
+                f'transfer_context={self.motion_status.get("transfer_context")}')
             return response
         now = time.monotonic()
         if (self.last_joint_state_time is None or now-self.last_joint_state_time > self.status_timeout or
@@ -226,6 +241,8 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
         self.staged_timing_used = False
         self.staged_timing_active = False
         self.transport_slot_yaw_flipped = False
+        self.transport_pallet_yaw_flipped = False
+        self.verified_pallet_yaw_target = None
         self.verified_slot_transfer_target = None
         self.transport_slot_yaw_deadline = now + 5.0
         self.alternative_observation = None
@@ -317,6 +334,12 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                 getattr(self, 'transport_moveit_direct_enabled', False) and
                 (not getattr(self, 'transport_is_return', False) or
                  getattr(self, 'return_to_observation', True)))
+            self.clearance_phase = None
+            if getattr(self, 'transport_is_pick', False) or getattr(self, 'transport_is_return', False):
+                self.transport_pallet_yaw_flipped = False
+            # Both direct and staged returns begin in the empty-tool exit column.
+            self.return_collision_column_open = True
+            self.return_collision_previous_z = float(start[2])
             if self.direct_moveit_active:
                 self.reuse_active = False
                 if not (self.planning_scene_status.get('camera_collision_applied') and
@@ -376,8 +399,6 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                 raise ValueError('blended transport exceeds the configured workspace ceiling')
             self.transport_start_xyz = start
             self.transport_start_q = q
-            self.return_collision_column_open = True
-            self.return_collision_previous_z = float(start[2])
             self.transport_end = np.array(end)
             self.transport_end_q = quaternion(end_q)
             self.transport_clearance = clearance
@@ -506,6 +527,15 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                 # No applicable retry: hold/fault. Never fabricate timing for
                 # an untimed geometric path or retry an execution failure.
                 raise ValueError(reason)
+            # Slow the carried-item route without an iterative TCP retimer.
+            if ((getattr(self, 'transport_scene', None) or {}).get('attached_item_id')
+                    and not getattr(self, 'transport_is_pick', False)
+                    and not getattr(self, 'transport_is_return', False)):
+                for point in trajectory.points:
+                    t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+                    point.time_from_start = Duration(seconds=t * 2.).to_msg()
+                    point.velocities = [v * .5 for v in point.velocities]
+                    point.accelerations = [a * .25 for a in point.accelerations]
             operator_scale = max(0.05, min(1.0, self.motion_speed_percent/100))
             source = getattr(self, 'transport_timing_source', 'cartesian')
             relative_scale = (1. if source == 'moveit' else
@@ -555,6 +585,14 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             trajectory, self.transport_checks, self.transport_duration, duration_ratio, timing = task.result()
             scale = requested_scale
             self.transport_trajectory = trajectory
+            if getattr(self, 'clearance_phase', None) == 'continuous':
+                index = self.clearance_descent_index
+                if index is not None:
+                    seconds = lambda p: p.time_from_start.sec+p.time_from_start.nanosec*1e-9
+                    self.transport_descent_time = seconds(trajectory.points[max(0, index-1)])
+                    self.clearance_descent_seam_time = seconds(trajectory.points[index])
+                    self.clearance_descent_blend_end = seconds(trajectory.points[index+1])
+                    self.clearance_previous_descent_z = math.inf
             worst = timing['initial_worst']
             jerk_cap = (f'{self.transport_max_joint_jerk*scale:.3f} rad/s^3'
                         if self.transport_enforce_jerk_limit else 'disabled (software opt-in)')
@@ -601,7 +639,7 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             self._transport_execute()
             return
         joints, _ = self.transport_checks[self.transport_check_index]
-        if getattr(self, 'transport_is_return', False) and not getattr(self, 'direct_moveit_active', False):
+        if getattr(self, 'transport_is_return', False):
             self._transport_fk_request(joints, self._return_collision_classified)
             return
         self._transport_check_collision(joints)
@@ -664,6 +702,12 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
         try:
             xyz,q = self._transport_pose(future.result())
             _,t = self.transport_checks[self.transport_check_index]
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'clearance_phase', None) == 'continuous'):
+                issue = self._continuous_clearance_geometry_issue(xyz, q, t)
+                if issue:
+                    self._transport_reject_geometry(issue)
+                    return
             if (getattr(self, 'direct_moveit_active', False) and
                     getattr(self, 'clearance_phase', None) == 'transfer' and
                     getattr(self, 'transport_moveit_clearance_constraint_enabled', False) and
@@ -808,7 +852,8 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             self._fault('robot moved during continuous transport planning')
             return
         if (getattr(self, 'transport_is_pick', False) and
-                (not getattr(self, 'direct_moveit_active', False) or getattr(self, 'clearance_phase', None) == 'descend') and
+                (not getattr(self, 'direct_moveit_active', False) or
+                 getattr(self, 'clearance_phase', None) in ('descend', 'continuous')) and
                 self._check_pick_descent_before_execution()):
             return
         if self._wait_descent_baseline():
@@ -959,6 +1004,8 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                         xyz=list(self.transport_end),
                         original_z=float(self.transport_target['pre_place_tcp_xyz_m'][2]),
                         item_id=self.transport_scene.get('attached_item_id'))
+                if getattr(self, 'transport_pallet_yaw_flipped', False):
+                    self.verified_pallet_yaw_target = dict(self.transport_target)
                 if getattr(self, 'transport_target', {}).get('transfer_context') == 'staging_store':
                     self.verified_slot_transfer_target = dict(self.transport_target)
                     self.verified_slot_transfer_target['pre_place_tcp_xyz_m'] = list(self.transport_end)
@@ -1077,13 +1124,6 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             self.transport_still_since = now
         self.transport_stop_stamp = self.last_joint_state_time
         if self.transport_still_since is not None and now-self.transport_still_since >= 0.25:
-            self.loading_contact_fallback = True
-            self.place_fallback_used = True
-            self.place_fallback_reason = 'force contact during continuous descent'
-            self.contact_detected = True
-            self.direct_target_z = float(self.transport_target['transfer_tcp_z_m'])
-            self.direct_target_pose = None
-            self.direct_tcp_z_offset = None
-            self.continuous_contact_retreat = True
-            self._turn_vacuum_off()
+            self._fault('unexpected force contact before guarded placement; '
+                        'transport stopped, item remains held')
         return True

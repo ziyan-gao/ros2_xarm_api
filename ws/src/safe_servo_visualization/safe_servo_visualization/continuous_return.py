@@ -2,7 +2,6 @@
 import math
 import time
 
-import yaml
 from std_srvs.srv import SetBool
 
 
@@ -68,6 +67,7 @@ class ContinuousReturn:
             return
         self.return_escape_active = False
         self.return_escape_count = 0
+        self.return_staged_endpoint = None
         self.return_clearance_pending = True
         self.return_staged_fallback_used = False
         self.continuous_return_target_id = None  # Consume the one-cycle request.
@@ -104,6 +104,11 @@ class ContinuousReturn:
 
     def _return_transport_target(self):
         target = dict(self.motion_status)
+        resolved = getattr(self, 'verified_pallet_yaw_target', None)
+        if (resolved is not None and target.get('transfer_context') == 'pallet' and
+                resolved.get('operation_id') == target.get('operation_id')):
+            target['pre_place_tcp_xyz_m'] = list(resolved['pre_place_tcp_xyz_m'])
+            target['transfer_tcp_quaternion_xyzw'] = list(resolved['transfer_tcp_quaternion_xyzw'])
         if target.get('transfer_context') != 'staging_store':
             return target
         resolved = getattr(self, 'verified_slot_transfer_target', None)
@@ -136,18 +141,23 @@ class ContinuousReturn:
                 raise ValueError('item is still attached')
             if not self.pallet_locked:
                 raise ValueError('pallet pose is not locked')
-            self.return_goal_joints = None
+            # Released-item return is staged: native vertical motion first,
+            # then PlacePipeline requests observation from the measured state.
             if getattr(self, 'return_to_observation', True):
-                with open(self.return_waypoint_file, encoding='utf-8') as stream:
-                    observation = yaml.safe_load(stream)['waypoints']['observation']
-                positions = dict(zip(observation['joint_names'], observation['positions_rad']))
-                self.return_goal_joints = tuple(float(positions[name]) for name in self.arm_joint_names)
-                if not all(math.isfinite(q) for q in self.return_goal_joints):
-                    raise ValueError('invalid observation joints')
-                for name,q in zip(self.arm_joint_names,self.return_goal_joints):
-                    lo,hi,_ = self.transport_joint_limits[name]
-                    if not lo <= q <= hi:
-                        raise ValueError(f'saved observation exceeds {name} limits')
+                if self.robot_mode != self.ros2_control_mode:
+                    self.get_logger().warning(
+                        'return waiting for ROS mode confirmation before handoff')
+                    self.continuous_return_restoring = True
+                    self._restore_ros2_control_mode()
+                    return
+                self.transport_target = self._return_transport_target()
+                self.transport_seed = tuple(self.latest_joint_positions)
+                self.return_clearance_z = float(self.motion_status['transfer_tcp_z_m'])
+                self.transfer_goal_handle = None
+                self.state = self.TRANSPORT_PLANNING
+                self._fallback_staged_return(None)
+                return
+            self.return_goal_joints = None
             if not all(c.service_is_ready() for c in (
                     self.transport_fk,self.transport_cartesian,self.state_validity_client)):
                 raise ValueError('MoveIt validation services unavailable')
@@ -352,9 +362,16 @@ class ContinuousReturn:
             self.direct_place_stepping = False
             self.return_handoff_started = time.monotonic()
             self.state = self.RETURN_DISABLING  # Invalidate pending transport callbacks.
-            self.get_logger().warning(
-                f'continuous return rejected ({reason}); falling back to staged '
-                'vertical retreat to overhead waypoint, then observation planning')
+            if reason is None:
+                self.return_staged_endpoint = (
+                    self.robot_tcp_xyz[0], self.robot_tcp_xyz[1], self.direct_target_z)
+                self.get_logger().info(
+                    'pre-place reached; native Cartesian retreat to clearance, '
+                    'then separate observation planning')
+            else:
+                self.get_logger().warning(
+                    f'continuous return rejected ({reason}); falling back to staged '
+                    'vertical retreat to overhead waypoint, then observation planning')
             operation = self.operation_id
             request = SetBool.Request()
             request.data = False
@@ -371,6 +388,15 @@ class ContinuousReturn:
             response = future.result()
             if response is None or not response.success:
                 raise ValueError('Servo did not confirm pause')
+            if (getattr(self, 'return_staged_endpoint', None) is not None and
+                    self.robot_mode != self.ros2_control_mode):
+                self.get_logger().warning(
+                    'mode changed during return handoff; restoring and waiting before retry')
+                self.return_staged_endpoint = None
+                self.return_staged_fallback_used = False
+                self.continuous_return_restoring = True
+                self._restore_ros2_control_mode()
+                return
             self.direct_target_z = self._staged_return_target()
             # Existing controller deactivation -> confirmed mode 0 -> vertical
             # retreat -> ROS restoration and fresh-feedback settling gate.

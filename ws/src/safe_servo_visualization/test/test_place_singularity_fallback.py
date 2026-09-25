@@ -140,7 +140,7 @@ def test_pickup_singularity_remains_a_hard_fault():
     assert 'singularity' in faults[0]
 
 
-def test_place_external_wrench_limit_releases_item_instead_of_faulting():
+def test_place_external_wrench_limit_holds_item_instead_of_releasing():
     supervisor = _descending_supervisor(
         'place',
         'external wrench safety limit: force=12.12 N, delta_fz=11.37 N')
@@ -152,10 +152,9 @@ def test_place_external_wrench_limit_releases_item_instead_of_faulting():
 
     supervisor.control_tick()
 
-    assert len(fallbacks) == 1
-    assert 'external wrench safety limit' in fallbacks[0][0]
-    assert fallbacks[0][1] == 'external-wrench-limit'
-    assert faults == []
+    assert fallbacks == []
+    assert len(faults) == 1
+    assert 'external wrench safety limit' in faults[0]
 
 
 def test_pickup_external_wrench_limit_remains_a_hard_fault():

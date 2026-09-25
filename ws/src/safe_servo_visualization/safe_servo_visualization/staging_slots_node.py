@@ -623,6 +623,7 @@ class StagingSlots(SlotInspection, Node):
         self.pending_record['yaw180_target_tcp_pose'] = flipped
         transfer_target.data.extend([*flipped[:2], flipped[2] + self.clearance, *flipped_q])
         self.store_transfer_target_pub.publish(transfer_target)
+        self.transport_ready_wait_started = None
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.ik_solutions = []
@@ -670,9 +671,22 @@ class StagingSlots(SlotInspection, Node):
             self._fault(f'staging transfer preparation rejected: {message}')
 
     def _begin_store_continuous_transfer(self):
+        expected = dict(operation_id=self.motion_status.get('operation_id'),
+                        attached_item_id=self.scene_status.get('attached_item_id'),
+                        transfer_context=self.motion_status.get('transfer_context'))
+        ready = self.pickup_status.get('prepared_transport')
+        if not expected['attached_item_id'] or ready != expected:
+            now = time.monotonic()
+            if getattr(self, 'transport_ready_wait_started', None) is None:
+                self.transport_ready_wait_started = now
+                self.get_logger().warning('waiting for supervisor transport readiness')
+            self.phase_started = now
+            return
+        self.transport_ready_wait_started = None
         client = self.start_transport if self.return_to_observation else self.start_transport_chained
         if not client.service_is_ready():
-            self._fault('shared continuous transport service is unavailable')
+            self.phase_started = time.monotonic()
+            self.get_logger().warning('waiting for shared continuous transport service', throttle_duration_sec=5.)
             return
         self.state = self.TRANSFERRING_STORE
         self.store_transfer_phase = 'continuous'

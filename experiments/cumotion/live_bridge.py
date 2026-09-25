@@ -277,7 +277,8 @@ class LiveServer(PlanOnlyServer):
         surface_top = source_pose.position.z + dimensions[2] / 2.0
         margin = geometry['barrier_top_margin_m']
         pallet_barrier_top = (
-            surface_top + geometry['pallet_clearance_z_m'] - margin)
+            # Match the pallet transfer plane in clearance_transfer.py.
+            surface_top + geometry['pallet_clearance_z_m'] - .100 - margin)
         barrier_height = pallet_barrier_top - surface_top
         if barrier_height <= 0.0:
             raise ValueError('Pallet clearance barrier has no height')
@@ -465,6 +466,13 @@ class LiveServer(PlanOnlyServer):
             scene.fixed_frame_transforms = [t for t in scene.fixed_frame_transforms
                 if t.child_frame_id == 'link_base' and t.header.frame_id == 'world']
             ignored = set(self.ignored)
+            # Accept these MoveIt allowances without removing any GPU obstacles.
+            # GPU checks remain stricter until per-link/world filtering is supported.
+            item_names = {n for n in scene.allowed_collision_matrix.entry_names
+                          if n.startswith(('placed_item_', 'carried_item_'))}
+            for item in item_names:
+                ignored.add(frozenset((item, 'xarm_vacuum_gripper_link')))
+                ignored.update(frozenset((item, other)) for other in item_names)
             for a in attachments:
                 ignored.update(frozenset((a.object.id, n)) for n in a.touch_links)
             scene.robot_state.attached_collision_objects = []

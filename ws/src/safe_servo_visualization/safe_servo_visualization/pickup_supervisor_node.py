@@ -97,7 +97,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.declare_parameter('retreat_acc_mm_s2', 200.0)
         self.declare_parameter('direct_cartesian_max_speed_mm_s', 200.0)
         self.declare_parameter('direct_cartesian_max_acc_mm_s2', 500.0)
-        self.declare_parameter('initial_motion_speed_percent', 80.0)
+        self.declare_parameter('initial_motion_speed_percent', 96.0)
         self.declare_parameter('ros2_control_mode', 1)
         self.declare_parameter('trajectory_controller', 'uf850_traj_controller')
         self.declare_parameter('joint_state_broadcaster', 'joint_state_broadcaster')
@@ -218,7 +218,7 @@ class PickupSupervisor(ContinuousTransport, Node):
             p('direct_cartesian_max_acc_mm_s2'))
         self.motion_speed_percent = float(p('initial_motion_speed_percent'))
         if not math.isfinite(self.motion_speed_percent):
-            self.motion_speed_percent = 80.0
+            self.motion_speed_percent = 96.0
         self.motion_speed_percent = min(
             100.0, max(5.0, self.motion_speed_percent))
         initial_speed_scale = self.motion_speed_percent / 100.0
@@ -3281,10 +3281,6 @@ class PickupSupervisor(ContinuousTransport, Node):
                 self._begin_place_singularity_fallback(reason)
             elif self._try_live_pick_singularity_recovery(reason):
                 pass
-            elif (self.operation_kind == 'place' and
-                  self._is_servo_external_wrench_limit(reason)):
-                self._begin_place_release_fallback(
-                    reason, 'external-wrench-limit')
             else:
                 self._fault(reason)
             return
@@ -3737,6 +3733,10 @@ class PickupSupervisor(ContinuousTransport, Node):
                 (self.mode_wait_last_command is None or
                  now - self.mode_wait_last_command >=
                  self.mode_retry_interval)):
+            if telemetry_fresh and self.robot_mode != self.mode_wait_target:
+                self.get_logger().warning(
+                    f'waiting for mode {self.mode_wait_target}; current mode='
+                    f'{self.robot_mode}; retrying transition without motion')
             self._request_mode_wait_command(now)
 
     def _request_mode_wait_error_clear(self, now):
@@ -4333,6 +4333,17 @@ class PickupSupervisor(ContinuousTransport, Node):
         if getattr(self, 'pick_path_restoring', False):
             self._plan_pick_path()
             return
+        endpoint = getattr(self, 'return_staged_endpoint', None)
+        if endpoint is not None:
+            xyz = self.robot_tcp_xyz
+            if (xyz is None or self.robot_state_time is None or
+                    time.monotonic() - self.robot_state_time > self.status_timeout or
+                    not all(math.isfinite(v) for v in xyz) or
+                    abs(xyz[2] + self.direct_tcp_z_offset - endpoint[2]) > self.tolerance or
+                    math.hypot(xyz[0]-endpoint[0], xyz[1]-endpoint[1]) > .003):
+                self._fault('native clearance retreat endpoint not confirmed; observation blocked')
+                return
+            self.return_staged_endpoint = None
         if getattr(self, 'continuous_return_restoring', False):
             self._plan_continuous_return()
             return
@@ -5137,7 +5148,15 @@ class PickupSupervisor(ContinuousTransport, Node):
             'contact_detected': self.contact_detected,
             'probe_only': self.probe_only,
             'object_info_obtained': self.object_info_obtained,
+            'prepared_transport': (self._prepared_transport_target()
+                if self.state not in self.ACTIVE and not self.manual_gripper_pending else None),
             'pick_path_completed': getattr(self, 'pick_path_completed', False),
+            'prepared_pick_target_id': (self.motion_status.get('operation_id')
+                if self.motion_status.get('state') == 'PREPARED' and
+                self.motion_status.get('transfer_context') == 'known_pick' and
+                not self.planning_scene_status.get('attached_item_id') and
+                (self.state not in self.ACTIVE or self.state == self.AWAITING_GRASP) and
+                not self.manual_gripper_pending else None),
             'pick_path_target_id': getattr(self, 'pick_path_target_id', None),
             'contact_tcp_z_m': self.contact_tcp_z,
             'contact_tcp_xyz_m': self.contact_tcp_xyz,

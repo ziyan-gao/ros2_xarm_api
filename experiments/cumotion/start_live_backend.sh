@@ -19,6 +19,8 @@ trap 'kill "$static_pid" 2>/dev/null || true' EXIT
 python3 /workspace/experiments/cumotion/live_bridge.py --ros-args \
   -p yml_file_path:="$CUMOTION_TEST_MODEL/uf850.yml" -p tool_frame:=link_tcp \
   -p max_attempts:=2 \
+  -p speed_multiplier:="${CUMOTION_SPEED_MULTIPLIER:-2.0}" \
+  -p collision_cache_cuboid:="${CUMOTION_COLLISION_CACHE_CUBOID:-128}" \
   -p trajopt_finetune_iters:="${CUMOTION_TRAJOPT_FINETUNE_ITERS:-50}" \
   -p parallel_finetune:="${CUMOTION_PARALLEL_FINETUNE:-false}" \
   -p clearance_barriers_enabled:="${CUMOTION_CLEARANCE_BARRIERS_ENABLED:-true}" \

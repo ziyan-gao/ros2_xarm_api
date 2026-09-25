@@ -145,6 +145,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--waypoints', required=True)
     parser.add_argument('--plan', action='store_true')
+    parser.add_argument('--export-only', action='store_true', help='Export without GPU smoke planning')
     parser.add_argument('--export-model', help='Create a new directory with ROS planner model files')
     parser.add_argument('--sphere-model', choices=['aabb', 'slabs', 'curobo'], default='slabs')
     parser.add_argument('--sphere-pitch', type=float, default=0.04,
@@ -154,6 +155,8 @@ def main():
     parser.add_argument('--joint5-max-deg', type=float,
                         help='cuMotion-only joint5 upper position bound in degrees')
     options = parser.parse_args()
+    if options.export_only and not options.export_model:
+        parser.error('--export-only requires --export-model')
     if not 0.01 <= options.sphere_pitch <= 0.1:
         parser.error('sphere-pitch must be between 0.01 and 0.1 m')
     if options.sphere_model == 'curobo':
@@ -185,10 +188,20 @@ def main():
     waypoint = yaml.safe_load(Path(options.waypoints).read_text())['waypoints']['observation']
     saved = dict(zip(waypoint['joint_names'], waypoint['positions_rad']))
     q = [float(saved[name]) for name in names]
+    moveit_limits = yaml.safe_load((Path(get_package_share_directory('xarm_moveit_config')) /
+        'config/uf850/joint_limits.yaml').read_text())['joint_limits']
+    accelerations = []
     limits = {}
     for joint in root.findall('joint'):
         if joint.get('name') in names:
             limit = joint.find('limit')
+            configured = moveit_limits[joint.get('name')]
+            velocity = min(float(limit.get('velocity')), float(configured['max_velocity']))
+            acceleration = float(configured['max_acceleration'])
+            if not all(math.isfinite(v) and v > 0 for v in (velocity, acceleration)):
+                raise ValueError('invalid MoveIt joint dynamics limits')
+            limit.set('velocity', str(velocity))
+            accelerations.append(acceleration)
             limits[joint.get('name')] = [float(limit.get('lower')), float(limit.get('upper'))]
     for name, angle in zip(names, q):
         assert limits[name][0] <= angle <= limits[name][1], (name, angle, limits[name])
@@ -278,7 +291,7 @@ def main():
             'use_global_cumul': True,
             'cspace': {'joint_names': names, 'retract_config': q,
                        'null_space_weight': [1.0]*6, 'cspace_distance_weight': [1.0]*6,
-                       'max_acceleration': 1.0, 'max_jerk': 10.0,
+                       'max_acceleration': min(accelerations), 'max_jerk': 10.0,
                        'position_limit_clip': 0.0}}}
         if options.export_model:
             destination = Path(options.export_model).resolve()
@@ -289,6 +302,8 @@ def main():
             (destination/'uf850.yml').write_text(yaml.safe_dump({'robot_cfg': cfg}))
             print(json.dumps({'exported_model': str(destination),
                               'camera_included': False, 'payload_included': False}), flush=True)
+        if options.export_only:
+            return
         args = TensorDeviceType()
         t0 = time.monotonic()
         planner = MotionGen(MotionGenConfig.load_from_robot_config(

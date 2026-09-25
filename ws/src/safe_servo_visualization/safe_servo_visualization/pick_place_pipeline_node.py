@@ -133,6 +133,11 @@ class PickPlacePipeline(Node):
     def tick(self):
         if self.state not in self.ACTIVE or self.state == 'ABORTING':
             return
+        child = self.pickup_status if self.state == 'PICKING' else self.place_status
+        expected = self.expected_pickup_id if self.state == 'PICKING' else self.expected_place_id
+        if (child.get('operation_id') == expected and child.get('state') != 'FAULT' and
+                (child.get('waiting_reason') or child.get('state') in ('WAIT_ATTACHMENT', 'WAIT_DETECTION', 'SAM_REFINEMENT'))):
+            self.started = time.monotonic()
         if time.monotonic() - self.started > self.timeout:
             self._fault(f'PickAndPlace timed out in {self.state}')
             return

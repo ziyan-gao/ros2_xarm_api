@@ -2,6 +2,7 @@
 import json
 import math
 import time
+from unittest.mock import Mock
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -245,7 +246,7 @@ def path_client():
             futures.setdefault(self.name, []).append(future)
             return future
     faults = []
-    node = NS(create_client=lambda _, name: Client(name))
+    node = NS(create_client=lambda _, name: Client(name), get_logger=Mock())
     path = PickPathClient(node, faults.append)
     path.reset(7)
     return path, futures, faults
@@ -254,7 +255,7 @@ def path_client():
 def test_shared_client_waits_for_all_three_completion_signals():
     path, futures, faults = path_client()
     motion = dict(operation_id=7, state='PREPARED', transfer_context='known_pick')
-    supervisor = dict(operation_id=4, state='AWAITING_GRASP')
+    supervisor = dict(operation_id=4, state='AWAITING_GRASP', prepared_pick_target_id=7)
     assert not path.tick(motion, supervisor)
     start = futures['/pickup_supervisor/start_pick_waypoints'][0]
     start.callback(start)
@@ -270,7 +271,7 @@ def test_shared_client_waits_for_all_three_completion_signals():
 
 def test_shared_client_ignores_late_callback_after_cancel():
     path, futures, faults = path_client()
-    path.tick(dict(operation_id=7, state='PREPARED', transfer_context='known_pick'), dict(operation_id=4))
+    path.tick(dict(operation_id=7, state='PREPARED', transfer_context='known_pick'), dict(operation_id=4, prepared_pick_target_id=7))
     start = futures['/pickup_supervisor/start_pick_waypoints'][0]
     path.cancel()
     start.callback(Future(NS(success=False, message='late')))
@@ -390,7 +391,7 @@ def test_slot_approach_completion_enters_settling_not_another_direct_plan():
     assert node.retrieval_converged_samples == 0
 
 
-def test_hung_ack_has_five_second_timeout_even_when_future_is_pending():
+def test_delayed_ack_waits_without_repeating_motion():
     path, _, faults = path_client()
     path.phase = 'acknowledging'
     path.supervisor_id = 5
@@ -399,7 +400,7 @@ def test_hung_ack_has_five_second_timeout_even_when_future_is_pending():
     assert not path.tick(dict(operation_id=7, state='PREPARED', transfer_context='known_pick'),
                          dict(operation_id=5, state='SUCCEEDED', pick_path_completed=True,
                               pick_path_target_id=7))
-    assert faults == ['pickup-path completion acknowledgement timed out']
+    assert not faults and path.pending and path.phase == 'acknowledging'
 
 
 def test_timed_pick_geometry_rejects_lateral_shortcut_below_container():

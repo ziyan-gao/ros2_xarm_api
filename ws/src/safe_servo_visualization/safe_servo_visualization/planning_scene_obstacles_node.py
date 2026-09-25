@@ -3,8 +3,9 @@ import math
 
 from geometry_msgs.msg import Pose
 from moveit_msgs.msg import (
-    AttachedCollisionObject, CollisionObject, ObjectColor, PlanningScene)
-from moveit_msgs.srv import ApplyPlanningScene
+    AttachedCollisionObject, CollisionObject, ObjectColor, PlanningScene,
+    AllowedCollisionEntry, PlanningSceneComponents)
+from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -50,6 +51,7 @@ class PlanningSceneObstacles(Node):
             'xarm_vacuum_gripper_link']
         self.tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.scene_client = self.create_client(GetPlanningScene, '/get_planning_scene')
         self.apply_client = self.create_client(
             ApplyPlanningScene, '/apply_planning_scene')
         self.create_subscription(
@@ -189,15 +191,50 @@ class PlanningSceneObstacles(Node):
                 scene.object_colors.append(color)
         return self._apply_scene(scene, description, on_success)
 
+    @staticmethod
+    def _allow_item_contacts(matrix, item_ids):
+        """Merge exact item/item and vacuum/item pairs, preserving other rules."""
+        vacuum = 'xarm_vacuum_gripper_link'
+        items = set(item_ids)
+        items.update(n for n in matrix.entry_names if n.startswith(('placed_item_', 'carried_item_')))
+        for name in sorted(items | {vacuum}):
+            if name not in matrix.entry_names:
+                for row in matrix.entry_values:
+                    row.enabled.append(False)
+                matrix.entry_names.append(name)
+                matrix.entry_values.append(AllowedCollisionEntry(enabled=[False]*len(matrix.entry_names)))
+        for i, name in enumerate(matrix.entry_names):
+            for j, other in enumerate(matrix.entry_names):
+                if ((name in items and other in items) or
+                        (name == vacuum and other in items) or
+                        (other == vacuum and name in items)):
+                    matrix.entry_values[i].enabled[j] = True
+        return matrix
+
     def _apply_scene(self, scene, description, on_success=None):
-        if self.apply_pending or not self.apply_client.service_is_ready():
+        if (self.apply_pending or not self.apply_client.service_is_ready() or
+                not self.scene_client.service_is_ready()):
             return False
-        request = ApplyPlanningScene.Request()
-        request.scene = scene
         self.apply_pending = True
-        future = self.apply_client.call_async(request)
-        future.add_done_callback(
-            lambda done: self._apply_completed(done, description, on_success))
+        query = GetPlanningScene.Request()
+        query.components.components = (PlanningSceneComponents.ALLOWED_COLLISION_MATRIX |
+                                       PlanningSceneComponents.WORLD_OBJECT_NAMES |
+                                       PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        def ready(future):
+            try:
+                current = future.result().scene
+                objects = list(current.world.collision_objects) + list(scene.world.collision_objects)
+                objects += [a.object for a in current.robot_state.attached_collision_objects]
+                objects += [a.object for a in scene.robot_state.attached_collision_objects]
+                ids = [o.id for o in objects if o.id.startswith(('placed_item_', 'carried_item_'))]
+                scene.allowed_collision_matrix = self._allow_item_contacts(current.allowed_collision_matrix, ids)
+                request = ApplyPlanningScene.Request(scene=scene)
+                self.apply_client.call_async(request).add_done_callback(
+                    lambda done: self._apply_completed(done, description, on_success))
+            except Exception as exc:
+                self.apply_pending = False
+                self.get_logger().error(f'failed to merge item collision policy: {exc}')
+        self.scene_client.call_async(query).add_done_callback(ready)
         return True
 
     def _apply_completed(self, future, description, on_success):

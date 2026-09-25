@@ -8,6 +8,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
+from .pick_path_client import PickPathClient
 
 
 def round_dimension_down_m(value_m, increment_mm=5.0):
@@ -160,7 +161,8 @@ class PickupPipeline(NewItemSAM, Node):
         self.plan_observation_client = self.create_client(
             Trigger, '/motion_coordinator/plan_observation')
         self.plan_pregrasp_client = self.create_client(
-            Trigger, '/motion_coordinator/plan_pregrasp')
+            Trigger, '/motion_coordinator/prepare_new_pick')
+        self.pick_path = PickPathClient(self, self._set_fault)
         self.execute_motion_client = self.create_client(
             Trigger, '/motion_coordinator/execute')
         self.cancel_motion_client = self.create_client(
@@ -426,6 +428,8 @@ class PickupPipeline(NewItemSAM, Node):
                 self._set_fault(f'motion execution rejected: {message}')
 
     def abort_callback(self, _request, response):
+        if getattr(self, 'pick_path', None) is not None:
+            self.pick_path.cancel()
         if hasattr(self, 'new_item_sam_client'):
             self.new_item_sam_client.cancel()
         if self.state not in self.ACTIVE:
@@ -561,7 +565,8 @@ class PickupPipeline(NewItemSAM, Node):
             if time.monotonic() < self.new_item_sam_retry_at:
                 return
         if self._phase_elapsed() > self.detection_timeout:
-            self._set_fault('timed out waiting for refined box detection')
+            self.get_logger().warning('waiting for refined box detection', throttle_duration_sec=5.)
+            self.phase_started = time.monotonic()
             return
         if self.stable_box_published_at is not None:
             if (time.monotonic() - self.stable_box_published_at <
@@ -622,13 +627,15 @@ class PickupPipeline(NewItemSAM, Node):
 
     def _start_pregrasp_plan(self):
         if not self.plan_pregrasp_client.service_is_ready():
-            self._set_fault('pre-grasp planning service is unavailable')
+            self.get_logger().warning('waiting for pre-grasp preparation service', throttle_duration_sec=5.)
+            self.phase_started = time.monotonic()
             return
         self.pending_motion = 'pregrasp'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.phase_started = time.monotonic()
         self.state = self.MOVE_PREGRASP
+        self.pick_path.reset(self.expected_motion_operation_id)
         future = self.plan_pregrasp_client.call_async(Trigger.Request())
         future.add_done_callback(self._plan_pregrasp_completed)
         self.publish_status()
@@ -699,6 +706,11 @@ class PickupPipeline(NewItemSAM, Node):
             self._set_fault(f'plan pre-grasp rejected: {message}')
 
     def _tick_move_pregrasp(self):
+        if getattr(self, 'pick_path', None) is not None and self.pick_path.phase not in ('idle', 'done'):
+            self.pick_path.tick(self.motion_status, self.pickup_status)
+            if self.pick_path.phase != 'done':
+                return
+            self.phase_started = time.monotonic()
         motion_state = self.motion_status.get('state')
         if self._phase_elapsed() > self.motion_timeout:
             self._set_fault('timed out moving to pre-grasp')
@@ -730,7 +742,8 @@ class PickupPipeline(NewItemSAM, Node):
                     self.pregrasp_settle):
                 return
             if not self.start_pickup_client.service_is_ready():
-                self._set_fault('pickup supervisor is unavailable')
+                self.get_logger().warning('waiting for pickup supervisor', throttle_duration_sec=5.)
+                self.phase_started = time.monotonic()
                 return
             self.phase_started = time.monotonic()
             self.state = self.SERVO_PICKUP
@@ -897,6 +910,9 @@ class PickupPipeline(NewItemSAM, Node):
             'new_item_sam_active': getattr(self, 'new_item_sam_active', False),
             'new_item_sam_message': getattr(self, 'new_item_sam_message', ''),
             'fault': self.fault,
+            'waiting_reason': ('waiting for pickup-path data' if
+                self.state == self.MOVE_PREGRASP and getattr(getattr(self, 'pick_path', None), 'phase', '')
+                in ('prepared', 'acknowledging', 'confirmed') else ''),
             'operation_id': self.operation_id,
             'motion_state': self.motion_status.get('state'),
             'motion_target': self.motion_status.get('target'),

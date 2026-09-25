@@ -223,11 +223,17 @@ SafeServoPanel::SafeServoPanel(QWidget * parent)
   motion_speed_->setRange(5, 100);
   motion_speed_->setSingleStep(5);
   motion_speed_->setPageStep(10);
-  motion_speed_->setValue(80);
+  bool speed_valid = false;
+  const double configured_speed =
+    QString::fromUtf8(qgetenv("MOTION_SPEED_DEFAULT_PERCENT")).toDouble(&speed_valid);
+  const int initial_speed = speed_valid && configured_speed >= 5.0 && configured_speed <= 100.0
+    ? qRound(configured_speed) : 96;
+  motion_speed_->setValue(initial_speed);
   motion_speed_->setToolTip(
     "Scales the commissioned MoveIt, joint-transfer, and direct Cartesian "
     "motion envelopes. Safe-servo speed is unchanged.");
-  motion_speed_label_ = new QLabel("80% of non-servo motion envelope", this);
+  motion_speed_label_ = new QLabel(
+    QString("%1% of non-servo motion envelope").arg(initial_speed), this);
   auto * motion_speed_layout = new QVBoxLayout();
   motion_speed_layout->addWidget(motion_speed_);
   motion_speed_layout->addWidget(motion_speed_label_);

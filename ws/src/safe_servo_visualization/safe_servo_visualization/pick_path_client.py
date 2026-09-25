@@ -5,6 +5,7 @@ from std_srvs.srv import Trigger
 
 class PickPathClient:
     def __init__(self, node, fault):
+        self.node = node
         self.fault = fault
         self.prepare = node.create_client(Trigger, '/motion_coordinator/prepare_pick_waypoints')
         self.start = node.create_client(Trigger, '/pickup_supervisor/start_pick_waypoints')
@@ -40,7 +41,11 @@ class PickPathClient:
 
     def _call(self, client, *, acknowledgement=False):
         if not client.service_is_ready():
-            return self._fail('pickup-path service unavailable')
+            self.node.get_logger().warning('waiting for pickup-path service', throttle_duration_sec=5.)
+            self.started = time.monotonic()
+            if client is self.start:
+                self.phase = 'prepared'
+            return False
         generation = self.generation
         self.pending = True
         def done(future):
@@ -71,6 +76,8 @@ class PickPathClient:
         if self.phase in ('idle', 'done'):
             return False
         now = time.monotonic()
+        if self.phase in ('prepared', 'acknowledging', 'confirmed'):
+            self.started = now  # No trajectory has started; await matching input data.
         if now-self.started > 180:
             return self._fail('pickup-path preparation/execution timed out')
         current = int(motion.get('operation_id', -1))
@@ -83,6 +90,10 @@ class PickPathClient:
         if self.phase == 'prepared':
             if motion.get('state') != 'PREPARED':
                 return False
+            if (supervisor.get('prepared_pick_target_id') != self.target_id or
+                    not self.start.service_is_ready()):
+                self.node.get_logger().warning('waiting for supervisor pickup-target readiness', throttle_duration_sec=5.)
+                return False
             self.supervisor_id = int(supervisor.get('operation_id', 0)) + 1
             self.phase = 'executing'
             return self._call(self.start)
@@ -94,7 +105,8 @@ class PickPathClient:
         if supervisor.get('state') == 'FAULT':
             return self._fail(supervisor.get('fault', 'pickup approach failed'))
         if self.phase in ('acknowledging', 'confirmed') and now-self.ack_started > 5:
-            return self._fail('pickup-path completion acknowledgement timed out')
+            self.node.get_logger().warning('waiting for pickup-path completion acknowledgement', throttle_duration_sec=5.)
+            self.ack_started = now
         if supervisor.get('state') != 'SUCCEEDED' or self.pending:
             return False
         if (not supervisor.get('pick_path_completed') or
@@ -109,7 +121,8 @@ class PickPathClient:
                 return True
             return False
         if now-self.ack_started > 5:
-            return self._fail('pickup-path completion acknowledgement timed out')
+            self.node.get_logger().warning('waiting for pickup-path completion acknowledgement', throttle_duration_sec=5.)
+            self.ack_started = now
         if now >= self.next_ack:
             return self._call(self.accept, acknowledgement=True)
         return False

@@ -55,9 +55,37 @@ warm-up. The duplicate local low-Z/column rejection is disabled with
 PlanningScene collision, Cartesian vertical approach, and Servo force checks
 remain active.
 The markers remain visible continuously and the boxes are injected into every
-cuMotion collision world. Low final approach and descent motions remain separate
-Cartesian/Servo phases and do not add these cuMotion-only boxes to MoveIt's
-global PlanningScene.
+cuMotion collision world. Low final approaches use Cartesian planning and do
+not add these cuMotion-only boxes to MoveIt's global PlanningScene.
+
+On `cumotion-pony`, direct cuMotion transport plans the complete Cartesian
+lift -> cuMotion transfer -> Cartesian descent before executing anything.
+Each leg starts at the preceding leg's exact joint endpoint. Buffer routes
+use one direct cuMotion transfer without an observation-side waypoint. No
+additional global TCP clearance floor is applied to the continuous transfer;
+cuMotion's configured virtual barriers and PlanningScene collision checks remain.
+The lift and descent endpoint heights remain unchanged. The combined
+trajectory uses nonzero seam velocities and the existing C2 timing/derivative
+checks, then passes full PlanningScene collision and FK validation before one
+`FollowJointTrajectory` goal is sent. A failed suffix never executes its prefix.
+Planner padding at segment boundaries is removed; reversals or stationary
+seams that cannot be blended are rejected instead of silently stopping.
+
+The final turn is bounded by the smaller of the configured blend radius and
+the 10 mm clearance margin. Neighboring knot times only bound the candidate
+window: points outside the spatial region remain free-space transfer
+before the seam, and strict vertical descent after it. Sparse planner samples
+therefore do not enlarge the turn or falsely reject a valid straight suffix.
+Once descent exits the region, it cannot reenter the relaxed turn checks.
+The terminal approach remains vertical (1 mm XY tolerance, 0.5 degree
+orientation tolerance). Rejections log time, TCP position and seam distance.
+The descent
+force-monitoring start time is taken from the final retimed trajectory.
+Inspection/acquisition and Servo force-contact handoffs still stop at their
+operation boundaries. The incoming-item observation/pre-grasp service is not
+changed by this transport stitching. OMPL retains its existing staged behavior.
+Offline tests do not establish real-robot clearance or tracking performance;
+validate a planned path in RViz before commissioning the continuous motion.
 
 Build from ROS repository root:
 
@@ -443,3 +471,119 @@ the experimental adapter still rejects orientation path constraints, and neither
 the actual packing scene nor carried payload was validated. Robot execution remains
 disabled. `panel_smoke.py` accepts `CUMOTION_TEST_GOAL_JSON` for reproducing a six-angle
 joint target and still fails validation if the tilt check is violated.
+
+Pallet clearance tuning: the virtual pallet box top and the pallet-region
+cuMotion transfer plane are lowered by 100 mm from the configured clearance.
+Slot clearance is unchanged; endpoint heights still respect the current/final
+pose and payload/tool extent. This does not change physical collision objects.
+
+Pallet placement retries a failed direct cuMotion plan once with a 180-degree
+yaw change, before any transfer execution. The TCP offset is recomputed to
+preserve the held box center. IK and the complete retimed path remain checked;
+the equivalent wrist angle with smallest absolute value inside planner joint
+limits is selected. Failed execution, pickup and return do not trigger this retry.
+Ordinary transport now defaults to `MOTION_SPEED_DEFAULT_PERCENT=96.0` and
+`CARTESIAN_TRANSPORT_SPEED_RATIO=1.0`, including the RViz slider initialization.
+This doubles the old mixed-transport envelope (80% × 0.60 = 48%) to 96%,
+subject to joint limits and retiming. It does not guarantee half the duration:
+retiming only slows paths to satisfy limits, and acceleration/path geometry
+still matter. MoveIt/cuMotion use joint scaling; native SDK motion uses the
+same percentage of its configured Cartesian limits (240 mm/s, 240 mm/s²
+with the current 250/250 settings, halved from 500/500). These are consistent percentages, not
+identical physical TCP speeds. Contact descent and slow contact retreat retain
+their independent limits.
+
+Data handoff waits (2026-09-25): transfer preparation and new-item pickup
+preparation accept the request in `WAITING_DATA` while required geometry,
+joint feedback, detection, or pallet pose is unavailable. The same operation
+continues when the data arrives; cancel discards the wait. Placement checks
+the coordinator's attachment acknowledgement against both item ID and pickup
+operation ID. Parent placement/pick-and-place/policy timeouts exclude these
+data waits. Supervisor target acknowledgement and slot-store readiness wait
+with warnings rather than immediately faulting. Invalid geometry, collisions,
+changed operation IDs, hardware errors and failed execution still stop.
+
+Observation to new-item pre-pick uses collision-aware IK plus a deterministic
+joint interpolation through the existing spline/limit/collision validation
+and FollowJointTrajectory executor; it does not call cuMotion search.
+Inspection to a known-item pre-pick uses horizontal Cartesian travel at the
+current inspection height then vertical descent, joined and checked before
+execution. The inspection height must already be at or above pre-pick.
+Contact motion still uses guarded Servo. No robot motion is started by deployment.
+
+Item deformation contact policy: the MoveIt AllowedCollisionMatrix permits
+`xarm_vacuum_gripper_link` versus `placed_item_*`/`carried_item_*`, and item
+versus item. Other robot/camera/environment pairs and existing SRDF allowances
+are preserved by merging the live matrix before applying scene updates.
+This covers Cartesian generation and timed state validation. The cuMotion
+bridge accepts this metadata, but the current GPU checker still checks these
+pairs conservatively: no world objects or collision spheres are removed.
+Therefore these contacts can still cause a GPU planning rejection.
+
+## Joint finetune iterations
+
+`CUMOTION_TRAJOPT_FINETUNE_ITERS=50` (the current default) now also controls
+joint-target finetune. The pinned cuRobo release otherwise leaves that solver
+at 400 iterations. The adapter sets its iteration budget before CUDA warmup
+and updates the saved retry-restore value; main trajectory optimization and
+collision checks are unchanged. Iterations round up to the optimizer's inner
+batch size (currently 25), so 50 is exactly two batches. cuRobo's existing
+recovery attempts may use their own larger budget.
+
+The backend logs `Joint finetune iterations=50` at initialization, including
+camera model rebuilds. Restart the backend to load the code; an existing
+process does not reload it automatically. Offline timings and test coverage
+are recorded in [the benchmark report](PLANNING_BENCHMARK_2026-09-25.md).
+
+## Post-place return to observation
+
+After confirmed release, the supervisor now uses separate stages: slow native
+xArm retreat to pre-place, native vertical Cartesian motion to the saved transfer
+clearance, then the existing observation planning service using the configured
+cuMotion pipeline. The vertical clearance leg no longer calls MoveIt's
+`computeCartesianPath`. It retains the existing released-tool retreat checks;
+this change does not add a sampled MoveIt collision validation of the native leg.
+Both native legs use exclusive mode-0 ownership after ROS controllers/hardware
+are inactive. Mode mismatches wait/retry through the existing bounded transition
+logic. ROS mode, controllers and fresh stable joint feedback must be restored
+before observation planning; the native clearance endpoint is checked as well.
+This changes the observation return only; overhead-only handoffs retain their
+existing path. No robot motion was performed when testing this change.
+
+OBB capacity: `CUMOTION_COLLISION_CACHE_CUBOID=128` is passed through Compose
+into the cuMotion startup ROS parameter `collision_cache_cuboid`. Capacity
+includes every scene box (items, tables, walls, virtual barriers); no obstacles
+are removed. Offline replay with 30 world boxes plus two virtual barriers
+passed all three tested joint-space routes. This is a finite capacity, not
+unlimited growth. Recreate the service to load changed environment defaults
+and rebuild the RViz panel; existing processes are not modified automatically.
+
+## cuMotion speed and transport timing
+
+The optional TCP envelope retimer (including the C++ xArm planner patch and
+multi-pass local repair) has been removed. Stitched transport retains the
+original C2 joint retimer, joint limits and full FK/collision/geometry validation.
+Native contact and recovery speeds retain their existing independent settings.
+
+`CUMOTION_SPEED_MULTIPLIER=2.0` requests twice the incoming cuMotion time scale,
+capped at 1.0 (the model's full speed). For example 40% -> 80%, 66% -> 100%,
+96% -> 100%. Logs show requested, multiplier and effective scale. This cannot
+guarantee half the execution time: joint constraints and the stitched C2 retimer
+still apply. It does not change SDK speed or other MoveIt planners.
+
+OBB cache 128, JS finetune 50, staged return and mode confirmation remain.
+The cuMotion model retains the previously aligned MoveIt joint limits.
+Recreate the service to load the speed multiplier and restart the Python nodes.
+If a deployed image contains the removed TCP C++ patch, rebuild the image too.
+
+Approach/loaded-transport speed correction (2026-09-25): the direct joint
+observation-to-pre-pick path uses 0.375 of its original velocity and 0.140625 of
+its acceleration (1.5 times the previous quarter-speed setting).
+This path runs through the trajectory controller, not native SDK Cartesian
+motion. Carried-item transport timestamps are doubled before the existing C2
+and collision checks, with velocity/acceleration scaled consistently; empty
+return timing is unchanged. This adds no iterative TCP retiming.
+Unexpected contact during continuous transfer stops with suction retained.
+A guarded Servo external-wrench fault also retains suction instead of releasing
+and reporting placement success. Normal verified pre-place completion still
+hands off to guarded Servo placement.

@@ -336,7 +336,7 @@ def stopping_harness(monkeypatch):
     return h,clock
 
 
-def test_release_requires_terminal_cancellation_and_fresh_stable_joints(monkeypatch):
+def test_contact_stop_holds_item_after_terminal_cancellation_and_fresh_stable_joints(monkeypatch):
     h,clock = stopping_harness(monkeypatch)
     h.transport_terminal = False
     h._transport_tick()
@@ -348,7 +348,8 @@ def test_release_requires_terminal_cancellation_and_fresh_stable_joints(monkeypa
     assert not h.released  # stale (unchanged timestamp) is not stationary feedback
     h.last_joint_state_time = 1.3
     h._transport_tick()
-    assert h.released and h.continuous_contact_retreat
+    assert not h.released
+    assert "item remains held" in h.fault
 
 
 def test_slow_drift_does_not_count_as_stopped(monkeypatch):
@@ -437,12 +438,16 @@ def test_wait_for_attachment_before_preparing_continuous_place():
     h = object.__new__(PlacePipeline)
     h.state = h.IDLE
     h.scene_status = {}
+    h.get_logger = lambda: NS(warning=lambda *args: None)
+    h.pallet_status = 'LOCKED'
+    h.prepare_transfer = NS(service_is_ready=lambda: True)
     h.operation_id = 0
     h.publish_status = lambda: None
     response = h.start_continuous(None,Trigger.Response())
     assert response.success and h.state == h.WAIT_ATTACHMENT
     calls = []
     h.scene_status = {'attached_item_id':'carried_item_1'}
+    h.motion_status = {'attachment_ready': {'attached_item_id': 'carried_item_1', 'pickup_operation_id': None}}
     h._start = lambda response,continuous: calls.append(continuous) or NS(success=True)
     h.tick()
     assert calls == [True]
@@ -491,3 +496,31 @@ def test_cartesian_request_contains_entire_path_and_requires_collision_checks():
     assert len(calls) == 1 and len(calls[0].waypoints) > 100
     assert calls[0].avoid_collisions and calls[0].max_velocity_scaling_factor == .3
     assert calls[0].waypoints[-1].position.z == .2
+
+
+def test_unified_transport_envelope_matches_moveit_and_cartesian():
+    durations = []
+    for source in ('cartesian', 'moveit'):
+        h, result = planned_harness()
+        h.motion_speed_percent = 96.
+        h.cartesian_transport_speed_ratio = 1.
+        h.transport_timing_source = source
+        h._transport_planned(Future(result))
+        assert not h.fault
+        durations.append(h.transport_duration)
+    assert durations[0] == pytest.approx(durations[1])
+
+
+def test_loaded_transfer_is_half_speed_without_slowing_empty_return():
+    loaded, result = planned_harness()
+    loaded.transport_scene = {'attached_item_id': 'carried_item_0'}
+    loaded._transport_planned(Future(result))
+    returning, result = planned_harness()
+    returning.transport_scene = {'attached_item_id': 'carried_item_0'}
+    returning.transport_is_return = True
+    returning._transport_planned(Future(result))
+    assert not loaded.fault and not returning.fault
+    assert loaded.transport_duration >= 2.
+    baseline, result = planned_harness()
+    baseline._transport_planned(Future(result))
+    assert returning.transport_duration == baseline.transport_duration

@@ -22,6 +22,7 @@ class MotionCoordinator(Node):
 
     IDLE = 'IDLE'
     PLANNING = 'PLANNING'
+    WAITING_DATA = 'WAITING_DATA'
     PREPARED = 'PREPARED'
     PLANNED = 'PLANNED'
     EXECUTING = 'EXECUTING'
@@ -155,6 +156,8 @@ class MotionCoordinator(Node):
         self.create_service(Trigger, '/motion_coordinator/plan_top_face_view',
                             self.plan_top_face_view_callback)
         self.create_subscription(String, '/pickup_supervisor/status', self._pick_path_status, 10)
+        self.create_service(Trigger, '/motion_coordinator/prepare_new_pick',
+                            self.prepare_new_pick_callback)
         self.create_service(Trigger, '/motion_coordinator/prepare_pick_waypoints',
                             self.prepare_pick_waypoints_callback)
         self.create_service(Trigger, '/motion_coordinator/accept_pick_waypoints',
@@ -202,6 +205,7 @@ class MotionCoordinator(Node):
         self.create_service(
             Trigger, '/motion_coordinator/accept_direct_transfer',
             self.accept_direct_transfer_callback)
+        self.create_timer(0.1, self._resume_transfer_preparation)
         self.create_timer(0.5, self.publish_status)
         self.get_logger().info(
             f'motion coordinator ready; waypoint_file={self.waypoint_file}')
@@ -336,6 +340,8 @@ class MotionCoordinator(Node):
             'state': self.state,
             'target': self.target,
             'fault': self.fault,
+            'waiting_reason': getattr(self, 'waiting_reason', ''),
+            'attachment_ready': getattr(self, 'attachment_ready', None),
             'operation_id': self.operation_id,
             'planner_ready': self.plan_client.service_is_ready(),
             'pose_planner_ready': self.pose_plan_client.service_is_ready(),
@@ -436,6 +442,10 @@ class MotionCoordinator(Node):
                     len(center) == 3 and len(orientation) == 4):
                 values = [*size, *center, *orientation]
                 if all(math.isfinite(float(value)) for value in values):
+                    self.attachment_ready = {
+                        'attached_item_id': status['attached_item_id'],
+                        'pickup_operation_id': status.get('last_attached_pickup_operation_id'),
+                    }
                     self.attached_item_geometry = {
                         'size': tuple(map(float, size)),
                         'center': tuple(map(float, center)),
@@ -445,6 +455,7 @@ class MotionCoordinator(Node):
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
         self.attached_item_geometry = None
+        self.attachment_ready = None
 
     @staticmethod
     def _quat_multiply(left, right):
@@ -540,44 +551,103 @@ class MotionCoordinator(Node):
             return self._plan_cached_staging_transfer(response)
         return self._plan_place_pose(response, transfer=True)
 
-    def prepare_transfer_callback(self, _request, response):
-        """Cache a validated transfer target without invoking a planner."""
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
-            response.message = f'Busy in state {self.state}'
-            return response
+    def _transfer_data_wait_reason(self):
+        response = Trigger.Response()
         if not self._require_fresh_joint_state(response, 'prepare transfer'):
-            return response
+            return response.message
         if not self.pallet_locked:
-            response.message = 'pallet pose is not LOCKED'
-            return response
+            return 'waiting for locked pallet pose'
         if (self.pre_place_pose is None or self.pre_place_pose_time is None or
                 time.monotonic() - self.pre_place_pose_time > 1.0):
-            response.message = 'fresh pallet-relative pre-place pose is unavailable'
+            return 'waiting for fresh pallet-relative pre-place pose'
+        if self.attached_item_geometry is None:
+            return 'waiting for attached-item grasp geometry'
+        if self.place_target_xyz is None:
+            return 'waiting for pallet-frame place target XYZ'
+        return ''
+
+    def prepare_new_pick_callback(self, _request, response):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
             return response
+        self.operation_id += 1
+        self.target = 'pregrasp_pending'
+        self.transfer_context = 'known_pick'
+        self.waiting_kind = 'new_pick'
+        self.fault = self.waiting_reason = ''
+        self.cancel_requested = self.pause_requested = False
+        self._set_state(self.WAITING_DATA)
+        self._resume_transfer_preparation()
+        response.success = self.state != self.FAULT
+        response.message = self.fault or f'Pickup preparation accepted; operation_id={self.operation_id}'
+        return response
+
+    def _resume_new_pick_preparation(self):
+        response = Trigger.Response()
+        reason = ''
+        if not self._require_fresh_joint_state(response, 'prepare pickup'):
+            reason = response.message
+        elif not self.ik_client.service_is_ready():
+            reason = 'waiting for MoveIt IK service'
+        else:
+            try:
+                box = self._select_refined_box()
+                if not self._marker_is_fresh(box):
+                    reason = 'waiting for fresh refined box detection'
+            except ValueError as exc:
+                reason = str(exc)
+        if reason:
+            if reason != self.waiting_reason:
+                self.waiting_reason = reason
+                self.get_logger().warning(reason)
+            return
+        self.waiting_reason = ''
+        self.plan_pregrasp_callback(None, response, prepare_only=True, prepared_operation=True)
+        if not response.success and self.state != self.FAULT:
+            self._set_state(self.FAULT, response.message)
+
+    def _resume_transfer_preparation(self):
+        if self.state != self.WAITING_DATA:
+            return
+        if getattr(self, 'waiting_kind', '') == 'new_pick':
+            self._resume_new_pick_preparation()
+            return
+        reason = self._transfer_data_wait_reason()
+        if reason:
+            if reason != getattr(self, 'waiting_reason', ''):
+                self.waiting_reason = reason
+                self.get_logger().warning(reason)
+            return
+        self.waiting_reason = ''
         try:
             self._calculate_place_poses()
             pose = self.transfer_tcp_pose
+            values = (pose.position.x, pose.position.y, pose.position.z,
+                      pose.orientation.x, pose.orientation.y,
+                      pose.orientation.z, pose.orientation.w)
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError('pallet-relative transfer pose is invalid')
         except (TypeError, ValueError) as exc:
-            response.message = str(exc)
-            return response
-        values = (
-            pose.position.x, pose.position.y, pose.position.z,
-            pose.orientation.x, pose.orientation.y,
-            pose.orientation.z, pose.orientation.w)
-        if not all(math.isfinite(float(value)) for value in values):
-            response.message = 'pallet-relative transfer pose is invalid'
+            self._set_state(self.FAULT, str(exc))
+            return
+        self._set_state(self.PREPARED)
+
+    def prepare_transfer_callback(self, _request, response):
+        """Accept preparation now; asynchronously await its required inputs."""
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
+            response.message = f'Busy in state {self.state}'
             return response
         self.operation_id += 1
         self.target = 'transfer'
         self.transfer_context = 'pallet'
-        self.fault = ''
+        self.waiting_kind = 'transfer'
+        self.fault = self.waiting_reason = ''
         self.cancel_requested = self.pause_requested = False
-        self._set_state(self.PREPARED)
-        response.success = True
-        response.message = (
-            'Prepared direct-joint transfer target at '
-            f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
-            f'{pose.position.z:.3f}] m; operation_id={self.operation_id}')
+        self._set_state(self.WAITING_DATA)
+        self._resume_transfer_preparation()
+        response.success = self.state != self.FAULT
+        response.message = (self.fault if not response.success else
+                            f'Transfer preparation accepted; state={self.state}; operation_id={self.operation_id}')
         return response
 
     def staging_store_transfer_target_callback(self, message):
@@ -619,7 +689,7 @@ class MotionCoordinator(Node):
 
     def prepare_staging_store_transfer_callback(self, _request, response):
         """Expose a staging waypoint through the normal transfer interface."""
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(
@@ -658,7 +728,7 @@ class MotionCoordinator(Node):
 
     def _plan_cached_staging_transfer(self, response):
         """Plan a MoveIt fallback for a prepared staging-store target."""
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(
@@ -756,7 +826,7 @@ class MotionCoordinator(Node):
         self.transfer_tcp_pose = self._object_corner_to_tcp_pose(transfer_corner)
 
     def _plan_place_pose(self, response, transfer):
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         label = 'transfer' if transfer else 'pre-place'
@@ -1062,9 +1132,9 @@ class MotionCoordinator(Node):
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.8, 0.0, 0.95
         self.pregrasp_marker_pub.publish(marker)
 
-    def plan_pregrasp_callback(self, request, response):
+    def plan_pregrasp_callback(self, request, response, *, prepare_only=False, prepared_operation=False):
         del request
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if not prepared_operation and self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(response, 'plan pre-grasp'):
@@ -1072,7 +1142,7 @@ class MotionCoordinator(Node):
         if not self.ik_client.service_is_ready():
             response.message = 'MoveIt compute-IK service is unavailable'
             return response
-        if not self.plan_client.service_is_ready():
+        if not prepare_only and not self.plan_client.service_is_ready():
             response.message = 'xArm joint planning service is unavailable'
             return response
         try:
@@ -1096,6 +1166,21 @@ class MotionCoordinator(Node):
             'yaw_rad': float(yaw),
             'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
         }
+        if prepare_only:
+            self.planned_pregrasp['approach_mode'] = 'joint_direct'
+            self.pre_place_tcp_pose = pose
+            self.transfer_tcp_pose = pose
+            self.nominal_transfer_corner_z = float(pose.position.z)
+            self.transfer_context = 'known_pick'
+            if not prepared_operation:
+                self.operation_id += 1
+            self.target = f'pregrasp_box_{int(box.id)}'
+            self.cancel_requested = self.pause_requested = False
+            self._publish_pregrasp_marker(pose, int(box.id))
+            self._set_state(self.PREPARED)
+            response.success = True
+            response.message = f'Prepared checked joint-space pickup; operation_id={self.operation_id}'
+            return response
         alternate_yaw = math.atan2(math.sin(yaw + math.pi),
                                    math.cos(yaw + math.pi))
         alternate_pose = Pose()
@@ -1177,7 +1262,7 @@ class MotionCoordinator(Node):
 
     def plan_staging_approach_callback(self, _request, response):
         """Plan the mandatory above-container waypoint for pallet retrieval."""
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(
@@ -1235,7 +1320,7 @@ class MotionCoordinator(Node):
         return response
 
     def plan_staging_pregrasp_callback(self, _request, response, *, prepare_only=False):
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(response, 'plan staging pre-pick'):
@@ -1334,7 +1419,7 @@ class MotionCoordinator(Node):
     def plan_waypoint(self, name, response):
         del response  # A fresh response below avoids accidental stale fields.
         response = Trigger.Response()
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Busy in state {self.state}'
             return response
         if not self._require_fresh_joint_state(response, f'plan {name}'):
@@ -1444,6 +1529,13 @@ class MotionCoordinator(Node):
             self._set_state(self.FAULT, f'execution of {self.target} failed')
 
     def _request_cancel(self, pause, response):
+        if self.state == self.WAITING_DATA:
+            self.operation_id += 1
+            self.waiting_reason = ''
+            self._set_state(self.PAUSED if pause else self.IDLE)
+            response.success = True
+            response.message = 'Pending data wait canceled'
+            return response
         if self.state not in (self.PLANNING, self.PLANNED, self.EXECUTING):
             response.message = f'Nothing to stop in state {self.state}'
             return response
@@ -1510,7 +1602,7 @@ class MotionCoordinator(Node):
 
     def reset_callback(self, request, response):
         del request
-        if self.state in (self.PLANNING, self.EXECUTING, self.CANCELING):
+        if self.state in (self.WAITING_DATA, self.PLANNING, self.EXECUTING, self.CANCELING):
             response.message = f'Cannot reset while state is {self.state}'
             return response
         self.operation_id += 1

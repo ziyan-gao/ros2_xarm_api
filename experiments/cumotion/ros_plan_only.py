@@ -184,6 +184,12 @@ def validate_pose_endpoint(request, trajectory, motion_gen, tensor_args):
             f'rotation_vector_error={rotation_error.tolist()}')
 
 
+def cumotion_speed_scale(requested, multiplier):
+    if not all(math.isfinite(v) and v > 0 for v in (requested, multiplier)) or requested > 1:
+        raise ValueError('invalid cuMotion speed scaling')
+    return min(1.0, requested * multiplier)
+
+
 class PlanOnlyServer(CumotionActionServer):
     def load_motion_gen(self):
         """Pinned release-4.0 initializer with an explicit optimization time budget.
@@ -197,6 +203,10 @@ class PlanOnlyServer(CumotionActionServer):
               self.declare_parameter('joint_trajectory_max_dt', 0.30)).value
         if not math.isfinite(dt) or dt <= 0.:
             raise ValueError('joint_trajectory_max_dt must be positive and finite')
+        self.speed_multiplier = (self.get_parameter('speed_multiplier') if
+            self.has_parameter('speed_multiplier') else
+            self.declare_parameter('speed_multiplier', 2.0)).value
+        cumotion_speed_scale(1.0, self.speed_multiplier)  # Validate before warmup.
         upstream = lambda name: getattr(self, '_CumotionActionServer__' + name)
         world = WorldConfig.from_dict({
             'cuboid': {'table': {'pose': [0, 0, -.05, 1, 0, 0, 0],
@@ -220,6 +230,19 @@ class PlanOnlyServer(CumotionActionServer):
             ee_link_name=upstream('tool_frame'),
             finetune_trajopt_iters=upstream('trajopt_finetune_iters'),
             js_trajopt_dt=dt, maximum_trajectory_dt=dt)
+        # Pinned cuRobo wires only pose finetune to finetune_trajopt_iters.
+        # Set the JS solver before warmup; keep its retry restore value in sync.
+        fine = config.finetune_js_trajopt_solver
+        opt = fine.solver.newton_optimizer
+        iters = upstream('trajopt_finetune_iters')
+        if iters <= 0:
+            raise ValueError('trajopt_finetune_iters must be positive')
+        opt.n_iters = iters
+        opt.outer_iters = math.ceil(iters / opt.inner_iters)
+        fine._og_newton_iters = opt.outer_iters
+        self.get_logger().info(
+            f'Joint finetune iterations={opt.outer_iters * opt.inner_iters} '
+            f'(requested={iters}, inner_iters={opt.inner_iters})')
         self.motion_gen = MotionGen(config)
         self._CumotionActionServer__robot_base_frame = self.motion_gen.kinematics.base_link
         checker = self.motion_gen.world_coll_checker
@@ -272,6 +295,12 @@ class PlanOnlyServer(CumotionActionServer):
             scale = min(scales)
             if scale == 0.:
                 scale = self.get_parameter('time_dilation_factor').value
+            requested_scale = scale
+            scale = cumotion_speed_scale(scale, self.speed_multiplier)
+            self.get_logger().info(
+                f'cuMotion speed: requested={requested_scale:.3f}, '
+                f'multiplier={self.speed_multiplier:.2f}, effective={scale:.3f}'
+                + (' (capped at model limits)' if requested_scale*self.speed_multiplier > 1 else ''))
             report = {'planner_method': 'plan_single_js' if kind == 'joint' else 'plan_single',
                       'start_names': list(js.name), 'start_rad': list(js.position),
                       'world_ids': [o.id for o in world]}

@@ -118,43 +118,52 @@ class PlacePipeline(Node):
             response.message = f'place pipeline already active in {self.state}'
             return response
         self.return_to_observation = return_to_observation
-        if not self.scene_status.get('attached_item_id'):
-            self.operation_id += 1
-            self.state = self.WAIT_ATTACHMENT
-            self.phase_started = time.monotonic()
-            self.fault = ''
-            response.success = True
-            response.message = 'waiting for confirmed carried-item attachment'
-            self.publish_status()
-            return response
         return self._start(response, continuous=True)
+
+    def _start_wait_reason(self):
+        if not self.scene_status.get('attached_item_id'):
+            return 'waiting for carried-item attachment'
+        expected = {'attached_item_id': self.scene_status['attached_item_id'],
+                    'pickup_operation_id': self.scene_status.get('last_attached_pickup_operation_id')}
+        if self.motion_status.get('attachment_ready') != expected:
+            return 'waiting for coordinator geometry for the current pickup'
+        if self.pallet_status != 'LOCKED':
+            return 'waiting for locked pallet pose'
+        if not self.prepare_transfer.service_is_ready():
+            return 'waiting for transfer preparation service'
+        return ''
 
     def _start(self, response, continuous):
         if self.state in self.ACTIVE:
             response.message = f'place pipeline already active in {self.state}'
             return response
-        if not self.scene_status.get('attached_item_id'):
-            return self._reject_start(
-                response, 'no carried item is attached; complete pickup first')
-        if self.pallet_status != 'LOCKED':
-            return self._reject_start(response, 'pallet pose is not LOCKED')
-        if not self.prepare_transfer.service_is_ready():
-            return self._reject_start(
-                response, 'transfer target preparation service is unavailable')
+        reason = self._start_wait_reason()
+        if reason:
+            self.operation_id += 1
+            self.continuous_transport = continuous
+            self.state = self.WAIT_ATTACHMENT
+            self.fault = ''
+            self._wait_for_data(reason)
+            response.success = True
+            response.message = reason
+            self.publish_status()
+            return response
         self.operation_id += 1
         self.continuous_transport = continuous
         if not continuous:
             self.return_to_observation = True
         self.continuous_ack_started = None
         self.continuous_ack_received = False
-        self.fault = ''
+        self.fault = self.waiting_reason = ''
         self.transfer_fallback_used = False
         self.transfer_fallback_reason = ''
         self.state = self.MOVE_TRANSFER
         self.pending_motion = 'transfer_preparing'
+        self.transport_ready_wait_started = None
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
         self.expected_supervisor_operation_id = None
+        self.waiting_reason = ''
         self.phase_started = time.monotonic()
         future = self.prepare_transfer.call_async(Trigger.Request())
         future.add_done_callback(
@@ -202,17 +211,27 @@ class PlacePipeline(Node):
             message = 'no response' if result is None else result.message
             self._fault(f'motion execution rejected: {message}')
 
+    def _wait_for_data(self, reason):
+        if reason != getattr(self, 'waiting_reason', ''):
+            self.get_logger().warning(reason)
+            self.waiting_reason = reason
+        self.phase_started = time.monotonic()
+
     def tick(self):
         if self.state == self.WAIT_ATTACHMENT:
-            if self.scene_status.get('attached_item_id'):
+            if not self._start_wait_reason():
                 self.state = self.IDLE
-                response = self._start(Trigger.Response(), continuous=True)
+                response = self._start(Trigger.Response(), continuous=self.continuous_transport)
                 if not response.success:
                     self._fault(response.message)
-            elif time.monotonic() - self.phase_started > 5.0:
-                self._fault('timed out waiting for carried-item attachment')
+            else:
+                self._wait_for_data(self._start_wait_reason())
             return
         if self.state not in self.ACTIVE or self.state == self.ABORTING:
+            return
+        if (self.motion_status.get('state') == 'WAITING_DATA' and
+                self.motion_status.get('operation_id') == self.expected_motion_operation_id):
+            self._wait_for_data(self.motion_status.get('waiting_reason') or 'waiting for coordinator data')
             return
         if time.monotonic() - self.phase_started > self.motion_timeout:
             self._fault(f'place pipeline timed out in {self.state}')
@@ -268,12 +287,26 @@ class PlacePipeline(Node):
         state = self.motion_status.get('state')
         if state == 'PREPARED' and self.pending_motion == 'transfer_preparing':
             if getattr(self, 'continuous_transport', False):
+                expected = dict(operation_id=self.motion_status['operation_id'],
+                                attached_item_id=self.scene_status.get('attached_item_id'),
+                                transfer_context=self.motion_status.get('transfer_context'))
+                ready = self.supervisor_status.get('prepared_transport')
+                if not expected['attached_item_id'] or ready != expected:
+                    now = time.monotonic()
+                    if getattr(self, 'transport_ready_wait_started', None) is None:
+                        self.transport_ready_wait_started = now
+                    self._wait_for_data(f'waiting for supervisor transport readiness; '
+                                        f'expected={expected}, acknowledged={ready}')
+                    return  # Wait for status delivery; never retry a motion request.
+                self.transport_ready_wait_started = None
+                self.waiting_reason = ''
                 client = (self.start_transport if getattr(self, 'return_to_observation', True)
                           else self.start_transport_chained)
                 if not client.service_is_ready():
-                    self._fault('continuous transport service is unavailable')
+                    self._wait_for_data('continuous transport service is unavailable')
                     return
                 self.state = self.LOAD_PRE_PLACE
+                self.waiting_reason = ''
                 self.phase_started = time.monotonic()
                 self.loading_succeeded_at = None
                 self.expected_supervisor_operation_id = int(
@@ -302,6 +335,7 @@ class PlacePipeline(Node):
         self.pending_motion = 'direct_joint_starting'
         self.expected_supervisor_operation_id = int(
             self.supervisor_status.get('operation_id', 0)) + 1
+        self.waiting_reason = ''
         self.phase_started = time.monotonic()
         future = self.start_joint_transfer.call_async(Trigger.Request())
         future.add_done_callback(self._start_direct_joint_transfer_completed)
@@ -349,6 +383,7 @@ class PlacePipeline(Node):
         self.pending_motion = 'transfer'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
+        self.waiting_reason = ''
         self.phase_started = time.monotonic()
         self.get_logger().warning(
             f'{reason}; direct transfer phase elapsed '
@@ -388,6 +423,7 @@ class PlacePipeline(Node):
             self._fault('linear loading service is unavailable')
             return
         self.state = self.LOAD_PRE_PLACE
+        self.waiting_reason = ''
         self.phase_started = time.monotonic()
         self.expected_supervisor_operation_id = int(
             self.supervisor_status.get('operation_id', 0)) + 1
@@ -439,10 +475,11 @@ class PlacePipeline(Node):
                     self.post_loading_settle):
                 return
             if not self.start_place.service_is_ready():
-                self._fault('guarded place supervisor is unavailable')
+                self._wait_for_data('guarded place supervisor is unavailable')
                 return
             self.state = self.CONTACT_PLACE
             self.loading_succeeded_at = None
+            self.waiting_reason = ''
             self.phase_started = time.monotonic()
             self.expected_supervisor_operation_id = int(
                 self.supervisor_status.get('operation_id', 0)) + 1
@@ -469,7 +506,7 @@ class PlacePipeline(Node):
                 self._fault('continuous transport handoff requires its prepared coordinator target')
                 return False
             if not self.accept_direct_transfer.service_is_ready():
-                self._fault('continuous transport acknowledgement service unavailable')
+                self._wait_for_data('continuous transport acknowledgement service unavailable')
                 return False
             self.continuous_ack_started = now
             self.pending_motion = 'continuous_accepting'
@@ -552,6 +589,7 @@ class PlacePipeline(Node):
         self.pending_motion = 'observation'
         self.expected_motion_operation_id = int(
             self.motion_status.get('operation_id', 0)) + 1
+        self.waiting_reason = ''
         self.phase_started = time.monotonic()
         future = self.plan_observation.call_async(Trigger.Request())
         future.add_done_callback(
@@ -611,6 +649,7 @@ class PlacePipeline(Node):
         message = String()
         message.data = json.dumps({
             'state': self.state, 'fault': self.fault,
+            'waiting_reason': getattr(self, 'waiting_reason', ''),
             'operation_id': self.operation_id,
             'motion_state': self.motion_status.get('state'),
             'motion_target': self.motion_status.get('target'),

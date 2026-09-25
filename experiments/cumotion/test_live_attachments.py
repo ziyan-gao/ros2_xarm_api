@@ -167,7 +167,7 @@ def test_clearance_barriers_follow_pallet_and_slot_footprints():
     assert pallet_barrier.primitives[0].dimensions[:2] == pytest.approx([.45, .55])
     assert (pallet_barrier.primitive_poses[0].orientation ==
             pallet.primitive_poses[0].orientation)
-    expected_pallet_top = pallet_top + .47 - .003
+    expected_pallet_top = pallet_top + .47 - .100 - .003
     assert (pallet_barrier.primitive_poses[0].position.z +
             pallet_barrier.primitives[0].dimensions[2] / 2.) == pytest.approx(
                 expected_pallet_top)

@@ -62,8 +62,11 @@ def test_capture_orientation_guard_only_applies_to_loaded_transfer(is_return):
     ([.3, .2, .15], [0., 1., 0., 0.], '', False),
     ([.3, .2, .15], DOWN, 'held', False),
 ])
-def test_return_collision_exception_only_initial_empty_vertical_column(xyz, q, attached, skip):
+@pytest.mark.parametrize('direct', [False, True])
+def test_return_collision_exception_only_initial_empty_vertical_column(xyz, q, attached, skip, direct):
     h = Harness()
+    h.transport_is_return = True
+    h.direct_moveit_active = direct
     h.transport_scene = None
     h.planning_scene_status = {'attached_item_id': attached}
     h.transport_start_xyz = np.array([.3, .2, .1])
@@ -77,7 +80,9 @@ def test_return_collision_exception_only_initial_empty_vertical_column(xyz, q, a
     geometry, checked = [], []
     h._transport_geometry_checked = geometry.append
     h._transport_check_collision = checked.append
-    h._return_collision_classified(Future((np.array(xyz), np.array(q))))
+    h._transport_fk_request = lambda joints, callback: callback(
+        Future((np.array(xyz), np.array(q))))
+    h._transport_validate_next()
     assert not h.fault
     assert bool(geometry) == skip
     assert bool(checked) != skip
@@ -450,3 +455,76 @@ def test_no_second_observation_move_after_connected_return(kind):
     node._begin_observation_motion = lambda: pytest.fail('duplicate observation motion')
     (node._tick_contact_place if kind == 'place' else node._tick_loading)()
     assert node.state == node.SUCCEEDED
+
+
+def test_direct_return_initializes_exit_column_before_planning():
+    h = Harness()
+    h.transport_is_return = True
+    h.transport_moveit_direct_enabled = True
+    h.transport_target = dict(pre_place_tcp_xyz_m=[.5, 0., .4],
+        transfer_tcp_quaternion_xyzw=DOWN, transport_corner_clearance_z_m=.5)
+    h.planning_scene_status = dict(camera_collision_applied=True, add_placed_item_obstacle=True)
+    h.transport_motion_plan = NS(service_is_ready=lambda: True)
+    h.transport_seed = (0.,)*6
+    h._transport_pose = lambda result: (np.array([.3, .2, .1]), np.array(DOWN))
+    h.return_collision_column_open = False
+    h.return_collision_previous_z = .9
+    calls = []
+    h._begin_clearance_transfer = lambda *args: calls.append(args)
+    h._transport_start_fk(Future(None))
+    assert not h.fault
+    assert calls and h.direct_moveit_active
+    assert h.return_collision_column_open
+    assert h.return_collision_previous_z == pytest.approx(.1)
+
+
+def test_normal_observation_return_uses_native_clearance_without_moveit_cartesian():
+    node, future, calls = staged_supervisor()
+    node.ros2_control_mode = 1
+    node.return_to_observation = True
+    node.return_clearance_pending = False
+    node.motion_status['transfer_tcp_z_m'] = .6
+    node.get_logger = lambda: NS(info=lambda *a: None, warning=lambda *a: None)
+    # No MoveIt service stubs: planning must not be used for this vertical leg.
+    node._plan_continuous_return()
+    assert not node.fault and not calls
+    assert not node.continuous_return_restoring
+    assert node.return_staged_endpoint == (0., 0., .6)
+    future.callback(future)
+    assert calls == [.6]
+
+
+def test_normal_return_mode_mismatch_restores_and_waits_without_motion():
+    node, future, calls = staged_supervisor()
+    node.ros2_control_mode = 1
+    node.robot_mode = 0
+    node.return_to_observation = True
+    node.return_clearance_pending = False
+    restored = []
+    node._restore_ros2_control_mode = lambda: restored.append(True)
+    node._plan_continuous_return()
+    assert not node.fault and not calls
+    assert restored == [True] and node.continuous_return_restoring
+
+
+def test_native_clearance_must_reach_target_before_observation():
+    node, _, _ = staged_supervisor()
+    node.return_staged_endpoint = (0., 0., .6)
+    node._finish_retreat()
+    assert 'endpoint not confirmed' in node.fault
+    assert node.return_staged_endpoint is not None
+
+
+def test_mode_change_during_staged_pause_waits_without_sending_retreat():
+    node, future, calls = staged_supervisor()
+    node.ros2_control_mode = 1
+    node.get_logger = lambda: NS(info=lambda *a: None, warning=lambda *a: None)
+    node._fallback_staged_return(None)
+    node.robot_mode = 0
+    restored = []
+    node._restore_ros2_control_mode = lambda: restored.append(True)
+    future.callback(future)
+    assert not node.fault and not calls
+    assert restored == [True]
+    assert node.continuous_return_restoring and not node.return_staged_fallback_used
+    assert node.return_staged_endpoint is None

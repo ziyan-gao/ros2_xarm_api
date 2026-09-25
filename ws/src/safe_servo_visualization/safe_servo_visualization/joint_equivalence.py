@@ -2,12 +2,12 @@
 import math
 
 
-def nearest_equivalent_joints(goal, seed, names, limits):
+def nearest_equivalent_joints(goal, seed, names, limits, *, minimize_wrist=False):
     """Choose bounded 2*pi-equivalent angles nearest the preceding arm state."""
     if len(goal) != len(names) or len(seed) != len(names):
         raise ValueError('invalid IK joint layout')
     chosen = []
-    for name, value, previous in zip(names, goal, seed):
+    for index, (name, value, previous) in enumerate(zip(names, goal, seed)):
         lower, upper = limits[name][:2]
         if (not all(math.isfinite(v) for v in
                     (value, previous, lower, upper)) or
@@ -19,5 +19,6 @@ def nearest_equivalent_joints(goal, seed, names, limits):
         candidates = [value+2*math.pi*k for k in range(first, last+1)]
         chosen.append(min(
             candidates, key=lambda candidate:
-            (abs(candidate-previous), abs(candidate-value))))
+            (abs(candidate) if minimize_wrist and index == len(names)-1
+             else abs(candidate-previous), abs(candidate-value))))
     return tuple(chosen)

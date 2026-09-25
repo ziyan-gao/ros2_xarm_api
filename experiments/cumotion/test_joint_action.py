@@ -5,7 +5,7 @@ import torch
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, RobotTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
-from ros_plan_only import PlanOnlyServer
+from ros_plan_only import PlanOnlyServer, cumotion_speed_scale
 
 
 class JointActionTests(unittest.TestCase):
@@ -15,6 +15,8 @@ class JointActionTests(unittest.TestCase):
         goal.planning_options.plan_only = True
         req = goal.request
         req.group_name = 'uf850'
+        req.max_velocity_scaling_factor = .4
+        req.max_acceleration_scaling_factor = .4
         req.start_state.joint_state.name = names
         req.start_state.joint_state.position = [0.]*6
         req.goal_constraints = [Constraints(joint_constraints=[
@@ -27,6 +29,7 @@ class JointActionTests(unittest.TestCase):
         def plan(start, target, config):
             calls.append(target.position.tolist())
             self.assertFalse(config.parallel_finetune)
+            self.assertAlmostEqual(config.time_dilation_factor, .8)
             if raises:
                 raise RuntimeError('injected failure')
             return SimpleNamespace(success=torch.tensor([success]), status='TEST',
@@ -36,7 +39,7 @@ class JointActionTests(unittest.TestCase):
         trajectory.joint_trajectory.points = [JointTrajectoryPoint(positions=[.2 if wrong_end else .1]*6)]
         logger = SimpleNamespace(info=lambda _: None, error=lambda _: None)
         server = SimpleNamespace(lock=threading.Lock(), planner_busy=False,
-            parallel_finetune=False,
+            parallel_finetune=False, speed_multiplier=2.,
             update_world_objects=lambda _: True,
             tensor_args=SimpleNamespace(to_device=lambda v: torch.tensor(v)),
             motion_gen=SimpleNamespace(get_active_js=lambda x: x,
@@ -48,6 +51,14 @@ class JointActionTests(unittest.TestCase):
         self.assertFalse(server.planner_busy)
         self.assertEqual(len(calls), 1)
         return result, handle
+
+    def test_speed_multiplier_caps_at_model_limits(self):
+        self.assertAlmostEqual(cumotion_speed_scale(.4, 2.), .8)
+        self.assertEqual(cumotion_speed_scale(.66, 2.), 1.)
+        self.assertEqual(cumotion_speed_scale(.96, 2.), 1.)
+        for bad in (0., -1., float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                cumotion_speed_scale(.4, bad)
 
     def test_joint_goal_no_pose_ik(self):
         result, handle = self.run_case()

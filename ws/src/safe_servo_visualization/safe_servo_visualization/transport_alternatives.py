@@ -18,7 +18,7 @@ from shape_msgs.msg import SolidPrimitive
 from rclpy.duration import Duration
 
 from .transport_path import quaternion, rounded_translation_waypoints, buffer_transfer_waypoints
-from .transport_path import directed_slerp
+from .transport_path import directed_slerp, rotate
 from .waypoint_search import GRID_SECONDS, next_grid
 from .joint_equivalence import nearest_equivalent_joints
 
@@ -71,12 +71,13 @@ def observation_transfer_waypoint(observation_xyz, high_z, y_offset_mm):
 
 
 
-def join_trajectories(parts, names):
-    """Keep exact segment seams and rest there; reject discontinuous IK branches."""
+def join_trajectories(parts, names, *, blend=False):
+    """Join exact joint branches; optionally let the checked C2 spline round seams."""
     from .continuous_transport import cartesian_timing_issue
     combined = copy.deepcopy(parts[0])
     combined.joint_names, combined.points = list(names), []
     offset = 0.
+    seams = []
     for part in parts:
         issue = cartesian_timing_issue(part, names)
         if issue:
@@ -94,12 +95,29 @@ def join_trajectories(parts, names):
         for point in (part.points[0], part.points[-1]):
             point.velocities = [0.] * len(names)
             point.accelerations = [0.] * len(names)
+        if combined.points:
+            seams.append(len(combined.points)-1)
         for point in part.points[bool(combined.points):]:
             stamp = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
             point.time_from_start = Duration(seconds=offset+stamp).to_msg()
             combined.points.append(point)
         last = combined.points[-1].time_from_start
         offset = last.sec + last.nanosec * 1e-9
+    if blend:
+        for i in seams:
+            before, point, after = combined.points[i-1:i+2]
+            seconds = lambda p: p.time_from_start.sec + p.time_from_start.nanosec*1e-9
+            incoming = (np.array(point.positions)-before.positions)/(seconds(point)-seconds(before))
+            outgoing = (np.array(after.positions)-point.positions)/(seconds(after)-seconds(point))
+            speeds = np.linalg.norm(incoming), np.linalg.norm(outgoing)
+            if min(speeds) < 1e-8:
+                raise ValueError('continuous seam contains a stationary interval')
+            direction = incoming/speeds[0] + outgoing/speeds[1]
+            if np.linalg.norm(direction) < 1e-6:
+                raise ValueError('continuous seam reverses direction; replan the corner')
+            # Only seed the shared velocity. Existing C2 timing enforces the
+            # derivative limits; FK/collision checks must accept the rounded path.
+            point.velocities = list(direction/np.linalg.norm(direction)*min(speeds)*.5)
     return combined
 
 
@@ -129,6 +147,43 @@ def blend_translation_segments(segments, initial_q):
 
 
 class TransportAlternatives:
+    def _try_pallet_yaw_flip(self, reason):
+        """Retry the complete unexecuted placement once, preserving box center."""
+        if (getattr(self, 'transport_moveit_pipeline_id', '') != 'isaac_ros_cumotion' or
+                getattr(self, 'transport_target', {}).get('transfer_context') != 'pallet' or
+                getattr(self, 'transport_pallet_yaw_flipped', False) or
+                getattr(self, 'transport_is_pick', False) or getattr(self, 'transport_is_return', False) or
+                self.state not in (self.TRANSPORT_PLANNING, self.TRANSPORT_VALIDATING,
+                                   self.TRANSPORT_DIAGNOSING) or
+                getattr(self, 'direct_transfer_motion_started', False) or
+                getattr(self, 'transfer_goal_handle', None) is not None):
+            return False
+        scene = getattr(self, 'transport_scene', None) or {}
+        if (not scene.get('attached_item_id') or
+                scene.get('attached_item_id') != self.planning_scene_status.get('attached_item_id')):
+            return False
+        center = np.asarray(scene.get('attached_item_center_in_tcp_m', []), dtype=float)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            return False
+        target = dict(self.transport_target)
+        q = quaternion(target['transfer_tcp_quaternion_xyzw'])
+        x, y, z, w = q
+        flipped = np.array([-y, x, w, -z])  # World-Z half turn; same box footprint.
+        xyz = np.asarray(target['pre_place_tcp_xyz_m']) + rotate(q, center) - rotate(flipped, center)
+        target.update(pre_place_tcp_xyz_m=xyz.tolist(),
+                      transfer_tcp_quaternion_xyzw=flipped.tolist())
+        self.transport_pallet_yaw_flipped = True
+        self.transport_target = target
+        self.transport_route_generation += 1  # Discard callbacks from the original candidate.
+        self.transport_seed = tuple(self.latest_joint_positions)
+        self.raised_pre_place_offset_m = 0.
+        self.state = self.TRANSPORT_PLANNING
+        self.get_logger().warning(
+            f'pallet route rejected ({reason}); replanning once with yaw 180 deg, '
+            'unchanged box center and bounded minimum-absolute wrist angle')
+        self._transport_fk_request(self.transport_seed, self._transport_start_fk)
+        return True
+
     def _try_slot_yaw_flip(self, now):
         """One planning-only retry after five seconds; never rotate live in place."""
         if (getattr(self, 'alternative_yaw_direction', 1) != -1 or
@@ -250,6 +305,8 @@ class TransportAlternatives:
 
     def _try_transport_alternative(self, reason, observation_first=False):
         if getattr(self, 'direct_moveit_active', False):
+            if self._try_pallet_yaw_flip(reason):
+                return True
             self._fault('direct MoveIt path rejected; no interpolation fallback: ' + reason)
             return True
         if (getattr(self, 'transport_moveit_primary_enabled', False) and
@@ -480,7 +537,13 @@ class TransportAlternatives:
     def _alternative_next(self):
         try:
             if not self.alternative_segments:
-                trajectory = join_trajectories(self.alternative_parts, self.arm_joint_names)
+                continuous = getattr(self, 'clearance_phase', None) == 'continuous'
+                trajectory = join_trajectories(
+                    self.alternative_parts, self.arm_joint_names, blend=continuous)
+                if continuous:
+                    self.clearance_descent_index = (
+                        sum(len(p.points)-1 for p in self.alternative_parts[:-1])
+                        if self.clearance_has_descent else None)
                 if getattr(self, 'transport_sdk_candidate', False):
                     self._sdk_validate_trajectory(trajectory)
                     return
@@ -552,7 +615,7 @@ class TransportAlternatives:
                     not math.isfinite(result.fraction) or not 1-1e-6 <= result.fraction <= 1.):
                 fraction = None if result is None else result.fraction
                 if getattr(self, 'direct_moveit_active', False):
-                    raise ValueError(f'mandatory lift incomplete (fraction={fraction}); no transfer executed')
+                    raise ValueError(f'Cartesian segment incomplete (fraction={fraction}); no transfer executed')
                 if self._partial_is_final_descent(result) and self._try_raised_pre_place():
                     return
                 if (result is not None and result.error_code.val == 1 and
@@ -652,7 +715,23 @@ class TransportAlternatives:
         if max(abs(trajectory.points[0].positions[i]-v)
                for i, v in zip(indices, self.alternative_seed)) > 1e-6:
             raise ValueError('alternative planner changed its requested joint start')
-        self.alternative_parts.append(copy.deepcopy(trajectory))
+        trajectory = copy.deepcopy(trajectory)
+        if getattr(self, 'clearance_phase', None) == 'continuous':
+            # Planner endpoint padding is a hold, not a geometric waypoint.
+            # Remove only identical boundary samples, never interior pauses.
+            points = trajectory.points
+            for side in (0, -1):
+                neighbor = 1 if side == 0 else -2
+                while len(points) > 2 and np.max(np.abs(
+                        np.array(points[side].positions)-points[neighbor].positions)) < 1e-10:
+                    points.pop(side)
+            offset = points[0].time_from_start
+            offset_ns = offset.sec*1000000000 + offset.nanosec
+            for point in points:
+                stamp = point.time_from_start
+                point.time_from_start = Duration(
+                    nanoseconds=stamp.sec*1000000000+stamp.nanosec-offset_ns).to_msg()
+        self.alternative_parts.append(trajectory)
         if not hasattr(self, 'alternative_part_kinds'):
             self.alternative_part_kinds = []
         self.alternative_part_kinds.append(
@@ -829,6 +908,14 @@ class TransportAlternatives:
         ik.avoid_collisions = True
         planning_limits = (getattr(self, 'transport_cumotion_joint_limits', None)
                            or self.transport_joint_limits)
+        if getattr(self, 'transport_pallet_yaw_flipped', False):
+            seed = list(ik.robot_state.joint_state.position)
+            lower, upper = planning_limits[self.arm_joint_names[-1]][:2]
+            candidates = [seed[-1]+turn for turn in (-math.pi, math.pi)
+                          if lower <= seed[-1]+turn <= upper]
+            if candidates:
+                seed[-1] = min(candidates, key=abs)
+                ik.robot_state.joint_state.position = seed
         # MoveIt's IK model still contains the physical limits. Constrain its
         # search to the narrower cuMotion-only interval so a geometrically
         # valid but planner-invalid solution (for example J5=69 deg when the
@@ -874,7 +961,17 @@ class TransportAlternatives:
                                or self.transport_joint_limits)
             goal_positions = nearest_equivalent_joints(
                 raw_goal_positions, self.alternative_seed,
-                self.arm_joint_names, planning_limits)
+                self.arm_joint_names, planning_limits,
+                minimize_wrist=getattr(self, 'transport_pallet_yaw_flipped', False))
+            if ((getattr(self, 'transport_target', {}).get('planned_pregrasp') or {}).get(
+                    'approach_mode') == 'joint_direct' and getattr(self, 'transport_is_pick', False)):
+                from .sdk_transport import joint_line
+                # Pre-pick approach at 37.5% of the original speed: acceleration scales with speed squared.
+                trajectory = joint_line(self.alternative_seed, goal_positions, self.arm_joint_names,
+                                        self.direct_transfer_max_joint_speed * .375,
+                                        self.direct_transfer_joint_acc * .140625)
+                self._alternative_segment_ready(trajectory)
+                return
             wrapped = [
                 name for name, raw, selected in zip(
                     self.arm_joint_names, raw_goal_positions, goal_positions)
@@ -922,7 +1019,8 @@ class TransportAlternatives:
                 code = None if result is None else result.error_code.val
                 raise ValueError(f'MoveIt overhead planning failed (code={code})')
             if (getattr(self, 'direct_moveit_active', False) and
-                    getattr(self, 'transport_is_return', False)):
+                    getattr(self, 'transport_is_return', False) and
+                    getattr(self, 'clearance_phase', None) != 'continuous'):
                 self._transport_planned(SimpleNamespace(result=lambda: SimpleNamespace(
                     error_code=SimpleNamespace(val=1), fraction=1., solution=result.trajectory)))
             else:
