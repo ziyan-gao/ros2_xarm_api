@@ -280,6 +280,10 @@ class TransportAlternatives:
         if (not math.isfinite(self.transport_workspace_z_max_mm) or
                 self.transport_workspace_z_max_mm < 0):
             raise ValueError('transport_workspace_z_max_mm must be nonnegative; 0 disables the transfer ceiling')
+        self.declare_parameter('transport_departure_lift_m', .100)
+        self.transport_departure_lift_m = float(self.get_parameter('transport_departure_lift_m').value)
+        if not math.isfinite(self.transport_departure_lift_m) or not 0 < self.transport_departure_lift_m <= .100:
+            raise ValueError('transport_departure_lift_m must be in (0, 0.100]')
         self.declare_parameter('raised_pre_pick_max_mm', 30.0)
         self.raised_pre_pick_max_mm = float(self.get_parameter('raised_pre_pick_max_mm').value)
         if not math.isfinite(self.raised_pre_pick_max_mm) or not 0 <= self.raised_pre_pick_max_mm <= 50:
@@ -797,7 +801,8 @@ class TransportAlternatives:
         goal.orientation_constraints = [orientation(.002, .002)]
         plan.goal_constraints = [goal]
         if (getattr(self, 'direct_moveit_active', False) and
-                getattr(self, 'transport_is_return', False)):
+                getattr(self, 'transport_is_return', False) and
+                getattr(self, 'return_goal_joints', None) is not None):
             goal = Constraints()
             goal.joint_constraints = [JointConstraint(
                 joint_name=n, position=float(v), tolerance_above=1e-5,
@@ -819,7 +824,8 @@ class TransportAlternatives:
             # Endpoint FK verification below still enforces the requested TCP
             # pose, so this does not weaken the geometric acceptance criteria.
             if (getattr(self, 'direct_moveit_active', False) and
-                    getattr(self, 'transport_is_return', False)):
+                    getattr(self, 'transport_is_return', False) and
+                    getattr(self, 'return_goal_joints', None) is not None):
                 self._submit_moveit_request(req)
                 return
             self._cumotion_resolve_joint_goal(req, xyz, q)
@@ -963,15 +969,6 @@ class TransportAlternatives:
                 raw_goal_positions, self.alternative_seed,
                 self.arm_joint_names, planning_limits,
                 minimize_wrist=getattr(self, 'transport_pallet_yaw_flipped', False))
-            if ((getattr(self, 'transport_target', {}).get('planned_pregrasp') or {}).get(
-                    'approach_mode') == 'joint_direct' and getattr(self, 'transport_is_pick', False)):
-                from .sdk_transport import joint_line
-                # Pre-pick approach at 37.5% of the original speed: acceleration scales with speed squared.
-                trajectory = joint_line(self.alternative_seed, goal_positions, self.arm_joint_names,
-                                        self.direct_transfer_max_joint_speed * .375,
-                                        self.direct_transfer_joint_acc * .140625)
-                self._alternative_segment_ready(trajectory)
-                return
             wrapped = [
                 name for name, raw, selected in zip(
                     self.arm_joint_names, raw_goal_positions, goal_positions)
@@ -1017,10 +1014,13 @@ class TransportAlternatives:
             result = None if response is None else response.motion_plan_response
             if result is None or result.error_code.val != 1:
                 code = None if result is None else result.error_code.val
+                if self._retry_planning_after_lift(code):
+                    return
                 raise ValueError(f'MoveIt overhead planning failed (code={code})')
             if (getattr(self, 'direct_moveit_active', False) and
-                    getattr(self, 'transport_is_return', False) and
-                    getattr(self, 'clearance_phase', None) != 'continuous'):
+                    (getattr(self, 'clearance_phase', None) in ('direct', 'departure_lift') or
+                     (getattr(self, 'transport_is_return', False) and
+                      getattr(self, 'clearance_phase', None) != 'continuous'))):
                 self._transport_planned(SimpleNamespace(result=lambda: SimpleNamespace(
                     error_code=SimpleNamespace(val=1), fraction=1., solution=result.trajectory)))
             else:

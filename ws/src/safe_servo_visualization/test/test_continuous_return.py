@@ -1,4 +1,5 @@
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -478,20 +479,21 @@ def test_direct_return_initializes_exit_column_before_planning():
     assert h.return_collision_previous_z == pytest.approx(.1)
 
 
-def test_normal_observation_return_uses_native_clearance_without_moveit_cartesian():
+def test_normal_observation_return_hands_off_directly_without_clearance_motion():
     node, future, calls = staged_supervisor()
     node.ros2_control_mode = 1
     node.return_to_observation = True
     node.return_clearance_pending = False
     node.motion_status['transfer_tcp_z_m'] = .6
     node.get_logger = lambda: NS(info=lambda *a: None, warning=lambda *a: None)
-    # No MoveIt service stubs: planning must not be used for this vertical leg.
+    node.publish_status = lambda: None
+    # The pipeline owns the direct observation request.
     node._plan_continuous_return()
     assert not node.fault and not calls
     assert not node.continuous_return_restoring
-    assert node.return_staged_endpoint == (0., 0., .6)
-    future.callback(future)
-    assert calls == [.6]
+    assert node.state == node.SUCCEEDED
+    assert not node.continuous_return_completed
+    assert not calls
 
 
 def test_normal_return_mode_mismatch_restores_and_waits_without_motion():
@@ -528,3 +530,66 @@ def test_mode_change_during_staged_pause_waits_without_sending_retreat():
     assert restored == [True]
     assert node.continuous_return_restoring and not node.return_staged_fallback_used
     assert node.return_staged_endpoint is None
+
+
+def test_chained_pallet_return_finishes_at_verified_pre_place_without_old_height():
+    node, _, calls = staged_supervisor()
+    node.ros2_control_mode = 1
+    node.return_to_observation = False
+    node.return_clearance_pending = False
+    node.motion_status = {'transfer_context': 'pallet'}
+    node.get_logger = lambda: NS(info=lambda *a: None, warning=lambda *a: None)
+    node.publish_status = lambda: None
+    node._plan_continuous_return()
+    assert not node.fault and not calls
+    assert node.state == node.SUCCEEDED
+    assert node.continuous_return_completed
+
+
+def test_cumotion_return_restores_controller_without_sdk_motion():
+    node = return_supervisor()
+    node.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    node.state = node.RETURN_DISABLING
+    node.operation_id = 4
+    node._restore_ros2_control_mode = Mock()
+    node._begin_direct_retreat = Mock()
+    node._return_servo_disabled(Future(NS(success=True)), 4)
+    node._restore_ros2_control_mode.assert_called_once()
+    node._begin_direct_retreat.assert_not_called()
+    assert not node.return_clearance_pending
+
+
+@pytest.mark.parametrize('chained', [False, True])
+def test_cumotion_pallet_release_uses_sdk_then_verified_pipeline_handoff(chained):
+    node, future, calls = staged_supervisor()
+    node.state = node.DETACHING
+    node.motion_status['transfer_context'] = 'pallet'
+    node.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    node.return_to_observation = not chained
+    node.ros2_control_mode = 1
+    node._restore_ros2_control_mode = Mock()
+    node._transport_fk_request = Mock()
+    node.get_logger = lambda: NS(info=lambda *a: None, warning=lambda *a: None)
+    node.publish_status = Mock()
+    node._begin_continuous_return()
+    assert calls == [] and node.state == node.RETURN_DISABLING
+    future.callback(future)
+    assert calls == [.15] and node.return_clearance_pending
+    node._restore_ros2_control_mode.assert_not_called()
+    # Called by the existing SDK completion -> mode/controller restoration -> stable feedback gate.
+    node._plan_continuous_return()
+    assert not node.fault and node.return_sdk_retreat_verified
+    assert node.state == node.SUCCEEDED
+    assert node.continuous_return_completed == chained
+    node._transport_fk_request.assert_not_called()
+
+
+def test_sdk_pallet_retreat_cannot_complete_before_reaching_pre_place():
+    node, _, _ = staged_supervisor()
+    node.motion_status['transfer_context'] = 'pallet'
+    node.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    node.return_clearance_pending = True
+    node.robot_tcp_xyz = (0., 0., .10)
+    node._plan_continuous_return()
+    assert 'did not reach pre-place' in node.fault
+    assert not getattr(node, 'return_sdk_retreat_verified', False)

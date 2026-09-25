@@ -105,10 +105,12 @@ def test_full_pickup_uses_direct_retreat_after_contact():
     n._resume_direct_place_recovery_retreat.assert_called_once()
 
 
+@pytest.mark.parametrize('pipeline', ['ompl', 'isaac_ros_cumotion'])
 @pytest.mark.parametrize('raised', [False, True])
-def test_deferred_pallet_pick_reuses_slow_clearance_before_restoring(raised):
+def test_deferred_pallet_pick_reuses_slow_clearance_before_restoring(raised, pipeline):
     n = contact_node()
     n.operation_kind = 'pickup'
+    n.transport_moveit_pipeline_id = pipeline
     n.active_pickup_snapshot = dict(pickup_source='pallet', x_m=.1, y_m=-.3)
     n.raised_pick_active = raised
     n.defer_pickup_lift = True

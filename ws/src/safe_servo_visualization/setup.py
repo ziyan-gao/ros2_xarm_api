@@ -25,6 +25,7 @@ setup(
         'pickup_pipeline = safe_servo_visualization.pickup_pipeline_node:main',
         'place_pipeline = safe_servo_visualization.place_pipeline_node:main',
         'pick_place_pipeline = safe_servo_visualization.pick_place_pipeline_node:main',
+        'task_test = safe_servo_visualization.task_test_node:main',
         'pick_place_test = safe_servo_visualization.pick_place_test_node:main',
         'random_stable_loading = safe_servo_visualization.random_stable_loading_node:main',
         'policy_loading = safe_servo_visualization.policy_loading_node:main',

@@ -836,6 +836,8 @@ void SafeServoPanel::updatePickPlaceTest(const QString & payload)
   if (!json.contains("state")) {return;}
   test_last_status_ = payload;
   test_stale_timer_->start(3000);
+  test_buttons_[5]->setText(json.value("reset_preserves_inventory").toBool() ?
+    "Reset task state (keep items)" : "Reset test bookkeeping");
   const auto state = json.value("state").toString();
   const bool automatic = json.value("random_active").toBool();
   const bool busy = automatic || (state != "IDLE" && state != "READY" && state != "FAULT");

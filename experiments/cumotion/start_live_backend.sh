@@ -23,7 +23,7 @@ python3 /workspace/experiments/cumotion/live_bridge.py --ros-args \
   -p collision_cache_cuboid:="${CUMOTION_COLLISION_CACHE_CUBOID:-128}" \
   -p trajopt_finetune_iters:="${CUMOTION_TRAJOPT_FINETUNE_ITERS:-50}" \
   -p parallel_finetune:="${CUMOTION_PARALLEL_FINETUNE:-false}" \
-  -p clearance_barriers_enabled:="${CUMOTION_CLEARANCE_BARRIERS_ENABLED:-true}" \
+  -p clearance_barriers_enabled:="${CUMOTION_CLEARANCE_BARRIERS_ENABLED:-false}" \
   -p pallet_clearance_z_m:="${CUMOTION_PALLET_CLEARANCE_Z_M:-0.470}" \
   -p slot_clearance_z_m:="${CUMOTION_SLOT_CLEARANCE_Z_M:-0.480}" \
   -p slot_surface_z_m:="${CUMOTION_SLOT_SURFACE_Z_M:-0.0}" \

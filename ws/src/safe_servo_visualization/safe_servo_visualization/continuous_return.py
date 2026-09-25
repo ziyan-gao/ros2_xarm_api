@@ -68,6 +68,7 @@ class ContinuousReturn:
         self.return_escape_active = False
         self.return_escape_count = 0
         self.return_staged_endpoint = None
+        self.return_sdk_retreat_verified = False
         self.return_clearance_pending = True
         self.return_staged_fallback_used = False
         self.continuous_return_target_id = None  # Consume the one-cycle request.
@@ -90,6 +91,12 @@ class ContinuousReturn:
             response = future.result()
             if response is None or not response.success:
                 raise ValueError('Servo did not confirm pause')
+            if (getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion' and
+                    (self.motion_status.get('transfer_context') != 'pallet' or
+                     not getattr(self, 'sdk_place_retreat', True))):
+                self.return_clearance_pending = False
+                self._restore_ros2_control_mode()
+                return
             # Reuse lifecycle + repeated mode/state confirmation, controller
             # activation, new-joint-sample gate, and post_restore_settle.
             # No trajectory is sent from this service-completion callback.
@@ -137,25 +144,47 @@ class ContinuousReturn:
                 if actual_z < self.return_pre_place_z - self.tolerance:
                     raise ValueError('slow retreat did not reach pre-place height')
                 self.return_clearance_pending = False
+                self.return_sdk_retreat_verified = True
             if self.planning_scene_status.get('attached_item_id'):
                 raise ValueError('item is still attached')
             if not self.pallet_locked:
                 raise ValueError('pallet pose is not locked')
-            # Released-item return is staged: native vertical motion first,
-            # then PlacePipeline requests observation from the measured state.
-            if getattr(self, 'return_to_observation', True):
+            if (getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion' and
+                    not (getattr(self, 'return_sdk_retreat_verified', False) and
+                         self.motion_status.get('transfer_context') == 'pallet')):
+                if self.robot_mode != self.ros2_control_mode:
+                    self.continuous_return_restoring = True
+                    self._restore_ros2_control_mode()
+                    return
+                self.return_pre_place_only = True
+                self.return_goal_joints = None
+                self.transport_seed = tuple(self.latest_joint_positions)
+                self.transport_scene = None
+                self.transport_target = self._return_transport_target()
+                self.transport_target['pre_place_tcp_xyz_m'] = list(self.transport_target['pre_place_tcp_xyz_m'])
+                self.transport_target['pre_place_tcp_xyz_m'][2] = self.return_pre_place_z
+                self.transport_started = time.monotonic()
+                self.transfer_goal_handle = None
+                self.state = self.TRANSPORT_PLANNING
+                self._transport_fk_request(self.transport_seed, self._transport_start_fk)
+                return
+            # After the contact retreat, request observation directly from the measured state.
+            if (getattr(self, 'return_to_observation', True) or
+                    self.motion_status.get('transfer_context') == 'pallet'):
                 if self.robot_mode != self.ros2_control_mode:
                     self.get_logger().warning(
                         'return waiting for ROS mode confirmation before handoff')
                     self.continuous_return_restoring = True
                     self._restore_ros2_control_mode()
                     return
-                self.transport_target = self._return_transport_target()
-                self.transport_seed = tuple(self.latest_joint_positions)
-                self.return_clearance_z = float(self.motion_status['transfer_tcp_z_m'])
-                self.transfer_goal_handle = None
-                self.state = self.TRANSPORT_PLANNING
-                self._fallback_staged_return(None)
+                # Verified pre-place retreat is enough: the pipeline plans directly
+                # to the saved observation joints from this measured state.
+                self.continuous_return_completed = not getattr(self, 'return_to_observation', True)
+                self.state = self.SUCCEEDED
+                self.get_logger().info('pre-place retreat verified; chained handoff ready'
+                    if self.continuous_return_completed else
+                    'pre-place retreat verified; handing off direct observation planning')
+                self.publish_status()
                 return
             self.return_goal_joints = None
             if not all(c.service_is_ready() for c in (
@@ -342,6 +371,8 @@ class ContinuousReturn:
         return target_z
 
     def _fallback_staged_return(self, reason):
+        if getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion':
+            return False  # Free-space SDK/Cartesian fallback is disabled.
         # Used for missing MoveIt timing or exceeded smooth-retiming budget. Collision,
         # malformed-state, hardware and execution failures still fault.
         if (not getattr(self, 'transport_is_return', False) or

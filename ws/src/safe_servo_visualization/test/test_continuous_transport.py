@@ -461,6 +461,7 @@ def test_force_contact_cancels_but_does_not_release():
     h.transport_feedback_time = 2.
     h.transport_force_count = 0
     h.place_force_threshold = 4.
+    h.transport_force_threshold = 8.
     h.loading_contact_confirm_samples = 2
     h.latest_joint_positions = (0.,0.)
     h.last_joint_state_time = 1.
@@ -471,6 +472,10 @@ def test_force_contact_cancels_but_does_not_release():
     h._transport_force(15.)
     assert not calls
     h._transport_force(15.)
+    assert not calls  # 5 N transport delta must not use the 4 N placement threshold.
+    h._transport_force(18.)
+    assert not calls
+    h._transport_force(18.)
     assert calls == ['cancel'] and h.state == h.TRANSPORT_STOPPING
     assert not h.released
 
@@ -524,3 +529,13 @@ def test_loaded_transfer_is_half_speed_without_slowing_empty_return():
     baseline, result = planned_harness()
     baseline._transport_planned(Future(result))
     assert returning.transport_duration == baseline.transport_duration
+
+
+def test_departure_lift_has_dedicated_slow_timing():
+    h, result = planned_harness()
+    h.clearance_phase = 'departure_lift'
+    h.transport_start_xyz = np.array([.2, .3, .3])
+    h.transport_end = np.array([.2, .3, .4])
+    h._transport_planned(Future(result))
+    assert not h.fault
+    assert h.transport_duration >= 5. - 1e-8

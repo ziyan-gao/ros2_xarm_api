@@ -46,8 +46,9 @@ def test_all_clearance_legs_are_queued_before_execution(pick, context):
     h.get_logger = lambda: Mock()
     h._alternative_next = Mock()
     h._begin_clearance_transfer(np.array([.2, .3, .4]), q, np.array([.5, .6, .4]), q, .5)
-    assert [kind for kind, _, _ in h.alternative_segments] == ['cartesian', 'moveit', 'cartesian']
-    assert h.clearance_phase == 'continuous'
+    expected = ['moveit']
+    assert [kind for kind, _, _ in h.alternative_segments] == expected
+    assert h.clearance_phase == 'direct'
     assert h.transport_seed == (0.,)*6
     assert h.transport_end == pytest.approx([.5, .6, .4])
     assert not h._advance_clearance_phase(np.zeros(3), q)
@@ -105,8 +106,9 @@ def test_buffer_routes_do_not_insert_observation_waypoint(pick, context):
     h._alternative_next = Mock()
     h._transport_fk_request = Mock()
     h._begin_clearance_transfer(np.array([.2, .3, .4]), q, np.array([.5, .6, .4]), q, .5)
-    assert [kind for kind, _, _ in h.alternative_segments] == ['cartesian', 'moveit', 'cartesian']
-    assert h.alternative_segments[1][1] == pytest.approx(h.clearance_destination)
+    expected = ['moveit']
+    assert [kind for kind, _, _ in h.alternative_segments] == expected
+    assert h.alternative_segments[-1][1] == pytest.approx(h.transport_end)
     h._transport_fk_request.assert_not_called()
     h._alternative_next.assert_called_once()
 
@@ -285,14 +287,15 @@ def test_pallet_clearance_lowered_100mm_without_lowering_slot(source, destinatio
     h._plan_clearance_phase = Mock()
     h._begin_clearance_transfer(np.array([.2, .3, .3]), q,
                                 np.array([.5, .6, .3]), q, .5)
-    assert h.clearance_source_z == pytest.approx(.54 if source == 'buffer' else .44)
-    assert h.clearance_destination[2] == pytest.approx(.54 if destination == 'buffer' else .44)
+    assert h.clearance_source_z == .3
+    assert h.clearance_destination[2] == .3
+
 
 
 @pytest.mark.parametrize('mode,source,kinds', [
     ('joint_direct', None, ['moveit']),
-    (None, 'pallet', ['cartesian', 'cartesian']),
-    (None, 'buffer', ['cartesian', 'cartesian']),
+    (None, 'pallet', ['moveit']),
+    (None, 'buffer', ['moveit']),
 ])
 def test_simple_pick_routes_skip_cumotion_search(mode, source, kinds):
     q = np.array([1., 0., 0., 0.])
@@ -307,8 +310,120 @@ def test_simple_pick_routes_skip_cumotion_search(mode, source, kinds):
     h._begin_clearance_transfer(np.array([.2, .3, .6]), q, np.array([.5, .6, .4]), q, .5)
     assert [kind for kind, _, _ in h.alternative_segments] == kinds
     assert h.direct_lift_z is None
-    if source:
-        assert h.alternative_segments[0][1] == pytest.approx([.5, .6, .6])
-        assert h.alternative_segments[1][1] == pytest.approx([.5, .6, .4])
-    else:
-        assert not h.clearance_has_descent
+    assert h.alternative_segments[-1][1] == pytest.approx([.5, .6, .4])
+    assert not h.clearance_has_descent
+
+
+def test_slot_exit_lifts_locally_then_plans_directly_to_pallet():
+    q = np.array([1., 0., 0., 0.])
+    h = ClearanceHarness(transport_is_pick=False, transport_is_return=False,
+        transport_moveit_pipeline_id='isaac_ros_cumotion',
+        active_pickup_snapshot={'pickup_source': 'buffer'},
+        transport_seed=(0.,)*6, transport_scene=None, transport_route_generation=0,
+        transport_target={'transfer_context': 'pallet'}, direct_moveit_active=True)
+    h._transport_ceiling = lambda: 1.
+    h.get_logger = lambda: Mock()
+    h._alternative_next = Mock()
+    h._begin_clearance_transfer(np.array([.2, .3, .3]), q, np.array([.5, -.6, .2]), q, .5)
+    assert [k for k, _, _ in h.alternative_segments] == ['moveit']
+    assert h.alternative_segments[-1][1] == pytest.approx([.5, -.6, .2])
+    assert not h.clearance_has_descent
+
+
+def test_loaded_pallet_departure_finishes_vertical_lift_before_direct_plan():
+    q = np.array([1., 0., 0., 0.])
+    h = ClearanceHarness(transport_is_pick=False, transport_is_return=False,
+        transport_moveit_pipeline_id='isaac_ros_cumotion',
+        transport_seed=(0.,)*6, transport_scene={'attached_item_id': 'carried_item_0'},
+        transport_route_generation=0, transport_target={'transfer_context': 'pallet'},
+        direct_moveit_active=True)
+    h._transport_ceiling = lambda: 1.
+    h.get_logger = lambda: Mock()
+    h._alternative_next = Mock()
+    h._begin_clearance_transfer(np.array([.2, .3, .3]), q, np.array([.5, -.6, .2]), q, .5)
+    assert h.clearance_phase == 'departure_lift'
+    assert [k for k, _, _ in h.alternative_segments] == ['moveit']
+    assert h.transport_end == pytest.approx([.2, .3, .4])
+    h.transport_verify_error = .003
+    h.transport_verify_joints = (.1,)*6
+    assert h._advance_clearance_phase(h.transport_end, q)
+    assert h.clearance_phase == 'departure_lift'
+    h.transport_verify_error = .001
+    assert h._advance_clearance_phase(h.transport_end, q)
+    assert h.clearance_phase == 'direct'
+    assert h.transport_seed == (.1,)*6
+    assert [k for k, _, _ in h.alternative_segments] == ['moveit']
+    assert h.transport_end == pytest.approx([.5, -.6, .2])
+
+
+def test_planning_lift_retries_are_bounded_and_use_measured_state():
+    q = np.array([1., 0., 0., 0.])
+    h = ClearanceHarness(direct_moveit_active=True, transport_moveit_pipeline_id='isaac_ros_cumotion',
+        state='PLANNING', operation_id=7, transport_target={'operation_id': 8},
+        clearance_phase='direct', latest_joint_positions=(.1,)*6)
+    h.TRANSPORT_PLANNING = 'PLANNING'
+    h._transport_ceiling = lambda: .8
+    h.get_logger = lambda: Mock()
+    h._fault = Mock()
+    h._plan_clearance_phase = Mock()
+    h._transport_pose = lambda result: (np.array([.2, -.4, .3]), q)
+    h._transport_fk_request = lambda joints, callback: callback(Future(None))
+    for attempt in range(5):
+        h.clearance_phase = 'direct'
+        assert h._retry_planning_after_lift(-10)
+        assert h.clearance_source_z == pytest.approx(.4)
+        assert h.clearance_phase == 'departure_lift'
+        assert h.planning_lift_count == attempt+1
+        assert h._plan_clearance_phase.call_args.args[2] == (.1,)*6
+    h.clearance_phase = 'direct'
+    assert h._retry_planning_after_lift(-10)
+    assert h._plan_clearance_phase.call_count == 5
+    h._fault.assert_called_once()
+
+
+@pytest.mark.parametrize('code', [None, -31, -6, -4])
+def test_nonplanning_failures_never_trigger_upward_motion(code):
+    h = ClearanceHarness()
+    assert not h._retry_planning_after_lift(code)
+
+
+def test_repack_recovery_uses_sdk_then_replans_from_measured_joints():
+    h = ClearanceHarness(direct_moveit_active=True, transport_moveit_pipeline_id='isaac_ros_cumotion',
+        state='PLANNING', operation_id=7, transport_target={'operation_id': 8},
+        clearance_phase='direct', latest_joint_positions=(.1,)*6,
+        task_policy_active=True, task_policy_task='repack', operation_kind='pick_approach')
+    h.TRANSPORT_PLANNING = 'PLANNING'
+    h._transport_ceiling = lambda: .8
+    h.get_logger = lambda: Mock()
+    h._fault = Mock()
+    h._plan_clearance_phase = Mock()
+    h._disable_servo_then_direct_retreat = Mock()
+    position = np.array([.2, -.4, .2])
+    h._transport_pose = lambda result: (position.copy(), np.array([1., 0., 0., 0.]))
+    h._transport_fk_request = lambda joints, callback: callback(Future(None))
+    for attempt in range(5):
+        assert h._retry_planning_after_lift(-10)
+        assert h.planning_sdk_lift_pending
+        assert h.direct_target_z == pytest.approx(position[2]+.1)
+        assert h._plan_clearance_phase.call_count == attempt  # No cuMotion lift.
+        position[2] += .1
+        h.latest_joint_positions = (attempt/10.,)*6
+        h._planning_sdk_lift_restored()
+        assert not h.planning_sdk_lift_pending
+        assert h._plan_clearance_phase.call_args.args[2] == h.latest_joint_positions
+    assert h._retry_planning_after_lift(-10)
+    assert h._disable_servo_then_direct_retreat.call_count == 5
+    h._fault.assert_called_once()
+
+
+def test_sdk_recovery_endpoint_mismatch_blocks_replanning():
+    h = ClearanceHarness(latest_joint_positions=(0.,)*6,
+        direct_target_z=.4, planning_sdk_lift_origin=np.array([.2, -.4, .3]))
+    h.TRANSPORT_PLANNING = 'PLANNING'
+    h._fault = Mock()
+    h._plan_clearance_phase = Mock()
+    h._transport_pose = lambda result: (np.array([.2, -.4, .3]), np.array([1., 0., 0., 0.]))
+    h._transport_fk_request = lambda joints, callback: callback(Future(None))
+    h._planning_sdk_lift_restored()
+    h._fault.assert_called_once()
+    h._plan_clearance_phase.assert_not_called()

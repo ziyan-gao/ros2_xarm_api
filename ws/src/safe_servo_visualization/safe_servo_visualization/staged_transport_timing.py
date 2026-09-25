@@ -35,6 +35,8 @@ def split_transport_request(request):
 
 class StagedTransportTiming:
     def _fallback_staged_transport_timing(self, reason):
+        if getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion':
+            return False  # Free-space SDK/Cartesian fallback is disabled.
         # Return/pick, cache connectors and alternative/SDK routes have their
         # own planners. Never accidentally replay their last segment as a
         # complete outbound route. Execution failures are never retried here.

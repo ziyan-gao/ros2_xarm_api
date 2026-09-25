@@ -14,6 +14,8 @@ add_library(${PROJECT_NAME} SHARED
   src/safe_servo_panel.cpp
   include/safe_servo_rviz_panel/top_face_debug_panel.hpp
   src/top_face_debug_panel.cpp
+  include/safe_servo_rviz_panel/task_test_panel.hpp
+  src/task_test_panel.cpp
 )
 target_include_directories(${PROJECT_NAME} PUBLIC include)
 ament_target_dependencies(${PROJECT_NAME} pluginlib rclcpp rviz_common std_msgs std_srvs sensor_msgs)

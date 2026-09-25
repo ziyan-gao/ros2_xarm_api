@@ -50,3 +50,18 @@ def test_missing_or_stale_force_never_authorizes_descent(monkeypatch, mode):
     h._transport_execute.assert_not_called()
     h._fault.assert_called_once()
     assert h.transport_contact_baseline is None
+
+
+@pytest.mark.parametrize('phase', ['direct', 'continuous'])
+def test_direct_route_latches_force_baseline_before_first_motion(monkeypatch, phase):
+    h = make_harness()
+    h.clearance_phase = phase
+    h.clearance_has_descent = False
+    h.latest_force_z = 12.
+    monkeypatch.setattr('safe_servo_visualization.clearance_transfer.time.monotonic', lambda: 10.)
+    assert not h._wait_descent_baseline()
+    assert h.transport_contact_baseline == 12.
+    assert h.transport_descent_time == 0.
+    h.latest_force_z = 18.
+    assert not h._wait_descent_baseline()
+    assert h.transport_contact_baseline == 12.

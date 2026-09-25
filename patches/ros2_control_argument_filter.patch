@@ -1,0 +1,13 @@
+diff --git a/controller_manager/src/controller_manager.cpp b/controller_manager/src/controller_manager.cpp
+--- a/controller_manager/src/controller_manager.cpp
++++ b/controller_manager/src/controller_manager.cpp
+@@ -4974,7 +4974,7 @@
+   for (const std::string & arg : cm_node_options_.arguments())
+   {
+     if (
+-      arg.find("__ns") != std::string::npos || arg.find("__node") != std::string::npos ||
+-      arg.find("robot_description") != std::string::npos)
++      arg.rfind("__ns:=", 0) == 0 || arg.rfind("__node:=", 0) == 0 ||
++      arg.rfind("robot_description:=", 0) == 0)
+     {
+       if (

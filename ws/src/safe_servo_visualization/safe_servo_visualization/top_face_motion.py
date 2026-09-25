@@ -162,18 +162,14 @@ class TopFaceMotion:
             tcp = self._matrix(self.base, 'link_tcp', Time().to_msg())
             extrinsic = self._matrix('link_tcp', info.header.frame_id, Time().to_msg())
             height = float(self.get_parameter('inspection_tcp_z_m').value)
-            pallet = self._matrix(self.base, 'pallet_frame', Time().to_msg())
-            clearance = self.motion_status['motion'].get('transfer_corner_height_pallet_m')
-            if (not math.isfinite(height) or clearance is None or
-                    not math.isfinite(float(clearance)) or float(clearance) <= 0):
-                raise ValueError('container clearance/inspection height unavailable')
-            height = max(height, float(pallet[2, 3])+float(clearance), float(points[0, 2])+.100)
+            if not math.isfinite(height):
+                raise ValueError('inspection height unavailable')
+            height = max(height, float(points[0, 2]) + .100)
             if slot_view:
                 if not math.isfinite(observation_z) or observation_z < height:
                     raise ValueError('observation TCP height is below required inspection clearance')
                 height = observation_z
-            # Begin at container clearance, increasing only if the face does
-            # not fit the image. Never lower below the container-safe plane.
+            # Start above the observed face; raise only when needed to fit the image.
             for extra in ([0.] if slot_view else np.arange(0., .201, .01)):
                 try:
                     pose = centered_camera_pose(tcp, extrinsic, points,

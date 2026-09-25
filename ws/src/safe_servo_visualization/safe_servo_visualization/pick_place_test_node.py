@@ -19,6 +19,7 @@ from xarm_msgs.srv import SetInt16
 
 from packing.real_platform_loading import RealPlatformRandomLoader
 from .pick_path_client import PickPathClient
+from .tasks import task_module
 from .random_stable_loading_node import round_down_to_increment, round_up_to_increment
 from .pallet_item_record import pallet_record, retrieval_values
 from .two_item_test import TwoItemTest, planning_dimensions
@@ -49,8 +50,8 @@ class PickPlaceTest(TwoItemTest, Node):
                     abort_place='/place_pipeline/abort', abort_supervisor='/pickup_supervisor/abort',
                     abort_motion='/motion_coordinator/cancel', abort_staging='/staging_slots/abort')
 
-    def __init__(self):
-        super().__init__('pick_place_test')
+    def __init__(self, node_name='pick_place_test', controls=True):
+        super().__init__(node_name)
         defaults = dict(container_size_mm=[450, 550, 450], clearance_mm=10,
                         clearance_mode='one_sided', seed=0, scan_downscale=1,
                         com_bound_ratio=.1, height_tolerance=0., use_fm=True,
@@ -66,7 +67,8 @@ class PickPlaceTest(TwoItemTest, Node):
             raise ValueError('random_test_max_steps must be in [1, 10000]')
         self.random_active = False
         self.new_item_sam_enabled = True
-        self.create_service(SetBool, '/pick_place_test/set_new_item_sam', self.set_new_item_sam)
+        if controls:
+            self.create_service(SetBool, '/pick_place_test/set_new_item_sam', self.set_new_item_sam)
         self.two_item_mode = False
         self.test_items = {}
         self.active_item = 0
@@ -116,7 +118,7 @@ class PickPlaceTest(TwoItemTest, Node):
         self.pick_path = PickPathClient(self, self.fail)
         self.sam_inspector = TopFaceInspectionClient(self, 'test')
         self.sam_pick_result = None
-        self.pub = self.create_publisher(String, '/pick_place_test/status', 10)
+        self.pub = self.create_publisher(String, '/'+node_name+'/status', 10)
         self.target_pub = self.create_publisher(Float64MultiArray, '/random_stable_loading/target', 10)
         self.source_pub = self.create_publisher(Float64MultiArray, '/staging_slots/retrieve_target', 10)
         self.store_selection = self.create_publisher(Int32, '/staging_slots/select_store', 10)
@@ -126,16 +128,17 @@ class PickPlaceTest(TwoItemTest, Node):
         self.create_subscription(String, '/pallet_localization/status', self.pallet_status, 10)
         self.create_subscription(Float64MultiArray, '/random_stable_loading/target_applied', self.ack, 10)
         self.create_subscription(Float64MultiArray, '/random_stable_loading/target', self.target_seen, 10)
-        for step in STEPS:
-            self.create_service(Trigger, '/pick_place_test/'+step,
-                                lambda req, res, s=step: self.start(s, res))
-        self.create_service(Trigger, '/pick_place_test/abort', self.abort)
-        self.create_service(Trigger, '/pick_place_test/reset', self.reset)
-        self.create_service(Trigger, '/pick_place_test/start_random', self.start_random)
-        self.create_service(Trigger, '/pick_place_test/stop_random', self.stop_random)
-        self.create_service(SetBool, '/pick_place_test/set_random_pack_unpack_only',
-                            self.set_random_pack_unpack_only)
-        self.create_service(SetBool, '/pick_place_test/set_two_item_mode', self.set_two_item_mode)
+        if controls:
+            for step in STEPS:
+                self.create_service(Trigger, '/pick_place_test/'+step,
+                                    lambda req, res, s=step: self.start(s, res))
+            self.create_service(Trigger, '/pick_place_test/abort', self.abort)
+            self.create_service(Trigger, '/pick_place_test/reset', self.reset)
+            self.create_service(Trigger, '/pick_place_test/start_random', self.start_random)
+            self.create_service(Trigger, '/pick_place_test/stop_random', self.stop_random)
+            self.create_service(SetBool, '/pick_place_test/set_random_pack_unpack_only',
+                                self.set_random_pack_unpack_only)
+            self.create_service(SetBool, '/pick_place_test/set_two_item_mode', self.set_two_item_mode)
         self.create_timer(.1, self.tick)
         self.create_timer(.5, self.publish_status)
 
@@ -149,6 +152,9 @@ class PickPlaceTest(TwoItemTest, Node):
             if not isinstance(value, dict):
                 return
             self.status[key], self.received[key] = value, time.monotonic()
+            if (key == 'scene' and value.get('attached_item_id') and
+                    self.step == 'pack_new' and self.state in ('PICK_AND_PLACE_NEW', 'FAULT')):
+                self.location = 'carried'
             if key in ('staging', 'scene'):
                 self._record_slot_release()
             if key in ('supervisor', 'scene', 'place', 'cycle'):
@@ -318,16 +324,7 @@ class PickPlaceTest(TwoItemTest, Node):
         self.placement_started_sequence = None
         self.placement_attachment_seen_sequence = None
         self.sequence += 1
-        if step == 'pack_new':
-            self.phase('ESTIMATING')
-            self.call('estimate_sam' if getattr(self, 'new_item_sam_enabled', False) else 'estimate', 'pickup')
-        elif step == 'unpack':
-            if max(self.record['size_mm'][:2]) > 250:
-                response.message = 'item cannot fit in 250 x 250 mm staging slot'
-                return response
-            self.begin_pallet_pick()
-        else:
-            self.plan(self.record['item_id'], self.record.get('planning_size_mm', self.record['size_mm']))
+        task_module(step).begin(self)
         response.success = self.state != 'FAULT'
         response.message = self.fault or ('started '+step+'; real robot motion')
         return response
@@ -369,10 +366,8 @@ class PickPlaceTest(TwoItemTest, Node):
     def plan(self, item_id, dimensions):
         dimensions = planning_dimensions(dimensions, getattr(self, 'height_grid', 5))
         self.phase('PLANNING_RANDOM_TARGET')
-        excluded = set()
-        if self.step == 'repack':
-            # Exclude both orientations at the old virtual corner.
-            excluded = {(*self.record['virtual_corner_mm'], r) for r in (False, True)}
+        excluded = (task_module(self.step).excluded_placements(self)
+                    if self.step in STEPS else set())
         options = {}
         if self._two_enabled():
             item_id = self.active_item
@@ -627,14 +622,7 @@ class PickPlaceTest(TwoItemTest, Node):
                 if time.monotonic()-self.last_publish > .5:
                     self.publish_target()
             elif elapsed >= .5:
-                if self.step == 'pack_new':
-                    self.scene_before = placed_ids(self.status['scene'])
-                    self.phase('PICK_AND_PLACE_NEW')
-                    self.call('incoming', 'cycle')
-                elif self.step == 'pack_slot':
-                    self.begin_stage(False)
-                else:
-                    self.begin_pallet_pick()
+                task_module(self.step).target_ready(self)
         elif self.state == 'SAM_INSPECTION':
             result = self.sam_inspector.tick()
             if result is not None:
@@ -658,10 +646,7 @@ class PickPlaceTest(TwoItemTest, Node):
             if not self.status['scene'].get('attached_item_id'):
                 return
             self.location = 'carried'
-            if self.step == 'unpack':
-                self.begin_stage(True)
-            else:
-                self.begin_place()
+            task_module(self.step).grasp_ready(self)
         elif self.state in ('SELECT_STORE_SLOT', 'SELECT_RETRIEVE_SLOT'):
             store = self.state == 'SELECT_STORE_SLOT'
             field = 'selected_store_slot' if store else 'selected_retrieve_slot'
@@ -773,7 +758,7 @@ class PickPlaceTest(TwoItemTest, Node):
 
     def publish_status(self):
         reasons = {s: self.check_preconditions(s) for s in STEPS}
-        self.pub.publish(String(data=json.dumps(dict(
+        self.publish_payload(dict(
             state=self.state, step=self.step, location=self.location, fault=self.fault,
             new_item_sam_enabled=getattr(self, 'new_item_sam_enabled', False),
             sam_request_id=getattr(getattr(self, 'sam_inspector', None), 'token', None),
@@ -794,7 +779,10 @@ class PickPlaceTest(TwoItemTest, Node):
             random_message=self.random_message,
             random_start_allowed=(self.state != 'FAULT' and not self.random_active and bool(self.random_choices())),
             container_size_mm=self.container, transfer_corner_height_m=self.clearance,
-        ), separators=(',', ':'))))
+        ))
+
+    def publish_payload(self, payload):
+        self.pub.publish(String(data=json.dumps(payload, separators=(',', ':'))))
 
 
     def set_new_item_sam(self, request, response):

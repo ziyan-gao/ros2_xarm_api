@@ -55,18 +55,20 @@ COPY patches/xarm_control_handoff_lifecycle_guard.patch /tmp/xarm_control_handof
 COPY patches/xarm_sdk_bounded_servoj.patch /tmp/xarm_sdk_bounded_servoj.patch
 COPY tests/servo_write_deadline_test.cpp /tmp/servo_write_deadline_test.cpp
 COPY patches/ros2_control_fault_stop.patch /tmp/ros2_control_fault_stop.patch
+COPY patches/ros2_control_argument_filter.patch /tmp/ros2_control_argument_filter.patch
 
 # Match the installed ABI exactly; do not silently mix this patch with another
-# ros2_control release. This overlay only changes stop-only error cleanup.
+# ros2_control release. Patch fault cleanup and controller argument filtering.
 RUN grep -q '<version>4.48.0</version>' /opt/ros/jazzy/share/hardware_interface/package.xml && \
     git clone --branch 4.48.0 --depth 1 https://github.com/ros-controls/ros2_control.git /opt/ros2_control_ws/src/ros2_control && \
     cd /opt/ros2_control_ws/src/ros2_control && \
     test "$(git rev-parse HEAD)" = cdbc1127521074c2c5d19b4af2b73591e69d762b && \
     git apply /tmp/ros2_control_fault_stop.patch && \
+    git apply /tmp/ros2_control_argument_filter.patch && \
     source /opt/ros/jazzy/setup.bash && \
     cd /opt/ros2_control_ws && \
-    colcon build --base-paths src/ros2_control/hardware_interface \
-      --packages-select hardware_interface --cmake-args -DBUILD_TESTING=OFF
+    colcon build --base-paths src/ros2_control/hardware_interface src/ros2_control/controller_manager \
+      --packages-select hardware_interface controller_manager --cmake-args -DBUILD_TESTING=OFF
 
 # Official UFACTORY ROS 2 driver and collision-aware planning stack. Gazebo is
 # excluded from this real-robot image by the manifest-only patch copied above.

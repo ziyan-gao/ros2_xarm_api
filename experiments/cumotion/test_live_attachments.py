@@ -159,20 +159,10 @@ def test_clearance_barriers_follow_pallet_and_slot_footprints():
     pallet = pallet_surface()
     barriers = LiveServer.build_clearance_barriers(
         [pallet], barrier_geometry())
-    assert [obj.id for obj in barriers] == [
-        LiveServer.PALLET_BARRIER_ID, LiveServer.SLOT_BARRIER_ID]
-    pallet_barrier, slot_barrier = barriers
+    assert [obj.id for obj in barriers] == [LiveServer.SLOT_BARRIER_ID]
+    slot_barrier = barriers[0]
     pallet_top = (pallet.primitive_poses[0].position.z +
                   pallet.primitives[0].dimensions[2] / 2.)
-    assert pallet_barrier.primitives[0].dimensions[:2] == pytest.approx([.45, .55])
-    assert (pallet_barrier.primitive_poses[0].orientation ==
-            pallet.primitive_poses[0].orientation)
-    expected_pallet_top = pallet_top + .47 - .100 - .003
-    assert (pallet_barrier.primitive_poses[0].position.z +
-            pallet_barrier.primitives[0].dimensions[2] / 2.) == pytest.approx(
-                expected_pallet_top)
-    assert (pallet_barrier.primitive_poses[0].position.z -
-            pallet_barrier.primitives[0].dimensions[2] / 2.) == pytest.approx(pallet_top)
     expected_slot_top = pallet_top + .48 - .003
     assert slot_barrier.primitives[0].dimensions == pytest.approx(
         [.75, .5, expected_slot_top])

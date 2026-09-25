@@ -227,7 +227,9 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             response.message = 'fresh force telemetry is required'
             return response
         if not all(c.service_is_ready() for c in (
-                self.transport_fk, self.transport_cartesian, self.state_validity_client)):
+                self.transport_fk,
+                (self.transport_motion_plan if getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion'
+                 else self.transport_cartesian), self.state_validity_client)):
             response.message = 'MoveIt Cartesian/FK/state-validity service unavailable'
             return response
         if not self.transfer_trajectory_client.server_is_ready():
@@ -332,7 +334,8 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             clearance = float(self.transport_target['transport_corner_clearance_z_m'])
             self.direct_moveit_active = bool(
                 getattr(self, 'transport_moveit_direct_enabled', False) and
-                (not getattr(self, 'transport_is_return', False) or
+                (getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion' or
+                 not getattr(self, 'transport_is_return', False) or
                  getattr(self, 'return_to_observation', True)))
             self.clearance_phase = None
             if getattr(self, 'transport_is_pick', False) or getattr(self, 'transport_is_return', False):
@@ -360,9 +363,7 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                             'inspection_only'):
                         self.get_logger().info(
                             'top-face inspection routing: ' +
-                            ('cross-area cuMotion plus terminal Cartesian approach'
-                             if self.pick_cross_area else
-                             'same-area direct Cartesian motion; cuMotion bypassed'))
+                            'direct target planning from measured pose')
                 self._begin_clearance_transfer(start, q, end, end_q, clearance)
                 return
             if getattr(self, 'transport_is_pick', False):
@@ -536,6 +537,27 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                     point.time_from_start = Duration(seconds=t * 2.).to_msg()
                     point.velocities = [v * .5 for v in point.velocities]
                     point.accelerations = [a * .25 for a in point.accelerations]
+            if (getattr(self, 'transport_is_pick', False) and
+                    (self.transport_target.get('planned_pregrasp') or {}).get('approach_mode') == 'joint_direct' and
+                    getattr(self, 'clearance_phase', None) == 'direct'):
+                # Preserve the slower pre-pick setting with the cuMotion path.
+                for point in trajectory.points:
+                    t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+                    point.time_from_start = Duration(seconds=t / .375).to_msg()
+                    point.velocities = [v * .375 for v in point.velocities]
+                    point.accelerations = [a * .375**2 for a in point.accelerations]
+            if getattr(self, 'clearance_phase', None) == 'departure_lift':
+                # Dedicated slow lift: average vertical speed <=20 mm/s,
+                # independent of the faster transfer slider. Only stretch time.
+                distance = abs(float(self.transport_end[2] - self.transport_start_xyz[2]))
+                last = trajectory.points[-1].time_from_start
+                duration = last.sec + last.nanosec * 1e-9
+                factor = max(1., (distance / .020) / duration)
+                for point in trajectory.points:
+                    t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+                    point.time_from_start = Duration(seconds=t * factor).to_msg()
+                    point.velocities = [v / factor for v in point.velocities]
+                    point.accelerations = [a / factor**2 for a in point.accelerations]
             operator_scale = max(0.05, min(1.0, self.motion_speed_percent/100))
             source = getattr(self, 'transport_timing_source', 'cartesian')
             relative_scale = (1. if source == 'moveit' else
@@ -754,8 +776,8 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                 return
             near_start = np.linalg.norm(xyz[:2]-self.transport_start_xyz[:2]) <= 0.003
             near_end = np.linalg.norm(xyz[:2]-self.transport_end[:2]) <= 0.003
-            local_clearance = getattr(
-                self, 'transport_local_clearance_validation_enabled', False)
+            local_clearance = (getattr(self, 'clearance_phase', None) != 'direct' and
+                getattr(self, 'transport_local_clearance_validation_enabled', False))
             if (local_clearance and not near_start and not near_end and
                     not getattr(self, 'direct_moveit_active', False)):
                 if xyz[2]+item_bottom_offset(q,self.transport_scene) < self.transport_clearance-0.001:
@@ -989,7 +1011,9 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
                         abs(a-b) for a,b in zip(self.transport_verify_joints,self.return_goal_joints))
                     if self.transport_verify_joint_error > self.direct_transfer_joint_tolerance:
                         return
-                self.continuous_return_completed = True
+                self.continuous_return_completed = not (
+                    getattr(self, 'return_pre_place_only', False) and
+                    getattr(self, 'return_to_observation', True))
             else:
                 if (getattr(self, 'transport_target', {}).get('transfer_context') == 'staging_store' and
                         abs(float(q @ self.transport_end_q)) < math.cos(math.radians(2.5)/2)):
@@ -1033,7 +1057,7 @@ class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReu
             self._fault('continuous descent has no loaded force baseline')
             return
         delta = abs(force_z-self.transport_contact_baseline)
-        self.transport_force_count = self.transport_force_count+1 if delta >= self.place_force_threshold else 0
+        self.transport_force_count = self.transport_force_count+1 if delta >= self.transport_force_threshold else 0
         if self.transport_force_count < self.loading_contact_confirm_samples:
             return
         if getattr(self, 'transport_is_pick', False):

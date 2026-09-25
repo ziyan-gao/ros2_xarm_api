@@ -5,6 +5,9 @@
 # direct-SDK safe_servo_controller here without explicit controller handoff.
 set -eo pipefail
 
+# Also cover direct script starts; respect a deliberately supplied DDS config.
+export CYCLONEDDS_URI="${CYCLONEDDS_URI:-file:///workspace/config/cyclonedds.xml}"
+
 source /opt/ros/jazzy/setup.bash
 source /opt/xarm_ws/install/setup.bash
 if [[ "${CUMOTION_LIVE_ENABLED:-false}" == true ]]; then
@@ -24,6 +27,7 @@ set -u
 : "${SERVO_DESCENT_KP_Z:=3.0}"
 : "${PICKUP_FORCE_THRESHOLD_N:=5.0}"
 : "${PLACE_FORCE_THRESHOLD_N:=4.0}"
+: "${TRANSPORT_FORCE_THRESHOLD_N:=8.0}"
 : "${PLACE_DESCENT_TIMEOUT_SEC:=20.0}"
 : "${PLACE_SINGULARITY_RECOVERY_TIMEOUT_SEC:=20.0}"
 : "${PLACE_SINGULARITY_STEP_M:=0.003}"
@@ -154,6 +158,17 @@ fi
 start_required() {
   echo "Starting $1"
   shift
+  if [[ "$1" == ros2 && "$2" == run ]]; then
+    case "$4" in
+      pickup_supervisor|motion_coordinator|pickup_pipeline|place_pipeline|pick_place_pipeline|random_stable_loading|policy_loading|item_localization|waypoint_store|visualization_node|box_marker_detector|depth_box_refinement)
+        # Monitor owns the direct executable, preserves all launch arguments,
+        # and remains alive on child failure so RViz can request a restart.
+        python3 -m safe_servo_visualization.node_restart "${@:4}" &
+        child_pids+=("$!")
+        return
+        ;;
+    esac
+  fi
   "$@" &
   child_pids+=("$!")
 }
@@ -221,7 +236,12 @@ start_required "UF850 MoveIt/ros2_control stack (${ROBOT_IP})" \
     rviz_config:="${RVIZ_CONFIG}"
 
 start_required "RealSense camera" \
-  ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+  ros2 launch realsense2_camera rs_launch.py \
+    align_depth.enable:=true \
+    enable_sync:=true \
+    rgb_camera.color_profile:="${CAMERA_COLOR_PROFILE:-640x480x30}" \
+    depth_module.depth_profile:="${CAMERA_DEPTH_PROFILE:-640x480x30}" \
+    depth_module.infra_profile:="${CAMERA_DEPTH_PROFILE:-640x480x30}"
 
 # Run only the application node. visualization.launch.py also creates a robot
 # state publisher whose model and TF would conflict with MoveIt's publisher.
@@ -291,6 +311,7 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p continuous_transport_max_joint_jerk_rad_s3:="${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3}" \
     -p continuous_transport_enforce_jerk_limit:="${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT}" \
     -p force_contact_threshold_n:="${PICKUP_FORCE_THRESHOLD_N}" \
+    -p transport_force_contact_threshold_n:="${TRANSPORT_FORCE_THRESHOLD_N}" \
     -p place_force_contact_threshold_n:="${PLACE_FORCE_THRESHOLD_N}" \
     -p place_descent_timeout_sec:="${PLACE_DESCENT_TIMEOUT_SEC}" \
     -p direct_transfer_max_joint_delta_rad:=3.141592653589793 \
@@ -361,8 +382,8 @@ start_required "real-platform learned-policy coordinator" \
 
 # Inert until an explicit test-panel button is pressed. Uses the same random
 # loading geometry configuration, without changing either loader's inventory.
-start_required "single-item pack/unpack/repack test coordinator" \
-  ros2 run safe_servo_visualization pick_place_test --ros-args \
+start_required "restartable pack/unpack/repack task session" \
+  ros2 run safe_servo_visualization task_test --ros-args \
     -p random_test_max_steps:="${PICK_PLACE_TEST_MAX_STEPS}" \
     -p random_test_seed:="${PICK_PLACE_TEST_SEED}" \
     -p container_size_mm:="${RANDOM_LOADING_CONTAINER_ROS}" \
@@ -380,5 +401,6 @@ start_required "single-item pack/unpack/repack test coordinator" \
 echo "Unified stack is running; MoveIt is the sole motion owner."
 echo "Direct-SDK safe servo is disabled; guarded descent uses the real MoveIt Servo bridge."
 
-# Stop if a required component exits; the passive debugger is excluded.
+# Application monitors survive child failure; an unmanaged required component
+# or monitor failure still shuts the stack down.
 wait -n "${child_pids[@]}"

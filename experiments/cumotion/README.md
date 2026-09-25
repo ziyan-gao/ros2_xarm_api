@@ -1,5 +1,43 @@
 # cuMotion isolated experiment
 
+当前自由空间路径已改为 cuMotion：含抬升目标、pre-pick、pre-place、inspection、
+slot 进出及退回 pre-place。每段独立执行，不再拼接 Cartesian 段；接触下降仍用 Servo。
+100 mm 抬升是目标高度差，不保证途中直上直下。速度限制和完整轨迹检查保留。
+Pallet 和 slot 虚拟净空障碍均已关闭（`CUMOTION_CLEARANCE_BARRIERS_ENABLED=false`）。
+每次请求会过滤旧的两个虚拟障碍 ID，实际箱子、pallet、桌面和其他碰撞体保留。
+下文旧 Cartesian／slot 虚拟障碍流程不代表当前 cuMotion 模式。
+
+
+## 当前 cuMotion 直接路径（cumotion-direct-pallet）
+
+Pallet 虚拟净空障碍和强制高位 waypoint 已取消；实际 pallet、已放箱子、
+附着物体和相机碰撞模型继续参与校验。Slot 虚拟障碍保留。
+
+- Pack new、repack 取箱后：先原地垂直抬升 100 mm（`transport_departure_lift_m`），
+  确认实际位置后再从测量关节状态规划到 pre-place。两段分开执行，避免低位横向拖动。
+- Pack from slot：先垂直退出保留的 slot 障碍，再直接规划到 pre-place，
+  终点确认后继续原有 Servo 接触放置。
+- Inspection：直接规划到 inspection pose，不经 observation 或净空 waypoint。
+  Inspection 高度保留视觉覆盖和箱子上方接近距离，不再按 pallet 净空高度抬高。
+- 放置后：保留慢速 retreat 到 pre-place 及控制器恢复确认，随后直接规划到
+  保存的 observation 关节目标；不再执行额外净空抬升。
+- 本轮不新增奇异检测或失败后自动抬升。原有接触阶段恢复逻辑不变。
+- 最近调整的 pre-pick、载物转运速度以及碰撞、终点、力保护继续保留。
+
+Test-panel chained 接续：pallet 放置后确认 retreat 到 pre-place、解除附着及
+控制器恢复即可交接，不再抬升到旧净空高度。Slot 仍保留虚拟障碍，因此
+进入 slot pre-pick 时采用高位 cuMotion 加垂直下降；取箱离开 slot 时先垂直
+退出，再直接规划到 pallet pre-place。直接转运在执行前锁定新鲜受力基线，
+全段监测力变化；触发后停止并保持吸附，不自动释放。
+
+直接 cuMotion 路径在尚未执行时遇到起点碰撞或通用规划失败，可执行一次
+经碰撞／力检查的垂直上移 100 mm，确认到位后重新规划原目标。100 mm 抬升段至少用时 5 秒（平均速度不超过 20 mm/s），不加快其他路径。同一操作最多
+5 次（累计不超过 500 mm），且不得超过工作空间上限。IK、通信、执行失败不触发
+该重试，抬升失败也不继续抬升。本轮没有加入吸盘与指定箱子的 GPU 碰撞豁免。
+
+下文旧的 pallet 净空／高位路径说明不再适用于当前 cuMotion 直接路径。
+
+
 ## Real-state / real-scene commissioning profile (2026-09-24)
 
 Optional integration now exists in `compose.cumotion.yaml`. It adds cuMotion to

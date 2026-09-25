@@ -287,9 +287,10 @@ def test_empty_pick_contact_does_not_use_placement_release_fallback():
     node.transport_contact_baseline = 0.
     node.transport_force_count = 0
     node.place_force_threshold = 4.
+    node.transport_force_threshold = 8.
     node.loading_contact_confirm_samples = 2
-    node._transport_force(5.)
-    node._transport_force(5.)
+    node._transport_force(9.)
+    node._transport_force(9.)
     assert node.state == node.FAULT and not node.released
 
 

@@ -275,7 +275,9 @@ class ContinuousPick:
             self._fault('pickup approach prerequisites changed during handoff')
             return
         if not all(c.service_is_ready() for c in (
-                self.transport_fk, self.transport_cartesian, self.state_validity_client)) or not (
+                self.transport_fk,
+                (self.transport_motion_plan if getattr(self, 'transport_moveit_pipeline_id', '') == 'isaac_ros_cumotion'
+                 else self.transport_cartesian), self.state_validity_client)) or not (
                 self.transfer_trajectory_client.server_is_ready()):
             self._fault('pickup approach planning/trajectory services unavailable')
             return

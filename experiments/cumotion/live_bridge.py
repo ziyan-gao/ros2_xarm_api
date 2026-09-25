@@ -60,7 +60,7 @@ class LiveServer(PlanOnlyServer):
         self.get_logger().info(
             f'per-request parallel finetune enabled={self.parallel_finetune}')
         barrier_defaults = {
-            'clearance_barriers_enabled': True,
+            'clearance_barriers_enabled': False,
             'pallet_clearance_z_m': 0.470,
             'slot_clearance_z_m': 0.480,
             'slot_surface_z_m': 0.0,
@@ -253,8 +253,8 @@ class LiveServer(PlanOnlyServer):
     def build_clearance_barriers(cls, world_objects, geometry):
         """Build conservative local barriers without covering the robot base.
 
-        The pallet barrier follows the measured pallet primitive.  The slot
-        barrier follows the six-slot footprint, not the complete work table:
+        No virtual pallet barrier is generated. The slot barrier follows
+        the six-slot footprint, not the complete work table:
         extending the measured work-table cuboid to clearance would contain
         link_base and make every cuMotion start state collide.
         """
@@ -276,18 +276,6 @@ class LiveServer(PlanOnlyServer):
         source_pose = pallet.primitive_poses[0]
         surface_top = source_pose.position.z + dimensions[2] / 2.0
         margin = geometry['barrier_top_margin_m']
-        pallet_barrier_top = (
-            # Match the pallet transfer plane in clearance_transfer.py.
-            surface_top + geometry['pallet_clearance_z_m'] - .100 - margin)
-        barrier_height = pallet_barrier_top - surface_top
-        if barrier_height <= 0.0:
-            raise ValueError('Pallet clearance barrier has no height')
-        pose = copy.deepcopy(source_pose)
-        pose.position.z = surface_top + barrier_height / 2.0
-        result.append(cls._box_object(
-            cls.PALLET_BARRIER_ID,
-            (dimensions[0], dimensions[1], barrier_height), pose))
-
         x_min, x_max = geometry['slot_x_min_m'], geometry['slot_x_max_m']
         y_min, y_max = geometry['slot_y_min_m'], geometry['slot_y_max_m']
         z_min = geometry['slot_surface_z_m']
@@ -488,13 +476,12 @@ class LiveServer(PlanOnlyServer):
                 barriers = self.build_clearance_barriers(
                     scene.world.collision_objects,
                     self.clearance_barrier_geometry)
-                if len(barriers) != 2:
+                if len(barriers) != 1:
                     raise ValueError(
-                        "clearance barriers enabled but pallet/slot virtual obstacles "
+                        "slot clearance enabled but its virtual obstacle "
                         f"could not be built (count={len(barriers)}); refusing unprotected planning")
-                # These are the only clearance-height constraints. Keep them
-                # present for empty-tool and carried-item cuMotion requests;
-                # Cartesian vertical approach/descent is planned separately.
+                # Only the slot barrier remains; physical pallet and packed
+                # item objects are retained unchanged in the collision world.
                 scene.world.collision_objects.extend(barriers)
             self.publish_clearance_barriers(barriers)
             # The camera changes the robot topology and is baked once. Payload

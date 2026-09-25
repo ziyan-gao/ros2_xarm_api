@@ -934,7 +934,7 @@ def test_rotated_route_requires_rotation_and_descent_before_validation(tmp_path)
     assert len(h.validated[0].solution.joint_trajectory.points) == 4
 
 
-def test_new_pick_ik_builds_joint_line_without_planner_request(tmp_path):
+def test_new_pick_ik_submits_collision_checked_cumotion_joint_goal(tmp_path):
     h = Harness(tmp_path)
     h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
     h.transport_moveit_planner_id = 'cuMotion'
@@ -950,16 +950,8 @@ def test_new_pick_ik_builds_joint_line_without_planner_request(tmp_path):
     pending.value = NS(error_code=NS(val=1), solution=NS(joint_state=NS(
         name=['j1', 'j2'], position=[.3, .4])))
     pending.callback(pending)
-    assert not h.transport_motion_plan.calls
-    h._alternative_segment_ready.assert_called_once()
-    path = h._alternative_segment_ready.call_args.args[0]
-    assert list(path.points[0].positions) == [.1, .2]
-    assert list(path.points[-1].positions) == pytest.approx([.3, .4])
-    from safe_servo_visualization.sdk_transport import joint_line
-    original = joint_line((.1, .2), (.3, .4), ['j1', 'j2'], .5, .5)
-    def seconds(point):
-        return point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
-    assert seconds(path.points[-1]) == pytest.approx(seconds(original.points[-1]) / .375)
-    for slowed, baseline in zip(path.points, original.points):
-        assert slowed.velocities == pytest.approx([v * .375 for v in baseline.velocities])
-        assert slowed.accelerations == pytest.approx([a * .140625 for a in baseline.accelerations])
+    assert len(h.transport_motion_plan.calls) == 1
+    request, _ = h.transport_motion_plan.calls[0]
+    assert request.motion_plan_request.pipeline_id == 'isaac_ros_cumotion'
+    assert [j.position for j in request.motion_plan_request.goal_constraints[0].joint_constraints] == pytest.approx([.3, .4])
+    h._alternative_segment_ready.assert_not_called()

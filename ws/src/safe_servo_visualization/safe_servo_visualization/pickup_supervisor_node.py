@@ -24,9 +24,10 @@ from xarm_msgs.msg import RobotMsg
 from xarm_msgs.srv import (
     Call, GetInt16, MoveCartesian, SetInt16, VacuumGripperCtrl)
 from .continuous_transport import ContinuousTransport
+from .task_motion_policy import TaskMotionPolicy
 
 
-class PickupSupervisor(ContinuousTransport, Node):
+class PickupSupervisor(TaskMotionPolicy, ContinuousTransport, Node):
     """Supervise a vertical-only pickup after pre-grasp execution."""
 
     IDLE = 'IDLE'
@@ -128,6 +129,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.declare_parameter('vacuum_verify_interval_sec', 0.5)
         self.declare_parameter('force_contact_threshold_n', 5.0)
         self.declare_parameter('place_force_contact_threshold_n', 4.0)
+        self.declare_parameter('transport_force_contact_threshold_n', 8.0)
         self.declare_parameter(
             'force_topic', '/ufactory/uf_ftsensor_ext_states')
         self.declare_parameter('force_timeout_sec', 0.5)
@@ -250,6 +252,9 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.vacuum_verify_attempts = int(p('vacuum_verify_attempts'))
         self.vacuum_verify_interval = float(p('vacuum_verify_interval_sec'))
         self.force_threshold = float(p('force_contact_threshold_n'))
+        self.transport_force_threshold = float(p('transport_force_contact_threshold_n'))
+        if not math.isfinite(self.transport_force_threshold) or self.transport_force_threshold <= 0:
+            raise ValueError('transport_force_contact_threshold_n must be finite and positive')
         self.place_force_threshold = float(
             p('place_force_contact_threshold_n'))
         self.force_topic = str(p('force_topic'))
@@ -643,6 +648,7 @@ class PickupSupervisor(ContinuousTransport, Node):
             Trigger, '/pickup_supervisor/recover_ft_sensor',
             self.recover_ft_sensor_callback)
         self._init_continuous_transport()
+        self._init_task_motion_policy()
         self.create_timer(0.05, self.control_tick)
         self.create_timer(0.1, self.retreat_tick)
         self.create_timer(0.5, self.publish_status)
@@ -935,11 +941,15 @@ class PickupSupervisor(ContinuousTransport, Node):
         except (TypeError, ValueError):
             self.orchestrator_status[name] = {}
 
-    def _manual_control_busy_reason(self):
+    def _manual_control_busy_reason(self, allow_prepared_release=False):
         if self.state in self.ACTIVE:
             return f'supervisor is active in {self.state}'
         motion_state = self.motion_status.get('state')
-        if motion_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT'):
+        prepared_release = (allow_prepared_release and self.state == self.FAULT and
+                            motion_state == 'PREPARED' and self.robot_state == 2 and
+                            self.robot_state_time is not None and
+                            0 <= time.monotonic()-self.robot_state_time < self.status_timeout)
+        if motion_state not in (None, 'IDLE', 'SUCCEEDED', 'FAULT') and not prepared_release:
             return f'MoveIt coordinator is in {motion_state}'
         for name, status in self.orchestrator_status.items():
             state = status.get('state')
@@ -1062,7 +1072,7 @@ class PickupSupervisor(ContinuousTransport, Node):
 
     def set_gripper_callback(self, request, response):
         action = 'close' if request.data else 'open'
-        busy_reason = self._manual_control_busy_reason()
+        busy_reason = self._manual_control_busy_reason(allow_prepared_release=not request.data)
         if busy_reason:
             response.message = f'cannot {action} gripper: {busy_reason}'
             return response
@@ -3938,7 +3948,8 @@ class PickupSupervisor(ContinuousTransport, Node):
         request.acc = self.retreat_acc
         if (getattr(self, 'return_clearance_pending', False) or
                 getattr(self, 'pickup_clearance_pending', False) or
-                getattr(self, 'return_escape_active', False)):
+                getattr(self, 'return_escape_active', False) or
+                getattr(self, 'planning_sdk_lift_pending', False)):
             request.speed = min(self.retreat_speed, self.return_clearance_speed)
             request.acc = min(self.retreat_acc, 100.0)
             self.get_logger().info(
@@ -4258,7 +4269,8 @@ class PickupSupervisor(ContinuousTransport, Node):
             else:
                 self.restore_settle_ready_count = 0
                 if (getattr(self, 'continuous_return_restoring', False) or
-                        getattr(self, 'pick_path_restoring', False)):
+                        getattr(self, 'pick_path_restoring', False) or
+                        getattr(self, 'planning_sdk_lift_pending', False)):
                     # Return motion requires one uninterrupted healthy delay,
                     # not merely enough elapsed wall time since activation.
                     self.restore_settle_started = now
@@ -4314,6 +4326,9 @@ class PickupSupervisor(ContinuousTransport, Node):
             reason = self.post_retreat_fault
             self.post_retreat_fault = ''
             self._fault(reason)
+            return
+        if getattr(self, 'planning_sdk_lift_pending', False):
+            self._planning_sdk_lift_restored()
             return
         if getattr(self, 'transport_sdk_active', False):
             self._sdk_restored()
@@ -4483,7 +4498,8 @@ class PickupSupervisor(ContinuousTransport, Node):
         pallet_source = (source.get('pickup_source') == 'pallet' or
                          ('retrieval_target_id' in source and
                           source.get('pickup_source') not in ('buffer', 'incoming')))
-        if (getattr(self, 'operation_kind', None) == 'pickup' and pallet_source and
+        if (getattr(self, 'sdk_pick_retreat', True) and
+                getattr(self, 'operation_kind', None) == 'pickup' and pallet_source and
                 getattr(self, 'defer_pickup_lift', False) and vacuum_verified):
             # Match post-place retreat: clear the low contact region directly,
             # then restore ROS control before the planner owns the long lift.
@@ -4783,7 +4799,8 @@ class PickupSupervisor(ContinuousTransport, Node):
                 getattr(self, 'pickup_clearance_pending', False) or
                 getattr(self, 'transport_sdk_active', False) or
                 getattr(self, 'live_pick_pause_gate', None) is not None or
-                getattr(self, 'return_escape_active', False)):
+                getattr(self, 'return_escape_active', False) or
+                getattr(self, 'planning_sdk_lift_pending', False)):
             # Servo disable alone cannot stop a direct xArm service move.
             # Do not queue another step or release while this stop is pending.
             if self.set_state_client.service_is_ready():
@@ -4793,6 +4810,7 @@ class PickupSupervisor(ContinuousTransport, Node):
             else:
                 self.get_logger().error('direct descent stop service unavailable; operator stop required')
         self.live_pick_pause_gate = None
+        self.planning_sdk_lift_pending = False
         self.pickup_clearance_pending = False
         self.transport_sdk_active = False
         self.transport_sdk_candidate = False
@@ -5115,6 +5133,8 @@ class PickupSupervisor(ContinuousTransport, Node):
     def publish_status(self):
         message = String()
         message.data = json.dumps({
+            'task_policy_token': getattr(self, 'task_policy_token', None),
+            'task_policy_supported': True,
             'state': self.state,
             'operation_kind': self.operation_kind,
             'staging_place_active': self.staging_place_active,
