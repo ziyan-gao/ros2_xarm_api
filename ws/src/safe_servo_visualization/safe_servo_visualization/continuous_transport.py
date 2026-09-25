@@ -1,6 +1,7 @@
 """Continuous pallet transport; planning services never command the robot."""
 import math
 import copy
+import os
 from concurrent.futures import ThreadPoolExecutor
 import time
 import xml.etree.ElementTree as ET
@@ -18,12 +19,13 @@ from .continuous_return import ContinuousReturn
 from .continuous_pick import ContinuousPick
 from .cartesian_failure_diagnostics import CartesianFailureDiagnostics
 from .smooth_transport import smooth_and_sample
-from .transport_alternatives import TransportAlternatives
+from .transport_alternatives import TransportAlternatives, MOVEIT_TILT_TOLERANCE_RAD
 from .sdk_transport import SdkTransport
 from .transport_path import pickup_needs_observation, grid_pick_waypoints
 from .transport_alternatives import waypoint_candidates
 from .transport_reuse import TransportReuse
 from .staged_transport_timing import StagedTransportTiming
+from .clearance_transfer import ClearanceTransfer
 
 
 def retime_snapshot(trajectory, limits, speed, acceleration, jerk, scale):
@@ -74,7 +76,7 @@ from .transport_path import (
 )
 
 
-class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, TransportAlternatives, ContinuousPick, CartesianFailureDiagnostics, ContinuousReturn):
+class ContinuousTransport(ClearanceTransfer, StagedTransportTiming, TransportReuse, SdkTransport, TransportAlternatives, ContinuousPick, CartesianFailureDiagnostics, ContinuousReturn):
     TRANSPORT_PLANNING = 'TRANSPORT_PLANNING'
     TRANSPORT_VALIDATING = 'TRANSPORT_VALIDATING'
     TRANSPORT_EXECUTING = 'TRANSPORT_EXECUTING'
@@ -103,6 +105,18 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         self.create_service(Trigger, '/pickup_supervisor/start_pick_waypoints', self.start_pick_waypoints)
         self.declare_parameter('continuous_transport_blend_radius_m', 0.04)
         self.transport_radius = float(self.get_parameter('continuous_transport_blend_radius_m').value)
+        self.declare_parameter('cartesian_transport_speed_ratio', 0.35)
+        self.cartesian_transport_speed_ratio = float(
+            self.get_parameter('cartesian_transport_speed_ratio').value)
+        if (not math.isfinite(self.cartesian_transport_speed_ratio) or
+                not .05 <= self.cartesian_transport_speed_ratio <= 1.):
+            raise ValueError('cartesian_transport_speed_ratio must be in [0.05, 1.0]')
+        self.declare_parameter('continuous_transport_planning_timeout_sec', 75.0)
+        self.transport_planning_timeout = float(
+            self.get_parameter('continuous_transport_planning_timeout_sec').value)
+        if (not math.isfinite(self.transport_planning_timeout) or
+                not 5.0 <= self.transport_planning_timeout <= 600.0):
+            raise ValueError('continuous transport planning timeout must be in [5, 600] seconds')
         self.declare_parameter('continuous_transport_max_joint_jerk_rad_s3', 10.0)
         self.declare_parameter('continuous_transport_enforce_jerk_limit', False)
         self.transport_enforce_jerk_limit = bool(
@@ -114,6 +128,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         self.transport_feedback_time = 0.0
         self.continuous_contact_retreat = False
         self.transport_joint_limits = {}
+        self.transport_cumotion_joint_limits = {}
         self.create_subscription(String, '/robot_description', self._transport_model,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
@@ -132,8 +147,39 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                     for row in limits.values()):
                 raise ValueError('missing or invalid bounded arm joints')
             self.transport_joint_limits = limits
+            # Match the narrowed URDF used by the live cuMotion backend.  The
+            # normal robot/controller limits remain unchanged; these bounds
+            # are used only when choosing a cuMotion endpoint branch.
+            planning_limits = dict(limits)
+            overrides = {
+                'joint3': ('lower', os.getenv('CUMOTION_JOINT3_MIN_DEG')),
+                'joint5': ('upper', os.getenv('CUMOTION_JOINT5_MAX_DEG')),
+            }
+            for name, (side, raw) in overrides.items():
+                if raw is None or name not in planning_limits:
+                    continue
+                lower, upper, velocity = planning_limits[name]
+                value = math.radians(float(raw))
+                if not math.isfinite(value):
+                    raise ValueError(f'non-finite cuMotion limit for {name}')
+                if side == 'lower':
+                    if not lower <= value < upper:
+                        raise ValueError(f'cuMotion lower limit for {name} is outside physical bounds')
+                    lower = value
+                else:
+                    if not lower < value <= upper:
+                        raise ValueError(f'cuMotion upper limit for {name} is outside physical bounds')
+                    upper = value
+                planning_limits[name] = (lower, upper, velocity)
+            self.transport_cumotion_joint_limits = planning_limits
+            narrowed = {name: [row[0], row[1]] for name, row in planning_limits.items()
+                        if row[:2] != limits[name][:2]}
+            if narrowed:
+                self.get_logger().info(
+                    f'cuMotion endpoint joint limits active (rad): {narrowed}')
         except (ET.ParseError, ValueError, TypeError, AttributeError) as exc:
             self.transport_joint_limits = {}
+            self.transport_cumotion_joint_limits = {}
             self.get_logger().error(f'continuous transport cannot read robot limits: {exc}')
 
     def start_continuous_transport(self, _request, response):
@@ -176,6 +222,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         self.transport_is_pick = False
         self.transport_is_return = False
         self.transport_route_attempt = 0
+        self.primary_moveit_attempt = 0
         self.staged_timing_used = False
         self.staged_timing_active = False
         self.transport_slot_yaw_flipped = False
@@ -266,6 +313,35 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 self._fault('slot-store TCP orientation changed since capture; prepare a fresh store target')
                 return
             clearance = float(self.transport_target['transport_corner_clearance_z_m'])
+            self.direct_moveit_active = bool(
+                getattr(self, 'transport_moveit_direct_enabled', False) and
+                (not getattr(self, 'transport_is_return', False) or
+                 getattr(self, 'return_to_observation', True)))
+            if self.direct_moveit_active:
+                self.reuse_active = False
+                if not (self.planning_scene_status.get('camera_collision_applied') and
+                        self.planning_scene_status.get('add_placed_item_obstacle')):
+                    raise ValueError('direct planning requires camera and placed-item collision geometry')
+                if not self.transport_motion_plan.service_is_ready():
+                    raise ValueError('MoveIt planning service unavailable')
+                self.transport_start_xyz, self.transport_start_q = start, q
+                self.transport_end, self.transport_end_q = np.asarray(end), quaternion(end_q)
+                self.transport_clearance = clearance
+                self.transport_safe_z = self.transport_high_z = max(start[2], end[2], clearance)
+                self.alternative_seed = tuple(self.transport_seed)
+                if getattr(self, 'transport_is_pick', False):
+                    source = (self.transport_target.get('planned_pregrasp') or {}).get(
+                        'pickup_source')
+                    self.pick_cross_area = pickup_needs_observation(start, end, source)
+                    if (self.transport_target.get('planned_pregrasp') or {}).get(
+                            'inspection_only'):
+                        self.get_logger().info(
+                            'top-face inspection routing: ' +
+                            ('cross-area cuMotion plus terminal Cartesian approach'
+                             if self.pick_cross_area else
+                             'same-area direct Cartesian motion; cuMotion bypassed'))
+                self._begin_clearance_transfer(start, q, end, end_q, clearance)
+                return
             if getattr(self, 'transport_is_pick', False):
                 end = np.array(end, dtype=float).copy()
                 end[2] += getattr(self, 'raised_pick_offset_m', 0.)
@@ -305,6 +381,12 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             self.transport_end = np.array(end)
             self.transport_end_q = quaternion(end_q)
             self.transport_clearance = clearance
+            if (getattr(self, 'transport_moveit_primary_enabled', False) and
+                    not getattr(self, 'transport_is_pick', False) and
+                    not getattr(self, 'transport_is_return', False)):
+                if not self._try_primary_moveit('primary overhead planner'):
+                    self._fault('constrained MoveIt transport requires an attached item and idle execution')
+                return
             if self._try_reuse_transport(future):
                 return
             if (getattr(self, 'transport_via_observation', False) and
@@ -340,6 +422,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             req.max_velocity_scaling_factor = scale
             req.max_acceleration_scaling_factor = scale
             self.transport_cartesian_request = req
+            self.transport_timing_source = 'cartesian'
             self.transport_cartesian.call_async(req).add_done_callback(
                 self._transport_guard(self._transport_planned))
         except (ValueError, KeyError, TypeError) as exc:
@@ -363,7 +446,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 return
             trajectory = result.solution.joint_trajectory
             timing_issue = cartesian_timing_issue(trajectory, self.arm_joint_names)
-            if getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None:
+            if (getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None
+                    and not getattr(self, 'direct_moveit_active', False)):
                 if len(trajectory.points) < 2:
                     raise ValueError('empty return trajectory')
                 total = (trajectory.points[-1].time_from_start.sec +
@@ -409,7 +493,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                         point.velocities = [0.0] * len(self.arm_joint_names)
                 previous, previous_t = values,t
             trajectory.joint_names = list(self.arm_joint_names)
-            if getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None:
+            if (getattr(self, 'transport_is_return', False) and getattr(self, 'return_goal_joints', None) is not None
+                    and getattr(self, 'clearance_phase', None) != 'lift'):
                 if max(abs(a-b) for a,b in zip(trajectory.points[-1].positions,self.return_goal_joints)) > 1e-4:
                     raise ValueError('return path does not reach the saved observation joint configuration')
             if timing_issue is not None:
@@ -421,7 +506,11 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 # No applicable retry: hold/fault. Never fabricate timing for
                 # an untimed geometric path or retry an execution failure.
                 raise ValueError(reason)
-            scale = max(0.05, min(1.0, self.motion_speed_percent/100))
+            operator_scale = max(0.05, min(1.0, self.motion_speed_percent/100))
+            source = getattr(self, 'transport_timing_source', 'cartesian')
+            relative_scale = (1. if source == 'moveit' else
+                              getattr(self, 'cartesian_transport_speed_ratio', 1.))
+            scale = operator_scale * relative_scale
             pool = getattr(self, '_retime_pool', None)
             if pool is None:
                 self._retime_pool = pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='transport-retime')
@@ -434,7 +523,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 self.transport_max_joint_jerk if self.transport_enforce_jerk_limit else None,
                 scale)
             self._retime_pending = (task, self.operation_id,
-                getattr(self, 'transport_route_generation', 0), self.motion_speed_percent)
+                getattr(self, 'transport_route_generation', 0), self.motion_speed_percent,
+                source, scale)
             self._retime_discarded = False
             self.state = self.TRANSPORT_PLANNING
             self.publish_status()
@@ -447,7 +537,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         pending = getattr(self, '_retime_pending', None)
         if pending is None:
             return
-        task, operation, generation, speed = pending
+        task, operation, generation, speed, source, requested_scale = pending
         if (getattr(self, '_retime_discarded', False) or
                 operation != self.operation_id or self.state != self.TRANSPORT_PLANNING or
                 generation != getattr(self, 'transport_route_generation', 0)):
@@ -463,7 +553,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             if speed != self.motion_speed_percent:
                 raise ValueError('motion speed changed during retiming; replan required')
             trajectory, self.transport_checks, self.transport_duration, duration_ratio, timing = task.result()
-            scale = max(0.05, min(1.0, speed/100))
+            scale = requested_scale
             self.transport_trajectory = trajectory
             worst = timing['initial_worst']
             jerk_cap = (f'{self.transport_max_joint_jerk*scale:.3f} rad/s^3'
@@ -472,6 +562,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 f'C2 transport timing ({timing["strategy"]}): '
                 f'{timing["original_duration"]:.2f}s -> {self.transport_duration:.2f}s '
                 f'({duration_ratio:.3f}x overall); '
+                f'source={source}, operator={speed:.1f}%, effective={scale*100:.1f}%; '
                 f'adjusted {timing["repaired_segments"]}/{timing["total_segments"]} intervals, '
                 f'max interval factor={timing["max_segment_factor"]:.3f}, '
                 f'passes={timing["iterations"]}; original limiter: '
@@ -502,10 +593,15 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
 
     def _transport_validate_next(self):
         if self.transport_check_index == len(self.transport_checks):
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'direct_lift_z', None) is not None and
+                    not self.direct_lift_verified):
+                self._fault('mandatory pickup lift was not verified; refusing execution')
+                return
             self._transport_execute()
             return
         joints, _ = self.transport_checks[self.transport_check_index]
-        if getattr(self, 'transport_is_return', False):
+        if getattr(self, 'transport_is_return', False) and not getattr(self, 'direct_moveit_active', False):
             self._transport_fk_request(joints, self._return_collision_classified)
             return
         self._transport_check_collision(joints)
@@ -568,6 +664,45 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         try:
             xyz,q = self._transport_pose(future.result())
             _,t = self.transport_checks[self.transport_check_index]
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'clearance_phase', None) == 'transfer' and
+                    getattr(self, 'transport_moveit_clearance_constraint_enabled', False) and
+                    not getattr(self, 'transport_is_return', False)):
+                scene = self.transport_scene if (self.transport_scene or {}).get('attached_item_id') else None
+                if xyz[2] + item_bottom_offset(q, scene) < self.clearance_floor_z-.001:
+                    self._transport_reject_geometry('MoveIt transfer leaves regional clearance')
+                    return
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'clearance_phase', None) == 'descend'):
+                if (np.linalg.norm(xyz[:2]-self.transport_end[:2]) > .001 or
+                        abs(float(q @ self.transport_end_q)) < math.cos(math.radians(.5)/2)):
+                    self._transport_reject_geometry('final approach must remain vertical with fixed orientation')
+                    return
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'direct_lift_z', None) is not None and
+                    not self.direct_lift_verified):
+                if (np.linalg.norm(xyz[:2]-self.transport_start_xyz[:2]) > .001 or
+                        xyz[2] < self.transport_start_xyz[2]-.001 or
+                        abs(float(q @ self.transport_start_q)) < math.cos(math.radians(.5)/2)):
+                    self._transport_reject_geometry('mandatory pickup lift deviates before clearing support')
+                    return
+                if xyz[2] >= self.direct_lift_z-.001:
+                    self.direct_lift_verified = True
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'transport_moveit_pipeline_id', 'ompl')
+                    != 'isaac_ros_cumotion'):
+                # Match MoveIt's reference-frame rotation-vector tilt constraint
+                # after retiming, not only on the planner's original samples.
+                a, b = self.transport_end_q, q
+                v = a[3]*b[:3] - b[3]*a[:3] - np.cross(a[:3], b[:3])
+                w = float(a @ b)
+                if w < 0:
+                    v, w = -v, -w
+                norm = float(np.linalg.norm(v))
+                error = v * (2*math.atan2(norm, w)/norm) if norm > 1e-12 else v*2
+                if np.any(np.abs(error[:2]) > MOVEIT_TILT_TOLERANCE_RAD + .0001):
+                    self._transport_reject_geometry('retimed direct path violates tilt constraint')
+                    return
             # The Servo XY box is a local descent region, not the free-space
             # transfer workspace. Do not apply it to the complete transfer.
             if xyz[2] > self._transport_ceiling():
@@ -575,11 +710,15 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 return
             near_start = np.linalg.norm(xyz[:2]-self.transport_start_xyz[:2]) <= 0.003
             near_end = np.linalg.norm(xyz[:2]-self.transport_end[:2]) <= 0.003
-            if not near_start and not near_end:
+            local_clearance = getattr(
+                self, 'transport_local_clearance_validation_enabled', False)
+            if (local_clearance and not near_start and not near_end and
+                    not getattr(self, 'direct_moveit_active', False)):
                 if xyz[2]+item_bottom_offset(q,self.transport_scene) < self.transport_clearance-0.001:
                     self._transport_reject_geometry('timed transport cuts below item-bottom clearance')
                     return
-            if getattr(self, 'transport_is_pick', False):
+            if (local_clearance and
+                    getattr(self, 'transport_is_pick', False)):
                 # At low Z only the two vertical columns are allowed. Each
                 # column retains its own orientation; reorientation is aloft.
                 if xyz[2] < self.transport_safe_z - .001:
@@ -590,7 +729,9 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                             return
                         self._fault('KINEMATIC_REJECTED: pickup approach changes XY/orientation below clearance')
                         return
-            elif not getattr(self, 'transport_is_return', False):
+            elif (local_clearance and
+                    not getattr(self, 'transport_is_return', False) and
+                    not getattr(self, 'direct_moveit_active', False)):
                 # Allow free overhead orientation, but never use the source/
                 # destination column exemption to rotate a low carried item.
                 # Check actual rotated corners, not just the nominal TCP plane.
@@ -601,7 +742,9 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                     if not references or max(abs(float(q @ ref)) for ref in references) < math.cos(math.radians(2.5)/2):
                         self._transport_reject_geometry('timed transport rotates a carried item below clearance')
                         return
-            if near_end and xyz[2] < self.transport_high_z-0.001 and self.transport_descent_time is None:
+            if (near_end and xyz[2] < self.transport_high_z-0.001 and self.transport_descent_time is None
+                    and (not getattr(self, 'direct_moveit_active', False) or
+                         getattr(self, 'clearance_phase', None) == 'descend')):
                 # Include the end of the downward bend even when pre-place
                 # is so high that the straight descent leg has zero length.
                 self.transport_descent_time = t
@@ -628,6 +771,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             self._fault(reason)
 
     def _grid_deadline_tick(self, now):
+        if getattr(self, 'direct_moveit_active', False):
+            return False
         if (self.state in (self.TRANSPORT_PLANNING, self.TRANSPORT_DIAGNOSING) and
                 not getattr(self, 'direct_transfer_motion_started', False) and
                 getattr(self, 'transfer_goal_handle', None) is None):
@@ -662,7 +807,11 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         if max(abs(a-b) for a,b in zip(self.latest_joint_positions,self.transport_seed)) > 0.01:
             self._fault('robot moved during continuous transport planning')
             return
-        if getattr(self, 'transport_is_pick', False) and self._check_pick_descent_before_execution():
+        if (getattr(self, 'transport_is_pick', False) and
+                (not getattr(self, 'direct_moveit_active', False) or getattr(self, 'clearance_phase', None) == 'descend') and
+                self._check_pick_descent_before_execution()):
+            return
+        if self._wait_descent_baseline():
             return
         if getattr(self, 'transport_sdk_candidate', False):
             self._sdk_begin_execution()
@@ -775,6 +924,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             self.transport_verify_error = float(np.linalg.norm(xyz-self.transport_end))
             if self.transport_verify_error > 0.01:
                 return  # Allow bounded settling; do not relax the tolerance.
+            if self._advance_clearance_phase(xyz, q):
+                return
             if getattr(self, 'transport_is_pick', False):
                 if abs(float(q @ self.transport_end_q)) < math.cos(math.radians(2.5)/2):
                     return
@@ -813,6 +964,9 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                     self.verified_slot_transfer_target['pre_place_tcp_xyz_m'] = list(self.transport_end)
                     self.verified_slot_transfer_target['transfer_tcp_quaternion_xyzw'] = list(self.transport_end_q)
             self._remember_overhead_path()
+            if getattr(self, 'direct_moveit_active', False):
+                self.clearance_last_region = (None if getattr(self, 'transport_is_return', False)
+                                              else self.clearance_target_region)
             self.direct_target_z = float(self.transport_end[2])
             self.state = self.SUCCEEDED
             self.get_logger().info(
@@ -822,6 +976,7 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
             self._fault(f'continuous transport final FK failed: {exc}')
 
     def _transport_force(self, force_z):
+        self._collect_descent_baseline(force_z)
         if self.state != self.TRANSPORT_EXECUTING or getattr(self, 'transport_is_return', False):
             return
         if self.transport_descent_time is None or self.transport_feedback_time < self.transport_descent_time:
@@ -867,6 +1022,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
         if self.robot_error not in (None,0):
             self._fault(f'xArm error {self.robot_error} during continuous transport')
             return True
+        if self._descent_baseline_tick(now):
+            return True
         if self._reuse_tick(now):
             return True
         if self._grid_deadline_tick(now):
@@ -886,7 +1043,8 @@ class ContinuousTransport(StagedTransportTiming, TransportReuse, SdkTransport, T
                 self._diagnostic_finish('probe timed out; cause unresolved')
             return True
         if self.state in (self.TRANSPORT_PLANNING,self.TRANSPORT_VALIDATING):
-            if now-self.transport_started > 30:
+            if now-self.transport_started > getattr(
+                    self, 'transport_planning_timeout', 30.0):
                 self._fault('continuous transport planning/validation timed out')
             else:
                 self._poll_transport_timing()

@@ -1,0 +1,8 @@
+Package: ros-jazzy-cuda-python-placeholder
+Version: 0.0.0-0noble
+Architecture: all
+Maintainer: UF850 Experiment <noreply@localhost>
+Section: misc
+Priority: optional
+Description: Dependency marker for separately installed cuda-python 13.0.1
+ Matches the mechanism used in NVIDIA Isaac ROS CLI release-4.0.

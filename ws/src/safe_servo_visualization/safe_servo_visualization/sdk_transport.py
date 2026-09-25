@@ -17,27 +17,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from xarm_msgs.srv import MoveJoint
 
 from .transport_alternatives import buffer_transfer_waypoints, pose_message
-
-
-def nearest_equivalent_joints(goal, seed, names, limits):
-    """Choose bounded 2*pi-equivalent angles nearest the preceding UF arm state.
-
-    UF arm joints are revolute. Never wrap the measured seed or relax limits;
-    FK and the complete interpolated path are still validated downstream.
-    """
-    if len(goal) != len(names) or len(seed) != len(names):
-        raise ValueError('invalid IK joint layout')
-    chosen = []
-    for name, value, previous in zip(names, goal, seed):
-        lower, upper = limits[name][:2]
-        if (not all(math.isfinite(v) for v in (value, previous, lower, upper)) or
-                not lower <= value <= upper or not lower <= previous <= upper):
-            raise ValueError(f'IK/seed exceeds joint limits: {name}')
-        first = math.ceil((lower-value)/(2*math.pi))
-        last = math.floor((upper-value)/(2*math.pi))
-        candidates = [value+2*math.pi*k for k in range(first, last+1)]
-        chosen.append(min(candidates, key=lambda v: (abs(v-previous), abs(v-value))))
-    return tuple(chosen)
+from .joint_equivalence import nearest_equivalent_joints
 
 
 def joint_line(start, end, names, speed, acceleration):

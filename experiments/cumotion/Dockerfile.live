@@ -1,0 +1,14 @@
+FROM uf850-cumotion-test:4.0
+COPY install_live_launch.py /opt/cumotion-experiment/install_live_launch.py
+COPY patch_moveit_timeout.py /opt/cumotion-experiment/patch_moveit_timeout.py
+RUN python3 /opt/cumotion-experiment/install_live_launch.py
+RUN python3 /opt/cumotion-experiment/patch_moveit_timeout.py && \
+    source /opt/ros/jazzy/setup.bash && \
+    cd /opt/cumotion_plugin_src && \
+    colcon build --packages-select isaac_ros_cumotion_moveit \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DCMAKE_DISABLE_FIND_PACKAGE_isaac_ros_common=TRUE \
+      --install-base /opt/cumotion_plugin_overlay
+ENV ROS_DOMAIN_ID=0
+ENTRYPOINT []
+CMD ["bash", "/workspace/start.sh"]

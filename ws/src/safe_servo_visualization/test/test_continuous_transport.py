@@ -233,6 +233,23 @@ def test_timing_is_stretched_to_respect_limits():
     assert h.transport_checks[-1][1] == h.transport_duration
 
 
+def test_cartesian_relative_ratio_slows_only_cartesian_timing():
+    cartesian, cartesian_result = planned_harness()
+    cartesian.motion_speed_percent = 100.
+    cartesian.cartesian_transport_speed_ratio = .1
+    cartesian.transport_timing_source = 'cartesian'
+    cartesian._transport_planned(Future(cartesian_result))
+
+    moveit, moveit_result = planned_harness()
+    moveit.motion_speed_percent = 100.
+    moveit.cartesian_transport_speed_ratio = .1
+    moveit.transport_timing_source = 'moveit'
+    moveit._transport_planned(Future(moveit_result))
+
+    assert cartesian.transport_duration > moveit.transport_duration
+    assert moveit.transport_duration < 1.2  # Only its normal spline-limit repair.
+
+
 def test_position_limit_rejection():
     h,result = planned_harness()
     h.transport_joint_limits['joint2'] = (-.1,.15,2.)

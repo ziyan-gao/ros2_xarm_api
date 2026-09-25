@@ -404,6 +404,7 @@ def test_hung_ack_has_five_second_timeout_even_when_future_is_pending():
 
 def test_timed_pick_geometry_rejects_lateral_shortcut_below_container():
     node = Harness()
+    node.transport_local_clearance_validation_enabled = True
     node.transport_is_pick = True
     node.servo_bounds_mm = [0]*5 + [1000]
     node.transport_start_xyz = np.array([0., 0., .1])

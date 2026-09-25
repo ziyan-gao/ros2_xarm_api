@@ -7,6 +7,9 @@ set -eo pipefail
 
 source /opt/ros/jazzy/setup.bash
 source /opt/xarm_ws/install/setup.bash
+if [[ "${CUMOTION_LIVE_ENABLED:-false}" == true ]]; then
+  source /opt/cumotion_plugin_overlay/setup.bash
+fi
 
 cd /workspace/ws
 colcon build --symlink-install
@@ -27,9 +30,11 @@ set -u
 : "${PLACE_SINGULARITY_STEP_SPEED_MM_S:=10.0}"
 : "${DIRECT_CARTESIAN_MAX_SPEED_MM_S:=200.0}"
 : "${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2:=500.0}"
+: "${MOTION_SPEED_DEFAULT_PERCENT:=80.0}"
 : "${CONTINUOUS_TRANSPORT_ENABLED:=true}"
 : "${CONTINUOUS_RETURN_ENABLED:=true}"
 : "${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M:=0.04}"
+: "${CARTESIAN_TRANSPORT_SPEED_RATIO:=0.35}"
 : "${CONTINUOUS_TRANSPORT_MAX_JOINT_JERK_RAD_S3:=10.0}"
 : "${CONTINUOUS_TRANSPORT_ENFORCE_JERK_LIMIT:=false}"
 : "${RANDOM_LOADING_AUTO_START:=false}"
@@ -37,6 +42,11 @@ set -u
 : "${PICK_PLACE_TEST_SEED:=-1}"
 : "${RANDOM_LOADING_CONFIG_PATH:=/opt/neuromeka_bin_packing/configs/real_platform_random.yaml}"
 : "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M:=0.480}"
+: "${STAGING_SLOT_X_MIN_M:=-0.375}"
+: "${STAGING_SLOT_X_MAX_M:=0.375}"
+: "${STAGING_SLOT_Y_MIN_M:=0.180}"
+: "${STAGING_SLOT_Y_MAX_M:=0.680}"
+: "${STAGING_SLOT_SURFACE_Z_M:=0.0}"
 : "${PLACE_WORKSPACE_Z_MIN_MM:=-100.0}"
 : "${TRANSPORT_WORKSPACE_Z_MAX_MM:=800.0}"
 : "${RANDOM_LOADING_VISUALIZE:=true}"
@@ -134,6 +144,13 @@ echo "Real-time scheduling preflight passed."
 child_pids=()
 optional_pids=()
 
+if [[ "${TRANSPORT_MOVEIT_PIPELINE_ID:-ompl}" == "isaac_ros_cumotion" &&
+      "${CUMOTION_LIVE_ENABLED:-false}" != "true" ]]; then
+  echo "FATAL: isaac_ros_cumotion was selected, but the cuMotion live profile is disabled." >&2
+  echo "Start with: docker compose -f compose.yaml -f compose.cumotion.yaml up -d" >&2
+  exit 4
+fi
+
 start_required() {
   echo "Starting $1"
   shift
@@ -148,6 +165,48 @@ stop_children() {
   fi
 }
 trap stop_children EXIT INT TERM
+
+if [[ "${CUMOTION_LIVE_ENABLED:-false}" == true ]]; then
+  echo "Checking CUDA before starting any robot hardware"
+  python3 -c 'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; print("CUDA preflight passed:", torch.cuda.get_device_name(0))'
+  cumotion_ready_file=/tmp/cumotion-live.ready
+  rm -f "${cumotion_ready_file}"
+  export CUMOTION_READY_FILE="${cumotion_ready_file}"
+  # These values are shared with the motion/staging nodes below.  The virtual
+  # boxes exist only inside the cuMotion request; they are not inserted into
+  # MoveIt's global PlanningScene, so Cartesian approach/descent remains legal.
+  export CUMOTION_PALLET_CLEARANCE_Z_M="${TRANSFER_CORNER_HEIGHT_M}"
+  export CUMOTION_SLOT_CLEARANCE_Z_M="$(python3 -c \
+    'import sys; print(max(float(sys.argv[1]), float(sys.argv[2])))' \
+    "${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M}" "${TRANSFER_CORNER_HEIGHT_M}")"
+  export CUMOTION_SLOT_SURFACE_Z_M="${STAGING_SLOT_SURFACE_Z_M}"
+  export CUMOTION_SLOT_X_MIN_M="${STAGING_SLOT_X_MIN_M}"
+  export CUMOTION_SLOT_X_MAX_M="${STAGING_SLOT_X_MAX_M}"
+  export CUMOTION_SLOT_Y_MIN_M="${STAGING_SLOT_Y_MIN_M}"
+  export CUMOTION_SLOT_Y_MAX_M="${STAGING_SLOT_Y_MAX_M}"
+  start_required "cuMotion live-scene plan-only backend" \
+    bash /workspace/experiments/cumotion/start_live_backend.sh
+  cumotion_backend_pid="${child_pids[${#child_pids[@]}-1]}"
+  cumotion_ready_deadline=$((SECONDS + 120))
+  echo "Waiting for cuMotion initialization before connecting robot hardware"
+  while [[ ! -s "${cumotion_ready_file}" ]]; do
+    cumotion_backend_state="$(ps -o stat= -p "${cumotion_backend_pid}" 2>/dev/null || true)"
+    if [[ -z "${cumotion_backend_state}" || "${cumotion_backend_state}" == Z* ]]; then
+      set +e
+      wait "${cumotion_backend_pid}"
+      cumotion_backend_status=$?
+      set -e
+      echo "FATAL: cuMotion backend exited before readiness (status=${cumotion_backend_status})." >&2
+      exit 5
+    fi
+    if ((SECONDS >= cumotion_ready_deadline)); then
+      echo "FATAL: cuMotion backend did not become ready within 120 seconds." >&2
+      exit 6
+    fi
+    sleep 0.2
+  done
+  echo "cuMotion readiness preflight passed: $(<"${cumotion_ready_file}")"
+fi
 
 # This is a short-lived connection made before ros2_control connects. It does
 # not remain as a second robot owner once MoveIt starts.
@@ -190,6 +249,11 @@ start_required "six-slot unpacking staging coordinator" \
     -p slot_inspection_policy_config_path:="${POLICY_LOADING_CONFIG_PATH}" \
     -p slot_inspection_enabled:="${STAGING_SLOT_INSPECTION_ENABLED:-true}" \
     -p slot_inspection_backoff_m:="${STAGING_SLOT_INSPECTION_BACKOFF_M:-0.100}" \
+    -p slot_x_min_m:="${STAGING_SLOT_X_MIN_M}" \
+    -p slot_x_max_m:="${STAGING_SLOT_X_MAX_M}" \
+    -p slot_y_min_m:="${STAGING_SLOT_Y_MIN_M}" \
+    -p slot_y_max_m:="${STAGING_SLOT_Y_MAX_M}" \
+    -p slot_surface_z_m:="${STAGING_SLOT_SURFACE_Z_M}" \
     -p configured_container_clearance_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p transfer_item_bottom_above_pallet_m:="${STAGING_TRANSFER_BOTTOM_ABOVE_PALLET_M}"
 start_required "pickup pipeline orchestrator" \
@@ -206,8 +270,19 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p pallet_pickup_floor_z_m:=-0.050 \
     -p continuous_return_enabled:="${CONTINUOUS_RETURN_ENABLED}" \
     -p continuous_transport_blend_radius_m:="${CONTINUOUS_TRANSPORT_BLEND_RADIUS_M}" \
+    -p cartesian_transport_speed_ratio:="${CARTESIAN_TRANSPORT_SPEED_RATIO}" \
+    -p continuous_transport_planning_timeout_sec:="${CONTINUOUS_TRANSPORT_PLANNING_TIMEOUT_SEC:-75.0}" \
     -p continuous_transport_alternatives_enabled:="${CONTINUOUS_TRANSPORT_ALTERNATIVES_ENABLED:-true}" \
     -p transport_moveit_fallback_enabled:="${TRANSPORT_MOVEIT_FALLBACK_ENABLED:-false}" \
+    -p transport_moveit_primary_enabled:="${TRANSPORT_MOVEIT_PRIMARY_ENABLED:-false}" \
+    -p transport_moveit_direct_enabled:="${TRANSPORT_MOVEIT_DIRECT_ENABLED:-false}" \
+    -p transport_moveit_pipeline_id:="${TRANSPORT_MOVEIT_PIPELINE_ID:-ompl}" \
+    -p transport_moveit_planner_id:="${TRANSPORT_MOVEIT_PLANNER_ID:-RRTstar}" \
+    -p transport_moveit_clearance_constraint_enabled:="${TRANSPORT_MOVEIT_CLEARANCE_CONSTRAINT_ENABLED:-false}" \
+    -p transport_slot_clearance_z_m:="${TRANSPORT_SLOT_CLEARANCE_Z_M:-0.0}" \
+    -p transport_empty_tool_drop_m:="${TRANSPORT_EMPTY_TOOL_DROP_M:-0.030}" \
+    -p transport_max_payload_drop_m:="${TRANSPORT_MAX_PAYLOAD_DROP_M:-0.300}" \
+    -p transport_local_clearance_validation_enabled:="${TRANSPORT_LOCAL_CLEARANCE_VALIDATION_ENABLED:-false}" \
     -p transport_expanded_waypoints_enabled:="${TRANSPORT_EXPANDED_WAYPOINTS_ENABLED:-true}" \
     -p transport_waypoint_search_timeout_sec:="${TRANSPORT_WAYPOINT_SEARCH_TIMEOUT_SEC:-180.0}" \
     -p transport_observation_y_offset_mm:="${TRANSPORT_OBSERVATION_Y_OFFSET_MM:-200.0}" \
@@ -228,6 +303,7 @@ start_required "supervised Phase 4 pickup coordinator" \
     -p direct_transfer_ik_timeout_sec:="${DIRECT_TRANSFER_IK_TIMEOUT_SEC}" \
     -p direct_cartesian_max_speed_mm_s:="${DIRECT_CARTESIAN_MAX_SPEED_MM_S}" \
     -p direct_cartesian_max_acc_mm_s2:="${DIRECT_CARTESIAN_MAX_ACCEL_MM_S2}" \
+    -p initial_motion_speed_percent:="${MOTION_SPEED_DEFAULT_PERCENT}" \
     -p transfer_corner_height_m:="${TRANSFER_CORNER_HEIGHT_M}" \
     -p contact_reference_z_m:="${OBJECT_CONTACT_REFERENCE_Z_M}" \
     -p transport_workspace_z_max_mm:="${TRANSPORT_WORKSPACE_Z_MAX_MM}" \

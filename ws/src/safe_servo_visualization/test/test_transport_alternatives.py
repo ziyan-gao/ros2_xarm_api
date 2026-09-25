@@ -76,6 +76,7 @@ class Harness(ContinuousTransport):
         self.motion_speed_percent = 50.
         self.planning_group, self.ik_link_name = 'uf850', 'link_tcp'
         self.transport_motion_plan, self.transport_cartesian = Client(), Client()
+        self.compute_ik_client = Client()
         self.fk_calls = []
         self._transport_fk_request = lambda joints, callback: self.fk_calls.append((joints, callback))
         self._transport_pose = lambda result: result
@@ -367,6 +368,44 @@ def test_missing_observation_file_still_allows_moveit_candidate(tmp_path):
     assert h.transport_cartesian.calls
 
 
+def test_primary_moveit_constrains_tilt_and_keeps_exact_goal(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_primary_enabled = True
+    h.transport_moveit_fallback_enabled = False
+    h.alternative_seed = h.transport_seed
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    plan = h.transport_motion_plan.calls[-1][0].motion_plan_request
+    c = plan.path_constraints.orientation_constraints[0]
+    assert c.absolute_x_axis_tolerance == pytest.approx(math.pi / 6)
+    assert c.absolute_y_axis_tolerance == pytest.approx(math.pi / 6)
+    assert c.absolute_z_axis_tolerance == math.pi
+    assert plan.goal_constraints[0].orientation_constraints[0].absolute_z_axis_tolerance == .002
+
+
+def test_primary_retries_original_seed_and_stops_after_three(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_primary_enabled = True
+    h.transport_target = dict(pre_place_tcp_xyz_m=list(h.transport_end))
+    h._alternative_prepare = Mock()
+    for attempt in range(1, 4):
+        h.alternative_seed = (1., 2.)
+        h.alternative_parts = [trajectory()]
+        assert h._try_transport_alternative('descent rejected')
+        assert h.primary_moveit_attempt == attempt
+        assert h.alternative_seed == h.transport_seed
+        assert h.alternative_parts == []
+    assert h._try_transport_alternative('descent rejected')
+    assert h.state == 'FAULT'
+    assert h._alternative_prepare.call_count == 3
+
+
+def test_primary_does_not_retry_after_execution_starts(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_primary_enabled = True
+    h.direct_transfer_motion_started = True
+    assert not h._try_transport_alternative('execution failed')
+
+
 def test_moveit_request_is_plan_only_with_free_overhead_orientation(tmp_path):
     h = Harness(tmp_path)
     h.alternative_seed = (.1, .2)
@@ -376,7 +415,7 @@ def test_moveit_request_is_plan_only_with_free_overhead_orientation(tmp_path):
     assert plan.start_state.is_diff  # attached object retained
     assert list(plan.start_state.joint_state.position) == [.1, .2]
     assert plan.pipeline_id == 'ompl'
-    assert plan.planner_id == 'RRTConnectkConfigDefault'
+    assert plan.planner_id == 'RRTstar'
     assert plan.allowed_planning_time == 5.
     assert plan.max_velocity_scaling_factor == .5
     box = plan.path_constraints.position_constraints[0]
@@ -387,6 +426,142 @@ def test_moveit_request_is_plan_only_with_free_overhead_orientation(tmp_path):
     assert plan.goal_constraints[0].orientation_constraints[0].absolute_y_axis_tolerance == .002
     assert plan.goal_constraints[0].orientation_constraints[0].absolute_z_axis_tolerance == .002
     assert not h.validated
+
+
+def test_cumotion_request_has_complete_start_and_no_path_constraints(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    h.transport_moveit_planner_id = 'cuMotion'
+    h.transport_moveit_primary_enabled = True
+    h.direct_moveit_active = True
+    h.clearance_phase = 'transfer'
+    h.transport_moveit_clearance_constraint_enabled = True
+    h.alternative_seed = (.1, .2)
+    h.state_validity_client = Client()
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    assert not h.transport_motion_plan.calls
+    ik, pending = h.compute_ik_client.calls[-1]
+    assert ik.ik_request.avoid_collisions
+    assert ik.ik_request.robot_state.is_diff
+    assert list(ik.ik_request.robot_state.joint_state.position) == [.1, .2]
+    pending.value = NS(
+        error_code=NS(val=1),
+        solution=NS(joint_state=NS(name=['j2', 'j1'], position=[.4, .3])))
+    pending.callback(pending)
+    plan = h.transport_motion_plan.calls[-1][0].motion_plan_request
+    assert plan.pipeline_id == 'isaac_ros_cumotion'
+    assert plan.planner_id == 'cuMotion'
+    assert not plan.start_state.is_diff
+    assert list(plan.start_state.joint_state.position) == [.1, .2]
+    assert not plan.path_constraints.position_constraints
+    assert not plan.path_constraints.orientation_constraints
+    assert [c.position for c in plan.goal_constraints[0].joint_constraints] == [.3, .4]
+    assert not plan.goal_constraints[0].position_constraints
+    assert not plan.goal_constraints[0].orientation_constraints
+    assert not h.state_validity_client.calls
+    assert not h.validated
+
+
+def test_cumotion_endpoint_ik_failure_does_not_submit_planner(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    h.transport_moveit_planner_id = 'cuMotion'
+    h.transport_moveit_primary_enabled = True
+    h.direct_moveit_active = True
+    h.alternative_seed = (.1, .2)
+    h._alternative_failed = Mock()
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    _, pending = h.compute_ik_client.calls[-1]
+    pending.value = NS(error_code=NS(val=-31))
+    pending.callback(pending)
+    assert not h.transport_motion_plan.calls
+    h._alternative_failed.assert_called_once_with(
+        'MoveIt IK for cuMotion endpoint failed (code=-31)')
+
+
+def test_cumotion_endpoint_uses_nearest_bounded_equivalent_angles(tmp_path):
+    h = Harness(tmp_path)
+    h.arm_joint_names = ['joint4', 'joint6']
+    h.transport_joint_limits = {
+        name: (-2*math.pi, 2*math.pi, 2.) for name in h.arm_joint_names}
+    h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    h.transport_moveit_planner_id = 'cuMotion'
+    h.transport_moveit_primary_enabled = True
+    h.direct_moveit_active = True
+    h.alternative_seed = (-3.0, -1.38)
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    _, pending = h.compute_ik_client.calls[-1]
+    pending.value = NS(error_code=NS(val=1), solution=NS(
+        joint_state=NS(
+            name=['joint6', 'joint4'], position=[4.73, -2*math.pi+.01])))
+    pending.callback(pending)
+
+    constraints = h.transport_motion_plan.calls[-1][0].motion_plan_request \
+        .goal_constraints[0].joint_constraints
+    assert [constraint.position for constraint in constraints] == pytest.approx(
+        [.01, 4.73-2*math.pi])
+
+
+def test_cumotion_endpoint_ik_uses_narrowed_planner_limits(tmp_path):
+    h = Harness(tmp_path)
+    h.arm_joint_names = ['joint3', 'joint5']
+    h.transport_joint_limits = {
+        'joint3': (-math.pi, math.pi, 2.),
+        'joint5': (-math.pi, math.pi, 2.),
+    }
+    h.transport_cumotion_joint_limits = {
+        'joint3': (math.radians(-130), math.pi, 2.),
+        'joint5': (-math.pi, math.radians(40), 2.),
+    }
+    h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    h.transport_moveit_planner_id = 'cuMotion'
+    h.transport_moveit_primary_enabled = True
+    h.direct_moveit_active = True
+    h.alternative_seed = (-1., -1.)
+    h._alternative_failed = Mock()
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    request, pending = h.compute_ik_client.calls[-1]
+    constraints = {c.joint_name: c for c in
+                   request.ik_request.constraints.joint_constraints}
+    assert set(constraints) == {'joint3', 'joint5'}
+    for name, (lower, upper, _) in h.transport_cumotion_joint_limits.items():
+        constraint = constraints[name]
+        assert constraint.position-constraint.tolerance_below == pytest.approx(lower)
+        assert constraint.position+constraint.tolerance_above == pytest.approx(upper)
+
+    # Even if an IK plugin ignores constraints, the returned goal is rejected
+    # locally and never reaches cuMotion.
+    pending.value = NS(error_code=NS(val=1), solution=NS(
+        joint_state=NS(name=['joint3', 'joint5'], position=[-1., math.radians(69)])))
+    pending.callback(pending)
+    assert not h.transport_motion_plan.calls
+    assert 'joint5' in h._alternative_failed.call_args.args[0]
+
+
+def test_first_direct_cartesian_segment_initializes_timing_source(tmp_path):
+    h = Harness(tmp_path)
+    h.alternative_parts = []
+    h.alternative_seed = (0., 0.)
+    h.alternative_active_segment = ('cartesian', np.array([.3, -.6, .65]), h.transport_end_q)
+    h._transport_fk_request = Mock()
+    h._alternative_segment_ready(trajectory(a=(0., 0.), b=(.1, .2)))
+    assert h.alternative_part_kinds == ['cartesian']
+    h._transport_fk_request.assert_called_once()
+
+
+def test_cumotion_return_uses_saved_joint_goal(tmp_path):
+    h = Harness(tmp_path)
+    h.transport_moveit_pipeline_id = 'isaac_ros_cumotion'
+    h.transport_moveit_planner_id = 'cuMotion'
+    h.direct_moveit_active = h.transport_is_return = True
+    h.return_goal_joints = (.4, .5)
+    h.alternative_seed = (.1, .2)
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    plan = h.transport_motion_plan.calls[-1][0].motion_plan_request
+    goal = plan.goal_constraints[0]
+    assert [c.position for c in goal.joint_constraints] == [.4, .5]
+    assert not goal.position_constraints
+    assert not plan.path_constraints.orientation_constraints
 
 
 @pytest.mark.parametrize('limit', [0., 950.])
@@ -405,6 +580,69 @@ def test_transfer_ceiling_is_independent_of_contact_servo_bounds(tmp_path, limit
     assert h.servo_bounds_mm[5] == 800
     assert plan.goal_constraints[0].orientation_constraints
     assert not h.validated  # planning alone never authorizes execution
+
+
+def test_direct_moveit_has_no_waypoints_or_overhead_region(tmp_path):
+    h = Harness(tmp_path)
+    h.direct_moveit_active = True
+    h.transport_moveit_fallback_enabled = False
+    h.transport_moveit_primary_enabled = False
+    h.alternative_seed = (.1, .2)
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    plan = h.transport_motion_plan.calls[-1][0].motion_plan_request
+    assert not plan.path_constraints.position_constraints
+    assert plan.path_constraints.orientation_constraints[0].absolute_x_axis_tolerance == pytest.approx(math.pi / 6)
+    assert plan.path_constraints.orientation_constraints[0].absolute_y_axis_tolerance == pytest.approx(math.pi / 6)
+    assert plan.goal_constraints[0].position_constraints
+    assert not h.validated
+
+
+def test_direct_return_targets_saved_joint_configuration(tmp_path):
+    h = Harness(tmp_path)
+    h.direct_moveit_active = h.transport_is_return = True
+    h.return_goal_joints = (.4, .5)
+    h.alternative_seed = (.1, .2)
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    goal = h.transport_motion_plan.calls[-1][0].motion_plan_request.goal_constraints[0]
+    assert [c.position for c in goal.joint_constraints] == [.4, .5]
+    assert not goal.position_constraints
+
+
+def test_direct_rejection_does_not_fallback_to_waypoints(tmp_path):
+    h = Harness(tmp_path)
+    h.direct_moveit_active = True
+    assert h._try_transport_alternative('collision')
+    assert h.state == 'FAULT'
+    assert not h.fk_calls and not h.transport_motion_plan.calls
+
+
+@pytest.mark.parametrize('valid', [True, False])
+@pytest.mark.parametrize('height_constraint', [True, False, None])
+def test_direct_checks_exact_start_constraints_before_ompl(tmp_path, valid, height_constraint):
+    h = Harness(tmp_path)
+    h.direct_moveit_active = True
+    h.clearance_phase = 'transfer'
+    if height_constraint is not None:
+        h.transport_moveit_clearance_constraint_enabled = height_constraint
+    h.alternative_seed = (.1, .2)
+    h.alternative_current_xyz = np.array([.3, -.6, .62])
+    h.state_validity_client = Client()
+    h._alternative_moveit([.3, -.6, .65], h.transport_end_q)
+    assert not h.transport_motion_plan.calls
+    check, pending = h.state_validity_client.calls[0]
+    assert list(check.robot_state.joint_state.position) == [.1, .2]
+    assert check.robot_state.is_diff
+    assert bool(check.constraints.position_constraints) == bool(height_constraint)
+    assert check.constraints.orientation_constraints
+    pending.value = NS(valid=valid, contacts=[], constraint_result=[])
+    pending.callback(pending)
+    if valid:
+        plan = h.transport_motion_plan.calls[0][0].motion_plan_request
+        assert plan.path_constraints == check.constraints
+        assert plan.start_state == check.robot_state
+    else:
+        assert not h.transport_motion_plan.calls
+        assert h.state == 'FAULT'
 
 
 @pytest.mark.parametrize('state', ['TRANSPORT_EXECUTING', 'TRANSPORT_VERIFYING',

@@ -802,14 +802,26 @@ void SafeServoPanel::runPickPlaceTest(size_t index)
   }
   for (size_t i = 0; i < 4; ++i) {test_buttons_[i]->setEnabled(false);}
   test_buttons_[6]->setEnabled(false);
-  client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>(),
-    [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
-      const auto result = future.get();
-      const QString text = QString::fromStdString(result->message);
-      QMetaObject::invokeMethod(this, [this, text]() {
-        test_status_label_->setText(text);
-      }, Qt::QueuedConnection);
-    });
+  auto send_request = [this, client]() {
+      client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>(),
+        [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+          const auto result = future.get();
+          const QString text = QString::fromStdString(result->message);
+          QMetaObject::invokeMethod(this, [this, text]() {
+            test_status_label_->setText(text);
+          }, Qt::QueuedConnection);
+        });
+    };
+
+  // Motion tests must receive the current slider value before the service starts.
+  // Otherwise a freshly started supervisor can run at its minimum speed clamp.
+  if (index < 4 || index == 6) {
+    publishConfig();
+    publishMotionSpeed();
+    QTimer::singleShot(100, this, send_request);
+  } else {
+    send_request();
+  }
 }
 
 void SafeServoPanel::updatePickPlaceTest(const QString & payload)

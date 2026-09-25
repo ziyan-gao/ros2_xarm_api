@@ -11,16 +11,18 @@ from types import SimpleNamespace
 
 import numpy as np
 import yaml
-from geometry_msgs.msg import Pose
-from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint
-from moveit_msgs.srv import GetCartesianPath, GetMotionPlan
+from geometry_msgs.msg import Pose, PoseStamped
+from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint, JointConstraint
+from moveit_msgs.srv import GetCartesianPath, GetMotionPlan, GetPositionIK, GetStateValidity
 from shape_msgs.msg import SolidPrimitive
 from rclpy.duration import Duration
 
 from .transport_path import quaternion, rounded_translation_waypoints, buffer_transfer_waypoints
 from .transport_path import directed_slerp
 from .waypoint_search import GRID_SECONDS, next_grid
+from .joint_equivalence import nearest_equivalent_joints
 
+MOVEIT_TILT_TOLERANCE_RAD = math.radians(30.)
 
 # (base-frame X offset, rotation location). Fixed, bounded planning alternatives;
 # these are not assumed safe until the complete timed trajectory is checked.
@@ -173,6 +175,38 @@ class TransportAlternatives:
                 ('pickup_source' not in source and 'staging_slot' in source))
 
     def _init_transport_alternatives(self):
+        self.declare_parameter('transport_moveit_pipeline_id', 'ompl')
+        self.transport_moveit_pipeline_id = str(
+            self.get_parameter('transport_moveit_pipeline_id').value)
+        self.declare_parameter('transport_moveit_planner_id', 'RRTstar')
+        self.transport_moveit_planner_id = str(self.get_parameter('transport_moveit_planner_id').value)
+        self.declare_parameter('transport_moveit_clearance_constraint_enabled', False)
+        self.transport_moveit_clearance_constraint_enabled = bool(
+            self.get_parameter('transport_moveit_clearance_constraint_enabled').value)
+        self.declare_parameter('transport_moveit_direct_enabled', False)
+        self.transport_moveit_direct_enabled = bool(self.get_parameter('transport_moveit_direct_enabled').value)
+        self.declare_parameter('transport_slot_clearance_z_m', 0.)
+        self.transport_slot_clearance_z_m = float(self.get_parameter('transport_slot_clearance_z_m').value)
+        if not math.isfinite(self.transport_slot_clearance_z_m):
+            raise ValueError('transport_slot_clearance_z_m must be finite (0 inherits existing clearance)')
+        self.declare_parameter('transport_empty_tool_drop_m', .030)
+        self.transport_empty_tool_drop_m = float(
+            self.get_parameter('transport_empty_tool_drop_m').value)
+        if (not math.isfinite(self.transport_empty_tool_drop_m) or
+                not 0.0 <= self.transport_empty_tool_drop_m <= .200):
+            raise ValueError('transport_empty_tool_drop_m must be in [0, 0.2]')
+        self.declare_parameter('transport_max_payload_drop_m', .300)
+        self.transport_max_payload_drop_m = float(
+            self.get_parameter('transport_max_payload_drop_m').value)
+        if (not math.isfinite(self.transport_max_payload_drop_m) or
+                not 0.0 <= self.transport_max_payload_drop_m <= .500):
+            raise ValueError('transport_max_payload_drop_m must be in [0, 0.5]')
+        self.declare_parameter('transport_local_clearance_validation_enabled', False)
+        self.transport_local_clearance_validation_enabled = bool(
+            self.get_parameter('transport_local_clearance_validation_enabled').value)
+        self.declare_parameter('transport_moveit_primary_enabled', False)
+        self.transport_moveit_primary_enabled = bool(
+            self.get_parameter('transport_moveit_primary_enabled').value)
         self.declare_parameter('transport_moveit_fallback_enabled', False)
         self.transport_moveit_fallback_enabled = bool(
             self.get_parameter('transport_moveit_fallback_enabled').value)
@@ -215,6 +249,13 @@ class TransportAlternatives:
         self.transport_route_generation = 0
 
     def _try_transport_alternative(self, reason, observation_first=False):
+        if getattr(self, 'direct_moveit_active', False):
+            self._fault('direct MoveIt path rejected; no interpolation fallback: ' + reason)
+            return True
+        if (getattr(self, 'transport_moveit_primary_enabled', False) and
+                not getattr(self, 'transport_is_pick', False) and
+                not getattr(self, 'transport_is_return', False)):
+            return self._try_primary_moveit(reason)
         if (observation_first and (self.transport_route_attempt != 0 or
                                   self.state != self.TRANSPORT_PLANNING)):
             return False
@@ -296,6 +337,7 @@ class TransportAlternatives:
         self.transport_descent_time = None
         self.state = self.TRANSPORT_PLANNING
         self.alternative_parts = []
+        self.alternative_part_kinds = []
         self.alternative_seed = tuple(self.transport_seed)
         if getattr(self, 'raised_pre_place_offset_m', 0.) > 0:
             self.transport_end = np.array(self.transport_target['pre_place_tcp_xyz_m'], dtype=float)
@@ -322,6 +364,40 @@ class TransportAlternatives:
                 if not self.transport_motion_plan.service_is_ready():
                     raise ValueError('MoveIt motion planning service unavailable')
                 self._alternative_prepare(None)
+        except Exception as exc:
+            self._alternative_failed(str(exc))
+        return True
+
+    def _try_primary_moveit(self, reason):
+        """Plan complete lift/transfer/descent candidates without moving between trials."""
+        if (self.state not in (self.TRANSPORT_PLANNING, self.TRANSPORT_VALIDATING,
+                               self.TRANSPORT_DIAGNOSING) or
+                getattr(self, 'direct_transfer_motion_started', False) or
+                getattr(self, 'transfer_goal_handle', None) is not None or
+                not getattr(self, 'transport_scene', {}).get('attached_item_id')):
+            return False
+        attempt = getattr(self, 'primary_moveit_attempt', 0) + 1
+        self.primary_moveit_attempt = attempt
+        if attempt > 3:
+            self._fault('constrained MoveIt transport exhausted 3 complete-path trials: ' + reason)
+            return True
+        self.transport_route_attempt = 2
+        self.transport_route_generation += 1
+        self.transport_started = time.monotonic()
+        self.transport_descent_time = None
+        self.alternative_diagnostic_pending = False
+        self.alternative_parts = []
+        self.alternative_part_kinds = []
+        self.alternative_seed = tuple(self.transport_seed)
+        self.transport_end = np.array(self.transport_target['pre_place_tcp_xyz_m'], dtype=float)
+        self.raised_pre_place_offset_m = 0.
+        self.state = self.TRANSPORT_PLANNING
+        self.get_logger().info(f'constrained MoveIt complete-path trial {attempt}/3: {reason}')
+        try:
+            if not self.transport_motion_plan.service_is_ready():
+                self._fault('MoveIt motion planning service unavailable')
+                return True
+            self._alternative_prepare(None)
         except Exception as exc:
             self._alternative_failed(str(exc))
         return True
@@ -409,6 +485,8 @@ class TransportAlternatives:
                     self._sdk_validate_trajectory(trajectory)
                     return
                 self.get_logger().info('complete alternative planned; validating the full timed path before execution')
+                kinds = set(getattr(self, 'alternative_part_kinds', []))
+                self.transport_timing_source = 'moveit' if kinds == {'moveit'} else 'cartesian'
                 result = SimpleNamespace(error_code=SimpleNamespace(val=1), fraction=1.,
                                          solution=SimpleNamespace(joint_trajectory=trajectory))
                 self._transport_planned(SimpleNamespace(result=lambda: result))
@@ -473,6 +551,8 @@ class TransportAlternatives:
             if (result is None or result.error_code.val != 1 or
                     not math.isfinite(result.fraction) or not 1-1e-6 <= result.fraction <= 1.):
                 fraction = None if result is None else result.fraction
+                if getattr(self, 'direct_moveit_active', False):
+                    raise ValueError(f'mandatory lift incomplete (fraction={fraction}); no transfer executed')
                 if self._partial_is_final_descent(result) and self._try_raised_pre_place():
                     return
                 if (result is not None and result.error_code.val == 1 and
@@ -521,7 +601,8 @@ class TransportAlternatives:
         No partial trajectory is executed. The combined candidate still passes
         the normal timed-path collision and geometry checks.
         """
-        if (self.transport_route_attempt not in (1, 2) or self.alternative_segments or
+        if (getattr(self, 'transport_moveit_primary_enabled', False) or
+                self.transport_route_attempt not in (1, 2) or self.alternative_segments or
                 getattr(self, 'transport_is_pick', False) or
                 getattr(self, 'transport_is_return', False) or
                 getattr(self, 'transport_target', {}).get('transfer_context') != 'pallet' or
@@ -572,6 +653,10 @@ class TransportAlternatives:
                for i, v in zip(indices, self.alternative_seed)) > 1e-6:
             raise ValueError('alternative planner changed its requested joint start')
         self.alternative_parts.append(copy.deepcopy(trajectory))
+        if not hasattr(self, 'alternative_part_kinds'):
+            self.alternative_part_kinds = []
+        self.alternative_part_kinds.append(
+            getattr(self, 'alternative_active_segment', ('cartesian',))[0])
         self.alternative_seed = tuple(trajectory.points[-1].positions[i] for i in indices)
         # Use actual segment endpoint FK, not the requested pose, for the next leg.
         self._transport_fk_request(self.alternative_seed, self._alternative_segment_fk)
@@ -592,16 +677,22 @@ class TransportAlternatives:
         return math.inf if limit == 0 else limit/1000.
 
     def _alternative_moveit(self, xyz, q):
-        if not getattr(self, 'transport_moveit_fallback_enabled', False):
+        if not (getattr(self, 'transport_moveit_fallback_enabled', False) or
+                getattr(self, 'transport_moveit_primary_enabled', False) or
+                getattr(self, 'direct_moveit_active', False)):
             raise ValueError('MoveIt sampling-planner fallback is disabled')
         req = GetMotionPlan.Request()
         plan = req.motion_plan_request
         plan.group_name = self.planning_group
-        plan.pipeline_id, plan.planner_id = 'ompl', 'RRTConnectkConfigDefault'
+        plan.pipeline_id = getattr(self, 'transport_moveit_pipeline_id', 'ompl')
+        plan.planner_id = getattr(self, 'transport_moveit_planner_id', 'RRTstar')
+        use_cumotion = plan.pipeline_id == 'isaac_ros_cumotion'
         plan.allowed_planning_time, plan.num_planning_attempts = 5., 3
         scale = max(.05, min(1., self.motion_speed_percent/100))
         plan.max_velocity_scaling_factor = plan.max_acceleration_scaling_factor = scale
-        plan.start_state.is_diff = True
+        # The live cuMotion adapter requires an explicit complete joint start.
+        # OMPL retains the historical differential state for scene merging.
+        plan.start_state.is_diff = not use_cumotion
         plan.start_state.joint_state.name = list(self.arm_joint_names)
         plan.start_state.joint_state.position = list(self.alternative_seed)
 
@@ -626,6 +717,35 @@ class TransportAlternatives:
         goal.position_constraints = [position(sphere, xyz)]
         goal.orientation_constraints = [orientation(.002, .002)]
         plan.goal_constraints = [goal]
+        if (getattr(self, 'direct_moveit_active', False) and
+                getattr(self, 'transport_is_return', False)):
+            goal = Constraints()
+            goal.joint_constraints = [JointConstraint(
+                joint_name=n, position=float(v), tolerance_above=1e-5,
+                tolerance_below=1e-5, weight=1.)
+                for n, v in zip(self.arm_joint_names, self.return_goal_joints)]
+            plan.goal_constraints = [goal]
+        # cuMotion 4.0 does not implement MoveIt path_constraints. Never send
+        # constraints that its action server would either reject or ignore.
+        # Exact endpoint constraints, scene collision checking and the existing
+        # complete-trajectory validation remain active.
+        if use_cumotion:
+            self.get_logger().info(
+                'cuMotion transport request: path constraints disabled; '
+                'resolving the exact endpoint with MoveIt IK before joint-space planning')
+            # cuMotion's pose-goal adapter runs its own batched IK.  On the real
+            # UF850 it can report IK_FAIL for a pose that MoveIt/KDL and the
+            # robot can reach.  Resolve the same collision-aware pose once from
+            # the measured branch, then give cuMotion the resulting joint goal.
+            # Endpoint FK verification below still enforces the requested TCP
+            # pose, so this does not weaken the geometric acceptance criteria.
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'transport_is_return', False)):
+                self._submit_moveit_request(req)
+                return
+            self._cumotion_resolve_joint_goal(req, xyz, q)
+            return
+
         # Free orientation only on this overhead leg. Its exact goal orientation
         # is still required before the fixed-orientation Cartesian descent.
         # Rotated carried-item corner clearance is checked on the final spline;
@@ -636,16 +756,163 @@ class TransportAlternatives:
             # Ten metres is beyond this fixed-base UF arm's reachable workspace;
             # it is not an execution ceiling. Joint/collision checks still apply.
             ceiling = floor + 10.
-        if floor >= ceiling:
+        if floor >= ceiling and not getattr(self, 'direct_moveit_active', False):
             raise ValueError('no overhead workspace for MoveIt transfer')
+        if getattr(self, 'direct_moveit_active', False):
+            ceiling = floor + 10.  # Region below is discarded for direct planning.
         region = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[4., 4., ceiling-floor])
         plan.path_constraints.position_constraints = [position(region, [0., 0., (floor+ceiling)/2])]
         plan.path_constraints.orientation_constraints = []
+        if (getattr(self, 'transport_moveit_primary_enabled', False) or
+                getattr(self, 'direct_moveit_active', False)):
+            # Rotation-vector X/Y constrain tilt in the reference frame; Z is free.
+            # Final endpoint still has the exact grasp-derived placement orientation.
+            plan.path_constraints.orientation_constraints = [orientation(MOVEIT_TILT_TOLERANCE_RAD, math.pi)]
+        if getattr(self, 'direct_moveit_active', False):
+            # Direct planning has no forced overhead segment. Scene geometry,
+            # including the attached camera/payload, defines the free space.
+            plan.path_constraints.position_constraints = []
+            if (getattr(self, 'transport_moveit_clearance_constraint_enabled', False) and
+                    getattr(self, 'clearance_phase', None) == 'transfer' and
+                    not getattr(self, 'transport_is_return', False)):
+                floor = self.transport_safe_z
+                ceiling = self._transport_ceiling()
+                if math.isinf(ceiling):
+                    ceiling = floor + 10.
+                if ceiling <= floor:
+                    raise ValueError('no clearance workspace for MoveIt')
+                region = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[4., 4., ceiling-floor])
+                plan.path_constraints.position_constraints = [position(region, [0., 0., (floor+ceiling)/2])]
+            if getattr(self, 'transport_is_return', False):
+                goal = Constraints()
+                goal.joint_constraints = [JointConstraint(
+                    joint_name=n, position=float(v), tolerance_above=1e-5,
+                    tolerance_below=1e-5, weight=1.)
+                    for n, v in zip(self.arm_joint_names, self.return_goal_joints)]
+                plan.goal_constraints = [goal]
         self.get_logger().info(
-            'MoveIt overhead fallback: free path orientation; exact destination orientation retained; '
+            f'MoveIt pipeline={plan.pipeline_id}, planner={plan.planner_id}; '
+            f'constrained tilt={bool(plan.path_constraints.orientation_constraints)}; '
+            'exact destination orientation retained; '
             f'transfer TCP ceiling={self._transport_ceiling()} m (inf=disabled)')
+        if (getattr(self, 'direct_moveit_active', False) and
+                not getattr(self, 'transport_moveit_clearance_constraint_enabled', False)):
+            plan.path_constraints.position_constraints = []
+        self.get_logger().info(
+            f'MoveIt path clearance constraint={bool(plan.path_constraints.position_constraints)}; '
+            'collision checking and clearance endpoints retained')
+        if (getattr(self, 'direct_moveit_active', False) and
+                getattr(self, 'clearance_phase', None) == 'transfer'):
+            # Ask MoveIt to evaluate the SAME measured start and constraints,
+            # including collision, before starting OMPL's search.
+            if not self.state_validity_client.service_is_ready():
+                raise ValueError('MoveIt start-state validation service unavailable')
+            check = GetStateValidity.Request()
+            check.robot_state = copy.deepcopy(plan.start_state)
+            check.group_name = self.planning_group
+            check.constraints = copy.deepcopy(plan.path_constraints)
+            self.state_validity_client.call_async(check).add_done_callback(
+                self._transport_guard(lambda f: self._moveit_start_validated(f, req)))
+        else:
+            self._submit_moveit_request(req)
+
+    def _cumotion_resolve_joint_goal(self, motion_request, xyz, q):
+        if not self.compute_ik_client.service_is_ready():
+            raise ValueError('MoveIt compute_ik service unavailable for cuMotion goal')
+        request = GetPositionIK.Request()
+        ik = request.ik_request
+        ik.group_name = self.planning_group
+        ik.ik_link_name = self.ik_link_name
+        ik.robot_state.is_diff = True
+        ik.robot_state.joint_state.name = list(self.arm_joint_names)
+        ik.robot_state.joint_state.position = list(map(float, self.alternative_seed))
+        ik.avoid_collisions = True
+        planning_limits = (getattr(self, 'transport_cumotion_joint_limits', None)
+                           or self.transport_joint_limits)
+        # MoveIt's IK model still contains the physical limits. Constrain its
+        # search to the narrower cuMotion-only interval so a geometrically
+        # valid but planner-invalid solution (for example J5=69 deg when the
+        # cuMotion maximum is 40 deg) is never submitted to the GPU backend.
+        ik.constraints.joint_constraints = []
+        for name in self.arm_joint_names:
+            lower, upper = planning_limits[name][:2]
+            physical_lower, physical_upper = self.transport_joint_limits[name][:2]
+            if abs(lower-physical_lower) <= 1e-9 and abs(upper-physical_upper) <= 1e-9:
+                continue
+            center = (lower+upper)/2
+            half_range = (upper-lower)/2
+            ik.constraints.joint_constraints.append(JointConstraint(
+                joint_name=name, position=center,
+                tolerance_below=half_range, tolerance_above=half_range, weight=1.))
+        ik.pose_stamped = PoseStamped()
+        ik.pose_stamped.header.frame_id = 'link_base'
+        ik.pose_stamped.pose = pose_message(xyz, q)
+        seconds = max(.001, float(getattr(self, 'direct_transfer_ik_timeout', 2.)))
+        ik.timeout.sec = int(seconds)
+        ik.timeout.nanosec = int((seconds-int(seconds))*1e9)
+        self.compute_ik_client.call_async(request).add_done_callback(
+            self._transport_guard(
+                lambda future: self._cumotion_goal_ik_received(future, motion_request)))
+
+    def _cumotion_goal_ik_received(self, future, motion_request):
+        try:
+            response = future.result()
+            if response is None or response.error_code.val != 1:
+                code = None if response is None else response.error_code.val
+                raise ValueError(f'MoveIt IK for cuMotion endpoint failed (code={code})')
+            names = list(response.solution.joint_state.name)
+            positions = list(response.solution.joint_state.position)
+            by_name = dict(zip(names, positions))
+            missing = [name for name in self.arm_joint_names if name not in by_name]
+            if missing:
+                raise ValueError(f'MoveIt IK omitted arm joints: {missing}')
+            raw_goal_positions = [
+                float(by_name[name]) for name in self.arm_joint_names]
+            if not all(math.isfinite(value) for value in raw_goal_positions):
+                raise ValueError('MoveIt IK returned non-finite arm joints')
+            planning_limits = (getattr(self, 'transport_cumotion_joint_limits', None)
+                               or self.transport_joint_limits)
+            goal_positions = nearest_equivalent_joints(
+                raw_goal_positions, self.alternative_seed,
+                self.arm_joint_names, planning_limits)
+            wrapped = [
+                name for name, raw, selected in zip(
+                    self.arm_joint_names, raw_goal_positions, goal_positions)
+                if abs(raw-selected) > 1e-6]
+            goal = Constraints()
+            goal.joint_constraints = [JointConstraint(
+                joint_name=name, position=value, tolerance_above=1e-5,
+                tolerance_below=1e-5, weight=1.)
+                for name, value in zip(self.arm_joint_names, goal_positions)]
+            plan = motion_request.motion_plan_request
+            plan.goal_constraints = [goal]
+            self.get_logger().info(
+                'MoveIt IK resolved cuMotion endpoint; selected nearest bounded '
+                f'equivalent joint branch (wrapped={wrapped}); submitting '
+                'collision-aware joint goal')
+            self._submit_moveit_request(motion_request)
+        except Exception as exc:
+            self._alternative_failed(str(exc))
+
+    def _submit_moveit_request(self, req):
         self.transport_motion_plan.call_async(req).add_done_callback(
             self._transport_guard(self._alternative_moveit_received))
+
+    def _moveit_start_validated(self, future, req):
+        try:
+            result = future.result()
+            if result is None or not result.valid:
+                contacts = [(c.contact_body_1, c.contact_body_2)
+                            for c in getattr(result, 'contacts', [])]
+                failed = [i for i, c in enumerate(getattr(result, 'constraint_result', []))
+                          if not c.result]
+                raise ValueError(f'MoveIt measured start rejected before search: '
+                                 f'contacts={contacts}, failed_constraints={failed}; '
+                                 f'TCP Z={self.alternative_current_xyz[2]:.6f} m, '
+                                 f'clearance floor={self.transport_safe_z:.6f} m')
+            self._submit_moveit_request(req)
+        except Exception as exc:
+            self._alternative_failed(str(exc))
 
     def _alternative_moveit_received(self, future):
         try:
@@ -654,6 +921,11 @@ class TransportAlternatives:
             if result is None or result.error_code.val != 1:
                 code = None if result is None else result.error_code.val
                 raise ValueError(f'MoveIt overhead planning failed (code={code})')
-            self._alternative_segment_ready(result.trajectory.joint_trajectory)
+            if (getattr(self, 'direct_moveit_active', False) and
+                    getattr(self, 'transport_is_return', False)):
+                self._transport_planned(SimpleNamespace(result=lambda: SimpleNamespace(
+                    error_code=SimpleNamespace(val=1), fraction=1., solution=result.trajectory)))
+            else:
+                self._alternative_segment_ready(result.trajectory.joint_trajectory)
         except Exception as exc:
             self._alternative_failed(str(exc))

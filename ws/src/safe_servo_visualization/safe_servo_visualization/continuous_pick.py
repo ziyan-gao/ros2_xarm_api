@@ -310,12 +310,20 @@ class ContinuousPick:
             return
         try:
             self.pick_observation_xyz, _ = self._transport_pose(future.result())
-            self.get_logger().info('observation-side waypoint available; selecting route from current TCP area')
+            if getattr(self, 'transport_moveit_direct_enabled', False):
+                self.get_logger().info(
+                    'observation waypoint metadata available; direct planner will route from '
+                    'the measured current pose without inserting that waypoint')
+            else:
+                self.get_logger().info(
+                    'observation-side waypoint available; selecting route from current TCP area')
             self._transport_fk_request(self.transport_seed, self._transport_start_fk)
         except Exception as exc:
             self._fault(f'buffer approach observation FK failed: {exc}')
 
     def _try_pick_grid(self):
+        if getattr(self, 'direct_moveit_active', False):
+            return False
         if (not getattr(self, 'transport_is_pick', False) or
                 not getattr(self, 'pick_cross_area', False) or
                 self.state not in (self.TRANSPORT_PLANNING, self.TRANSPORT_DIAGNOSING, self.TRANSPORT_VALIDATING) or

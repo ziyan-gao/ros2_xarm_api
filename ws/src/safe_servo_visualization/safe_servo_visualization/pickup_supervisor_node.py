@@ -97,6 +97,7 @@ class PickupSupervisor(ContinuousTransport, Node):
         self.declare_parameter('retreat_acc_mm_s2', 200.0)
         self.declare_parameter('direct_cartesian_max_speed_mm_s', 200.0)
         self.declare_parameter('direct_cartesian_max_acc_mm_s2', 500.0)
+        self.declare_parameter('initial_motion_speed_percent', 80.0)
         self.declare_parameter('ros2_control_mode', 1)
         self.declare_parameter('trajectory_controller', 'uf850_traj_controller')
         self.declare_parameter('joint_state_broadcaster', 'joint_state_broadcaster')
@@ -215,7 +216,14 @@ class PickupSupervisor(ContinuousTransport, Node):
             p('direct_cartesian_max_speed_mm_s'))
         self.direct_cartesian_max_acc = float(
             p('direct_cartesian_max_acc_mm_s2'))
-        self.motion_speed_percent = 0.0
+        self.motion_speed_percent = float(p('initial_motion_speed_percent'))
+        if not math.isfinite(self.motion_speed_percent):
+            self.motion_speed_percent = 80.0
+        self.motion_speed_percent = min(
+            100.0, max(5.0, self.motion_speed_percent))
+        initial_speed_scale = self.motion_speed_percent / 100.0
+        self.retreat_speed = self.direct_cartesian_max_speed * initial_speed_scale
+        self.retreat_acc = self.direct_cartesian_max_acc * initial_speed_scale
         self.ros2_control_mode = int(p('ros2_control_mode'))
         self.trajectory_controller = str(p('trajectory_controller'))
         self.joint_state_broadcaster = str(p('joint_state_broadcaster'))

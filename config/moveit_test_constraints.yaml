@@ -1,0 +1,19 @@
+# RViz named path constraint: load with save_constraints --ros-args --params-file ...
+# This file does not affect the automatic packing pipeline.
+save_test_constraints:
+  ros__parameters:
+    warehouse_plugin: warehouse_ros_sqlite::DatabaseConnection
+    warehouse_host: /workspace/results/moveit_warehouse.sqlite
+    warehouse_port: 33829
+    robot: UF_ROBOT
+    group: uf850
+    # Separate name preserves the existing orientation-only constraint.
+    constraint_name: tcp_down_yaw_free_clearance
+    overwrite: true
+    tilt_tolerance_rad: 0.5235987755982988 # X/Y +/-30 degrees, yaw free
+    clearance_constraint_enabled: false
+    # Absolute link_tcp Z in link_base, metres; NOT the carried box bottom.
+    # Example from the latest trial; adjust for the current scene/payload.
+    # BOTH the start and goal must be inside this interval.
+    tcp_min_z_m: 0.4364
+    tcp_max_z_m: 10.4364

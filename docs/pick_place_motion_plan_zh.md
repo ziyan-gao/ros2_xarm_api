@@ -1115,3 +1115,61 @@ pre-pick 位姿不会被旧目标覆盖，起点和终点连接仍重新规划�
 也不替换跨区候选搜索、inspection、缓存连接和 SDK 路径。分段失败或超时会报错，
 不会自动重试动作或释放物品。日志关键字为 `planning staged transport timing once`。
 修改后需在机器人停止时重新构建并重启相关节点；目前仅完成离线验证。
+# 实验分支：MoveIt 高处搬运主规划
+
+`TRANSPORT_MOVEIT_PRIMARY_ENABLED=true` 在下次启动时启用携物搬运的实验模式；默认值为 false，可恢复原有 waypoint 模式。不会改变空手接近、观察或释放后返回流程。
+
+先规划固定朝向的竖直抬升，再调用 OMPL RRTConnect 规划高处搬运，最后从规划所得的实际关节构型规划固定朝向下降到原始 pre-place。三段全部成功后才进行原有整体计时、碰撞、关节限制、携物净空和终点校验，再执行。不会先执行抬升再尝试规划余下路径。
+
+高处使用旋转向量姿态约束，X/Y 容差 ±30°（π/6 rad），Z 允许 yaw 变化；终点仍要求抓取变换决定的准确放置朝向。路径下限仍由携物安全高度决定。禁止通过抬高 pre-place 掩盖下降失败。失败时从原始测量关节状态重新规划完整路径，最多三次；每次 OMPL 请求的 allowed_planning_time 为 5 秒（不包含其他服务、计时和校验耗时）。执行开始后不通过此模式重试。
+
+这只是第一阶段实验：尚未加入 Jacobian 奇异性评分或显式多 IK 分支排序，也不保证后续接触 Servo 一定可达。下降预检仅覆盖高处到 pre-place；不能将离线测试通过视为实机奇异性问题已解决。实机试验前需要重新启动加载参数，先以低速验证。
+# 实验：直接 MoveIt transfer
+
+自动搬运及共用返回/接近的 MoveIt 请求使用 `.env` 的
+`TRANSPORT_MOVEIT_PLANNER_ID=RRTstar`（RRT*）。UF850 配置已注册此 ID。
+改回 `RRTConnect` 可做对比；需要重新创建容器加载环境变量。
+RViz 手动 Plan 的 planner 仍需在面板单独选择，不受此环境变量控制。
+
+独立 Cartesian 下降段在发送执行目标前采集静止 Fz 基线：至少 5 个新样本，
+覆盖至少 0.2 秒，最近样本不超过 0.1 秒（并满足 force timeout），窗口极差不超过 1 N。
+使用中位数作为基线，0 N 是有效值；采样时关节变化超过 0.001 rad 会重置窗口。
+等待超过 3 秒停止，不以零值代替缺失读数；执行前再次检查反馈、起点和场景。
+下降第一帧即相对该基线检测力变化，原有接触阈值不变。
+
+对比测试净空路径约束：在 `.env` 设置
+`TRANSPORT_MOVEIT_CLEARANCE_CONSTRAINT_ENABLED=false` 并重新创建容器以加载环境变量。
+默认 false。仅用于此直接/分阶段 MoveIt 模式；关闭后，搬运途中不再强制净空高度下界，
+计时后的搬运净空检查也同步关闭，但碰撞检查、±30°姿态约束、工作空间上限、
+源/目标净空位、竖直抬升与最终直线下降均保留。关闭前应确认场景障碍完整。
+此项不是 `keep_eef_perpendicular_to_pallet`，也不会更改 RViz 保存的命名约束。
+
+`TRANSPORT_MOVEIT_DIRECT_ENABLED=true` 时，先保持当前姿态竖直抬升到源区域净空，
+执行并验证到位后，使用新鲜实测关节状态规划 MoveIt 到目标区域上方净空。
+到位后再次使用实测状态规划固定姿态的 Cartesian 竖直下降到 pre-pick/pre-place，
+随后仍由原有 Servo 流程完成接触。各段单独规划、校验及执行，失败即停止，不跳过任何阶段。
+此模式也覆盖空手取 slot/pallet 物体前的接近；返回观察位在抬升后用 MoveIt 到保存的观察关节目标。
+源和目标净空分别计算，携物时按附着物底部换算 TCP 高度，不能仅使用 TCP Z。
+源/目标净空位额外留 10 mm 高度余量；默认不限制中间 MoveIt 路径的高度。
+仅手动重新启用高度路径约束时，其下界按原最低净空计算，
+避免实测到位误差使起点落在允许区域之外。提交 OMPL 前，通过 GetStateValidity
+检查相同关节起点、碰撞场景和路径约束；拒绝时报告碰撞对象、失败约束索引及 TCP Z/净空下界，
+不通过降低碰撞要求或移动约束下界来放行。
+slot 可用 `.env` 的 `TRANSPORT_SLOT_CLEARANCE_Z_M` 单独设置：单位米、机器人基坐标系下的绝对净空平面高度，
+不是相对槽面偏移，也不是 TCP 高度。默认 0 表示继承原有净空（未确认实际槽区安全高度前不自动降低）。
+Pallet 继续使用原 `transport_corner_clearance_z_m`。未知空手源区域保守使用原净空；
+本流程成功完成后的区域会被记录用于下一次接近。净空不能取代场景碰撞检查。
+不插入 observation/rail 绕行点。返回观察位也使用 MoveIt，
+但放置后的慢速脱离动作保留。接触下降和 pickup approach 不在本次替换范围。
+规划失败或轨迹验证失败会停止，不回退到 waypoint/SDK 插值。
+
+使用 RRTConnect；路径旋转向量 X/Y 倾斜容差为 ±30°（π/6 rad），yaw 可变化，放置终点保持目标姿态。计时后的姿态校验使用同一容差；这不是放置终点的姿态容差。
+返回观察位使用保存的关节目标。规划及计时后的采样轨迹均检查碰撞。
+直接模式不再强制整段位于全局高空平面，因此必须先启用
+`config/pallet_place_config.yaml` 的 `add_placed_item_obstacle: true`，
+并确认场景中的箱体与实物一致；缺少场景就绪标志时拒绝规划。
+
+相机为 D435i，仅加入约 90 × 25 × 25.05 mm 盒体，不包括支架。
+依据官方 ROS 模型，中心位于 camera_link 的 `(0, -17.5, 0)` mm；
+通过标定 TF 转到 link_eef 并附着，不能把光学中心直接当机身中心。
+参考：https://github.com/realsenseai/realsense-ros/blob/ros2-master/realsense2_description/urdf/_d435.urdf.xacro

@@ -1,0 +1,27 @@
+# Opt-in real-state/real-scene profile. Same driver and controller; no duplicate owner.
+services:
+  ros2_cv:
+    image: uf850-cumotion-live:4.0
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    build:
+      context: ./experiments/cumotion
+      dockerfile: Dockerfile.live
+    environment:
+      - CUMOTION_LIVE_ENABLED=true
+      - CUMOTION_DEFAULT_PLANNING_PIPELINE=isaac_ros_cumotion
+      - CUMOTION_ALLOW_TRAJECTORY_EXECUTION=true
+      - CUMOTION_PARALLEL_FINETUNE=${CUMOTION_PARALLEL_FINETUNE:-false}
+      - CUMOTION_CLEARANCE_BARRIERS_ENABLED=${CUMOTION_CLEARANCE_BARRIERS_ENABLED:-true}
+      - CUMOTION_SLOT_CLEARANCE_Z_M=${CUMOTION_SLOT_CLEARANCE_Z_M:-0.480}
+      - CUMOTION_BARRIER_TOP_MARGIN_M=${CUMOTION_BARRIER_TOP_MARGIN_M:-0.003}
+      # Avoid allocator fragmentation when the camera/payload collision model
+      # is rebuilt after attach/detach operations.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - ROS_DOMAIN_ID=0

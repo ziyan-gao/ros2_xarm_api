@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-rmw-cyclonedds-cpp \
     ros-jazzy-realsense2-camera \
     ros-jazzy-moveit \
+    ros-jazzy-warehouse-ros-sqlite \
     ros-jazzy-moveit-servo \
     ros-jazzy-pilz-industrial-motion-planner \
     ros-jazzy-ros2-control \

@@ -5,6 +5,8 @@ import time
 
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import Point, Pose, PoseStamped
+from moveit_msgs.msg import MoveItErrorCodes
+from moveit_msgs.srv import GetPositionIK
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -89,6 +91,10 @@ class MotionCoordinator(Node):
         self.keep_eef_perpendicular = True
         self.place_target_xyz = None
         self.planned_pregrasp = None
+        # A top suction grasp is symmetric under a 180-degree TCP yaw change.
+        # Keep one deterministic alternative for a new-item pre-grasp so an
+        # unreachable wrist branch does not abort an otherwise valid pickup.
+        self.pregrasp_yaw_fallback = None
         self.staging_retrieve_target = None
         self.staging_store_transfer_target = None
         self.transfer_context = ''
@@ -98,6 +104,8 @@ class MotionCoordinator(Node):
 
         self.plan_client = self.create_client(
             PlanJoint, '/xarm_joint_plan')
+        self.ik_client = self.create_client(
+            GetPositionIK, '/compute_ik')
         self.pose_plan_client = self.create_client(
             PlanPose, '/xarm_pose_plan')
         self.straight_plan_client = self.create_client(
@@ -875,7 +883,7 @@ class MotionCoordinator(Node):
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
-    def _start_pose_plan(self, pose, box_id, response):
+    def _start_pose_plan(self, pose, box_id, response, completion_callback=None):
         self.operation_id += 1
         request_id = self.operation_id
         self.target = f'pregrasp_box_{int(box_id)}'
@@ -886,13 +894,128 @@ class MotionCoordinator(Node):
         plan_request = PlanPose.Request()
         plan_request.target = pose
         future = self.pose_plan_client.call_async(plan_request)
+        callback = completion_callback or self._plan_completed
         future.add_done_callback(
-            lambda completed: self._plan_completed(request_id, completed))
+            lambda completed: callback(request_id, completed))
         response.success = True
         response.message = (
             f'Planning pregrasp for box {int(box_id)} at '
             f'[{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}] m; '
             f'operation_id={request_id}')
+        return response
+
+    def _request_pregrasp_ik(self, request_id, pose):
+        request = GetPositionIK.Request()
+        ik = request.ik_request
+        ik.group_name = 'uf850'
+        ik.ik_link_name = 'link_tcp'
+        ik.avoid_collisions = True
+        ik.timeout.sec = 2
+        ik.robot_state.joint_state.name = [f'joint{i}' for i in range(1, 7)]
+        ik.robot_state.joint_state.position = [
+            float(self.latest_joint_positions[name])
+            for name in ik.robot_state.joint_state.name]
+        ik.pose_stamped.header.frame_id = 'link_base'
+        ik.pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        ik.pose_stamped.pose = pose
+        future = self.ik_client.call_async(request)
+        future.add_done_callback(
+            lambda completed: self._pregrasp_ik_completed(
+                request_id, completed))
+
+    def _retry_pregrasp_with_symmetric_yaw(self, request_id, reason):
+        if request_id != self.operation_id:
+            return False
+        if self.cancel_requested:
+            self.pregrasp_yaw_fallback = None
+            self._set_state(self.PAUSED if self.pause_requested else self.IDLE)
+            return False
+
+        fallback = self.pregrasp_yaw_fallback
+        if fallback is None:
+            self._set_state(
+                self.FAULT,
+                f'{reason}; original and yaw-180 pre-grasp poses failed')
+            return False
+        self.pregrasp_yaw_fallback = None
+        pose = fallback['pose']
+        yaw = fallback['yaw_rad']
+        if self.planned_pregrasp is not None:
+            self.planned_pregrasp['yaw_rad'] = float(yaw)
+        self._publish_pregrasp_marker(pose, fallback['box_id'])
+        self.get_logger().warning(
+            f'{reason}; retrying the '
+            f'equivalent yaw-180 pose ({math.degrees(yaw):.1f} deg)')
+        self.publish_status()
+        self._request_pregrasp_ik(request_id, pose)
+        return True
+
+    def _pregrasp_ik_completed(self, request_id, future):
+        if request_id != self.operation_id:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.pregrasp_yaw_fallback = None
+            self._set_state(self.FAULT, f'pre-grasp IK service failed: {exc}')
+            return
+        if (result is None or
+                result.error_code.val != MoveItErrorCodes.SUCCESS):
+            code = None if result is None else result.error_code.val
+            self._retry_pregrasp_with_symmetric_yaw(
+                request_id, f'collision-aware pre-grasp IK failed (code={code})')
+            return
+        names = list(result.solution.joint_state.name)
+        positions = list(result.solution.joint_state.position)
+        by_name = dict(zip(names, positions))
+        arm_names = [f'joint{i}' for i in range(1, 7)]
+        if (len(names) != len(positions) or
+                any(name not in by_name for name in arm_names) or
+                any(not math.isfinite(float(by_name[name])) for name in arm_names)):
+            self.pregrasp_yaw_fallback = None
+            self._set_state(self.FAULT, 'pre-grasp IK returned invalid joint data')
+            return
+        request = PlanJoint.Request()
+        request.target = [float(by_name[name]) for name in arm_names]
+        planned = self.plan_client.call_async(request)
+        planned.add_done_callback(
+            lambda completed: self._pregrasp_plan_completed(
+                request_id, completed))
+
+    def _pregrasp_plan_completed(self, request_id, future):
+        """Accept a joint plan or retry with the yaw-symmetric grasp."""
+        if request_id != self.operation_id:
+            return
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.pregrasp_yaw_fallback = None
+            self._set_state(self.FAULT, f'pre-grasp planning service failed: {exc}')
+            return
+        if result is not None and result.success:
+            self.pregrasp_yaw_fallback = None
+            if self.cancel_requested:
+                self._set_state(self.PAUSED if self.pause_requested else self.IDLE)
+                return
+            self._set_state(self.PLANNED)
+            return
+        self._retry_pregrasp_with_symmetric_yaw(
+            request_id, 'cuMotion joint planning failed')
+
+    def _start_pregrasp_ik_plan(self, pose, box_id, response):
+        self.operation_id += 1
+        request_id = self.operation_id
+        self.target = f'pregrasp_box_{int(box_id)}'
+        self.cancel_requested = False
+        self.pause_requested = False
+        self._publish_pregrasp_marker(pose, int(box_id))
+        self._set_state(self.PLANNING)
+        self._request_pregrasp_ik(request_id, pose)
+        response.success = True
+        response.message = (
+            f'Resolving collision-aware pregrasp IK for box {int(box_id)} at '
+            f'[{pose.position.x:.3f}, {pose.position.y:.3f}, '
+            f'{pose.position.z:.3f}] m; operation_id={request_id}')
         return response
 
     def _start_straight_plan(self, pose, box_id, response):
@@ -946,8 +1069,11 @@ class MotionCoordinator(Node):
             return response
         if not self._require_fresh_joint_state(response, 'plan pre-grasp'):
             return response
-        if not self.pose_plan_client.service_is_ready():
-            response.message = 'xArm pose planning service is unavailable'
+        if not self.ik_client.service_is_ready():
+            response.message = 'MoveIt compute-IK service is unavailable'
+            return response
+        if not self.plan_client.service_is_ready():
+            response.message = 'xArm joint planning service is unavailable'
             return response
         try:
             box = self._select_refined_box()
@@ -970,7 +1096,21 @@ class MotionCoordinator(Node):
             'yaw_rad': float(yaw),
             'planned_stamp_sec': self.get_clock().now().nanoseconds * 1e-9,
         }
-        return self._start_pose_plan(pose, box.id, response)
+        alternate_yaw = math.atan2(math.sin(yaw + math.pi),
+                                   math.cos(yaw + math.pi))
+        alternate_pose = Pose()
+        alternate_pose.position.x = pose.position.x
+        alternate_pose.position.y = pose.position.y
+        alternate_pose.position.z = pose.position.z
+        (alternate_pose.orientation.x, alternate_pose.orientation.y,
+         alternate_pose.orientation.z, alternate_pose.orientation.w) = \
+            self._quaternion_from_rpy(math.pi, 0.0, alternate_yaw)
+        self.pregrasp_yaw_fallback = {
+            'pose': alternate_pose,
+            'yaw_rad': alternate_yaw,
+            'box_id': int(box.id),
+        }
+        return self._start_pregrasp_ik_plan(pose, box.id, response)
 
     def staging_retrieve_target_callback(self, message):
         # [slot, contact-reference TCP xyz_m, release TCP rpy_rad,
@@ -1377,6 +1517,7 @@ class MotionCoordinator(Node):
         self.target = None
         self.transfer_context = ''
         self.planned_pregrasp = None
+        self.pregrasp_yaw_fallback = None
         self._clear_pregrasp_snapshot()
         self.cancel_requested = False
         self.pause_requested = False

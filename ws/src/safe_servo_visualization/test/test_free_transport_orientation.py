@@ -13,7 +13,7 @@ DOWN = np.array([1., 0., 0., 0.])
 SIDE = np.array([0., math.sqrt(.5), 0., math.sqrt(.5)])
 
 
-def check_geometry(xyz, q, final=False, ceiling=None):
+def check_geometry(xyz, q, final=False, ceiling=None, local_clearance=True):
     node = ContinuousTransport.__new__(ContinuousTransport)
     node.transport_start_xyz = np.array([.2, .5, .2])
     node.transport_end = np.array([.3, -.6, .2])
@@ -24,6 +24,7 @@ def check_geometry(xyz, q, final=False, ceiling=None):
                                 attached_item_center_in_tcp_m=[0., 0., .05],
                                 attached_item_orientation_in_tcp_xyzw=[0., 0., 0., 1.])
     node.transport_clearance = .47
+    node.transport_local_clearance_validation_enabled = local_clearance
     node.transport_high_z, node.transport_safe_z = .65, .57
     node.servo_bounds_mm = [-1000, 1000, -1000, 1000, -100, 1000]
     if ceiling is not None:
@@ -62,6 +63,12 @@ def test_low_vertical_column_retains_required_orientation(xy):
     node._fault.assert_not_called()
     wrong_yaw = check_geometry([*xy, .2], np.array([0., 1., 0., 0.]))
     wrong_yaw._transport_reject_geometry.assert_called_once()
+
+
+def test_disabled_local_clearance_relies_on_virtual_obstacle_collision():
+    node = check_geometry([.4, .1, .60], SIDE, ceiling=0., local_clearance=False)
+    node._transport_reject_geometry.assert_not_called()
+    node._transport_validate_next.assert_called_once()
 
 
 def test_free_orientation_does_not_relax_endpoint_orientation():

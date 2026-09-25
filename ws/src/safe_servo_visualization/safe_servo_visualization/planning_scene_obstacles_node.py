@@ -40,6 +40,7 @@ class PlanningSceneObstacles(Node):
         self.motion_state = None
         self.pickup_state = None
         self.add_placed_item_obstacle = True
+        self.camera_applied = False
         self.place_singularity_fallback = False
         self.random_loading_target = None
         self.random_loading_status = {}
@@ -214,6 +215,9 @@ class PlanningSceneObstacles(Node):
         self.get_logger().info(f'applied {description}')
 
     def ensure_scene(self):
+        if not self.camera_applied:
+            self._apply_camera_body()
+            return
         if not self.static_applied:
             self._apply(self._table_objects(), 'fixed workspace collision objects',
                         lambda: setattr(self, 'static_applied', True))
@@ -224,6 +228,34 @@ class PlanningSceneObstacles(Node):
         if self.attachment_pending and not self.attached_item_id:
             self._attach_detected_item()
         self.publish_status()
+
+    def _apply_camera_body(self):
+        """D435i body only, attached to a robot-model link via calibrated TF."""
+        if self.apply_pending:
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform('link_eef', 'camera_link', rclpy.time.Time())
+        except TransformException:
+            self.get_logger().warning('waiting for calibrated camera TF before scene setup',
+                                      throttle_duration_sec=5.)
+            return
+        t, q = tf.transform.translation, tf.transform.rotation
+        # Official realsense2_description D435 box: depth, width, height.
+        # camera_link is offset 17.5 mm along Y from the body centre.
+        offset = self._rotate((0., -.0175, 0.), (q.x, q.y, q.z, q.w))
+        obj = self._box('eef_camera_d435i', (.02505, .090, .025),
+                        (t.x+offset[0], t.y+offset[1], t.z+offset[2]),
+                        (q.x, q.y, q.z, q.w))
+        obj.header.frame_id = 'link_eef'
+        attached = AttachedCollisionObject()
+        attached.link_name = 'link_eef'
+        attached.touch_links = ['link_eef']
+        attached.object = obj
+        scene = PlanningScene()
+        scene.is_diff = scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects = [attached]
+        self._apply_scene(scene, 'D435i attached camera collision body',
+                          lambda: setattr(self, 'camera_applied', True))
 
     def motion_status_callback(self, message):
         try:
@@ -756,6 +788,7 @@ class PlanningSceneObstacles(Node):
                 if k in self.placed_item_visuals},
             'placed_item_visual_count': len(self.placed_item_visuals),
             'add_placed_item_obstacle': self.add_placed_item_obstacle,
+            'camera_collision_applied': self.camera_applied,
             'last_placement_error': self.last_placement_error,
             'last_placed_item_pose_source': self.last_placed_item_pose_source,
         }, separators=(',', ':'))

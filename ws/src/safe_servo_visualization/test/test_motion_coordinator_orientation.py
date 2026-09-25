@@ -331,3 +331,96 @@ def test_straight_pregrasp_preserves_supervisor_target_contract():
     assert coordinator.target == 'pregrasp_box_1027'
     assert coordinator.state == coordinator.PLANNING
     assert coordinator.straight_plan_client.request.target is pose
+
+
+def test_pregrasp_ik_failure_retries_yaw_180_and_updates_snapshot():
+    class FinishedFuture:
+        def __init__(self, success):
+            self._result = SimpleNamespace(success=success)
+
+        def result(self):
+            return self._result
+
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.operation_id = 12
+    coordinator.cancel_requested = False
+    coordinator.pause_requested = False
+    coordinator.target = 'pregrasp_box_4'
+    coordinator.state = coordinator.PLANNING
+    coordinator.planned_pregrasp = {'yaw_rad': 0.2}
+    alternate = Pose()
+    alternate.position.x = 0.55
+    alternate.position.y = 0.02
+    alternate.position.z = 0.18
+    alternate_yaw = 0.2 - math.pi
+    (alternate.orientation.x, alternate.orientation.y,
+     alternate.orientation.z, alternate.orientation.w) = \
+        coordinator._quaternion_from_rpy(math.pi, 0.0, alternate_yaw)
+    coordinator.pregrasp_yaw_fallback = {
+        'pose': alternate, 'yaw_rad': alternate_yaw, 'box_id': 4}
+    published = []
+    coordinator._publish_pregrasp_marker = lambda pose, box_id: published.append(
+        (pose, box_id))
+    coordinator.publish_status = lambda: None
+    coordinator.get_logger = lambda: SimpleNamespace(warning=lambda *_args: None)
+    coordinator._set_state = lambda state, fault='': (
+        setattr(coordinator, 'state', state), setattr(coordinator, 'fault', fault))
+    requested = []
+    coordinator._request_pregrasp_ik = lambda request_id, pose: requested.append(
+        (request_id, pose))
+
+    coordinator._pregrasp_plan_completed(12, FinishedFuture(False))
+
+    assert requested == [(12, alternate)]
+    assert coordinator.planned_pregrasp['yaw_rad'] == pytest.approx(alternate_yaw)
+    assert published == [(alternate, 4)]
+    assert coordinator.pregrasp_yaw_fallback is None
+
+
+def test_pregrasp_faults_only_after_both_symmetric_yaws_fail():
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.operation_id = 3
+    coordinator.cancel_requested = False
+    coordinator.pause_requested = False
+    coordinator.target = 'pregrasp_box_0'
+    coordinator.pregrasp_yaw_fallback = None
+    coordinator._set_state = lambda state, fault='': (
+        setattr(coordinator, 'state', state), setattr(coordinator, 'fault', fault))
+    failed = SimpleNamespace(result=lambda: SimpleNamespace(success=False))
+
+    coordinator._pregrasp_plan_completed(3, failed)
+
+    assert coordinator.state == coordinator.FAULT
+    assert 'original and yaw-180' in coordinator.fault
+
+
+def test_pregrasp_ik_solution_is_ordered_and_sent_as_joint_goal():
+    class PendingFuture:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class JointClient:
+        def call_async(self, request):
+            self.request = request
+            self.future = PendingFuture()
+            return self.future
+
+    coordinator = object.__new__(MotionCoordinator)
+    coordinator.operation_id = 8
+    coordinator.plan_client = JointClient()
+    coordinator.pregrasp_yaw_fallback = {'unused': True}
+    coordinator._set_state = lambda state, fault='': (
+        setattr(coordinator, 'state', state), setattr(coordinator, 'fault', fault))
+    solution = SimpleNamespace(
+        name=['joint3', 'joint1', 'joint6', 'joint2', 'joint5', 'joint4'],
+        position=[3.0, 1.0, 6.0, 2.0, 5.0, 4.0])
+    result = SimpleNamespace(
+        error_code=SimpleNamespace(val=1),
+        solution=SimpleNamespace(joint_state=solution))
+    completed = SimpleNamespace(result=lambda: result)
+
+    coordinator._pregrasp_ik_completed(8, completed)
+
+    assert coordinator.plan_client.request.target == pytest.approx(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert coordinator.pregrasp_yaw_fallback == {'unused': True}
